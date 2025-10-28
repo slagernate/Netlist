@@ -128,7 +128,7 @@ class SpiceNetlister(Netlister):
         self.write_instance_conns(pinst)
 
         # Write the sub-circuit name
-        self.write("+ " + self.format_ident(pinst.module) + " \n")
+        self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
 
         # Write its parameter values
         self.write_instance_params(pinst.params)

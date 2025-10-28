@@ -390,7 +390,9 @@ class Netlister:
             rv = ""
             close_me_please = False
 
-        if isinstance(expr, Ident):
+        if isinstance(expr, Ref):  # Handle references (resolved or unresolved)
+            rv += self.format_ident(expr.ident)
+        elif isinstance(expr, Ident):
             rv += self.format_ident(expr)  # Identifiers
         elif isinstance(expr, UnaryOp):
             rv += self.format_unary_op(expr)  # Unary Operators
@@ -445,7 +447,7 @@ class Netlister:
 
     def format_function_call(self, call: Call) -> str:
         """Format a function-call expression."""
-        funcname = self.format_ident(call.func)
+        funcname = self.format_ident(call.func.ident)
         args = [self.format_expr(arg) for arg in call.args]
         return f'{funcname}({",".join(args)})'
 
