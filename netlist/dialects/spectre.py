@@ -155,8 +155,8 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
     def parse_variations(self) -> List[Variation]:
         """Parse a list of variation-statements, of the form
         `{
-            vary param1 dist=distname std=stdval
-            vary param2 dist=distname std=stdval
+            vary param1 dist=distname std=stdval [mean=meanval]
+            vary param2 dist=distname std=stdval [mean=meanval]
         }\n`
         Consumes the both opening and closing brackets,
         and the (required) newline following the closing bracket."""
@@ -172,6 +172,7 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
 
             dist = None
             std = None
+            mean = None
             percent = None  # FIXME: roll in
             while not self.match(Tokens.NEWLINE):
                 self.expect(Tokens.IDENT)
@@ -181,17 +182,25 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
                     self.expect(Tokens.EQUALS)
                     self.expect(Tokens.IDENT)
                     dist = str(self.cur.val)
+                    if dist not in ["gauss", "lnorm"]:
+                        print(f"dist ({dist}) not one of: gauss lnorm")
+                        self.fail()
                 elif self.cur.val == "std":
                     if std is not None:
                         self.fail()
                     self.expect(Tokens.EQUALS)
                     std = self.parse_expr()
+                elif self.cur.val == "mean":
+                    if mean is not None:
+                        self.fail()
+                    self.expect(Tokens.EQUALS)
+                    mean = self.parse_expr()
                 elif self.cur.val == "percent":
                     self.expect(Tokens.EQUALS)
                     percent = self.parse_expr()
                 else:
                     self.fail()
-            vars.append(Variation(name, dist, std))  # FIXME: roll in `percent`
+            vars.append(Variation(name, dist, std, mean))  # FIXME: roll in `percent`
 
         self.expect(Tokens.NEWLINE)
         return vars

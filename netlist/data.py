@@ -389,6 +389,7 @@ class Variation:
     name: Ident  # Parameter Name
     dist: str  # Distribution Name/Type
     std: "Expr"  # Standard Deviation
+    mean: Optional["Expr"] = None  # Mean value (optional, defaults based on dist)
 
 
 @datatype
