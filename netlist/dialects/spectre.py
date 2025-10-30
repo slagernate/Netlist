@@ -2,7 +2,7 @@
 # Spectre-Dialect Parsing 
 """
 
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Dict, Callable
 
 # Local Imports
 from ..data import *
@@ -34,12 +34,16 @@ class SpectreMixin:
 
 
 class SpectreSpiceDialectParser(SpectreMixin, SpiceDialectParser):
-    """Spice-Style Syntax, as Interpreted by Spectre.
-
-    Primarily differs from the base SpiceDialect in its capacity for
-    `simulator lang` statements which produce `DialectChanges`."""
+    """Spice-Style Syntax, as Interpreted by Spectre."""
 
     enum = NetlistDialects.SPECTRE_SPICE
+
+    @classmethod
+    def get_rules(cls) -> Dict[Tokens, Callable]:
+        """Get Spectre-Spice rules: base Spice rules + Spectre additions."""
+        rules = super().get_rules()  # Inherit Spice rules
+        rules[Tokens.SIMULATOR] = cls.parse_dialect_change  # Add Spectre rule
+        return rules
 
     def parse_statement(self) -> Optional[Statement]:
         """Mix-in the `simulator lang` DialectChange Statments"""
@@ -47,14 +51,57 @@ class SpectreSpiceDialectParser(SpectreMixin, SpiceDialectParser):
         pk = self.peek()
         if pk and pk.tp == Tokens.SIMULATOR:
             return self.parse_dialect_change()
+        elif pk.tp == Tokens.PARAMETERS:
+            return self.parse_param_statement()
         return super().parse_statement()
 
+    def parse_param_statement(self) -> Union[ParamDecls, FunctionDef]:
+        """Parse Spectre-style params: x y"""
+        if self.peek().tp == Tokens.PARAMETERS:
+            print(f"handling Spectre-style params: params: x y")
+            from .base import _endargs_startkwargs
+            self.expect(Tokens.PARAMETERS)
+            self.match(Tokens.COLON)
+            args = self.parse_ident_list(_endargs_startkwargs)
+            if self.nxt and self.nxt.tp == Tokens.EQUALS:
+                self.rewind()
+                args.pop()
+            args = [ParamDecl(a, None) for a in args]
+            vals = self.parse_param_declarations()
+            return ParamDecls(args + vals)
+        else:
+            return super().parse_param_statement()
 
 class SpectreDialectParser(SpectreMixin, DialectParser):
     """Spectre-Language Dialect.
     Probably more of a separate language really, but it fits our Dialect paradigm well enough."""
 
     enum = NetlistDialects.SPECTRE
+
+    @classmethod
+    def get_rules(cls) -> Dict[Tokens, Callable]:
+        """Get the base Spectre parsing rules."""
+        return {
+            Tokens.SIMULATOR: cls.parse_dialect_change,
+            Tokens.PARAMETERS: cls.parse_param_statement,
+            Tokens.INLINE: cls.parse_subckt_start,
+            Tokens.SUBCKT: cls.parse_subckt_start,
+            Tokens.ENDS: cls.parse_end_sub,
+            Tokens.MODEL: cls.parse_model,
+            Tokens.STATS: cls.parse_statistics_block,
+            Tokens.AHDL: cls.parse_ahdl,
+            Tokens.LIBRARY: cls.parse_start_lib,
+            Tokens.SECTION: cls.parse_start_section,
+            Tokens.ENDSECTION: cls.parse_end_section,
+            Tokens.ENDLIBRARY: cls.parse_end_lib,
+            Tokens.INCLUDE: cls.parse_include,
+            Tokens.REAL: cls.parse_function_def,
+            Tokens.PROT: cls.parse_protect,
+            Tokens.PROTECT: cls.parse_protect,
+            Tokens.UNPROT: cls.parse_unprotect,
+            Tokens.UNPROTECT: cls.parse_unprotect,
+            Tokens.IDENT: cls.parse_named,  # Catch-all for identifiers
+        }
 
     def parse_statement(self) -> Optional[Statement]:
         """Statement Parser
@@ -67,33 +114,11 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
         if pk is None:  # End-of-input case
             return None
 
-        rules = {
-            Tokens.SIMULATOR: self.parse_dialect_change,
-            Tokens.PARAMETERS: self.parse_param_statement,
-            Tokens.INLINE: self.parse_subckt_start,
-            Tokens.SUBCKT: self.parse_subckt_start,
-            Tokens.ENDS: self.parse_end_sub,
-            Tokens.MODEL: self.parse_model,
-            Tokens.STATS: self.parse_statistics_block,
-            Tokens.AHDL: self.parse_ahdl,
-            Tokens.LIBRARY: self.parse_start_lib,
-            Tokens.SECTION: self.parse_start_section,
-            Tokens.ENDSECTION: self.parse_end_section,
-            Tokens.ENDLIBRARY: self.parse_end_lib,
-            Tokens.INCLUDE: self.parse_include,
-            Tokens.REAL: self.parse_function_def,
-            Tokens.PROT: self.parse_protect,
-            Tokens.PROTECT: self.parse_protect,
-            Tokens.UNPROT: self.parse_unprotect,
-            Tokens.UNPROTECT: self.parse_unprotect,
-            Tokens.IDENT: self.parse_named,  # Catch-all for any non-keyword identifier
-        }
+        rules = self.get_rules()
         if pk.tp not in rules:
-            # No match - error time.
             return self.fail(f"Unexpected token to begin statement: {pk}")
-        # Call the type-specific parsing function
         type_parser = rules[pk.tp]
-        return type_parser()
+        return type_parser(self)
 
     def parse_named(self):
         """Parse an identifier-named statement.

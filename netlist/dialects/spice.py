@@ -1,7 +1,7 @@
 """
 # Spice-Dialect Parsing 
 """
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Callable
 
 # Local Imports
 from ..data import *
@@ -17,6 +17,25 @@ class SpiceDialectParser(DialectParser):
 
     enum = NetlistDialects.SPICE
 
+    @classmethod
+    def get_rules(cls) -> Dict[Tokens, Callable]:
+        """Get the base Spice parsing rules."""
+        return {
+            Tokens.PARAM: cls.parse_param_statement,
+            Tokens.SUBCKT: cls.parse_subckt_start,
+            Tokens.ENDS: cls.parse_end_sub,
+            Tokens.MODEL: cls.parse_model,
+            Tokens.OPTION: cls.parse_options,
+            Tokens.INC: cls.parse_include,
+            Tokens.INCLUDE: cls.parse_include,
+            Tokens.LIB: cls.parse_lib_statement,
+            Tokens.ENDL: cls.parse_endl,
+            Tokens.PROT: cls.parse_protect,
+            Tokens.PROTECT: cls.parse_protect,
+            Tokens.UNPROT: cls.parse_unprotect,
+            Tokens.UNPROTECT: cls.parse_unprotect,
+        }
+
     def parse_statement(self) -> Optional[Statement]:
         """Statement Parser
         Dispatches to type-specific parsers based on prioritized set of matching rules.
@@ -28,28 +47,17 @@ class SpiceDialectParser(DialectParser):
         if pk is None:  # End-of-input case
             return None
 
-        if self.match(Tokens.DOT):  # Control Statements
-            rules = {
-                Tokens.PARAM: self.parse_param_statement,
-                Tokens.SUBCKT: self.parse_subckt_start,
-                Tokens.ENDS: self.parse_end_sub,
-                Tokens.MODEL: self.parse_model,
-                Tokens.OPTION: self.parse_options,
-                Tokens.INC: self.parse_include,
-                Tokens.INCLUDE: self.parse_include,
-                Tokens.LIB: self.parse_lib_statement,
-                Tokens.ENDL: self.parse_endl,
-                Tokens.PROT: self.parse_protect,
-                Tokens.PROTECT: self.parse_protect,
-                Tokens.UNPROT: self.parse_unprotect,
-                Tokens.UNPROTECT: self.parse_unprotect,
-            }
+        if self.match(Tokens.DOT):
             pk = self.peek()
+            rules = self.get_rules()
             if pk.tp not in rules:
                 return self.fail(f"Invalid or unsupported dot-statement: {pk}")
             # Call the type-specific parsing function
             type_parser = rules[pk.tp]
-            return type_parser()
+            return type_parser(self)
+
+        elif pk.tp == Tokens.PARAMETERS:
+            return self.parse_param_statement()
 
         elif pk.tp == Tokens.IDENT:
             if pk.val.lower().startswith("x"):

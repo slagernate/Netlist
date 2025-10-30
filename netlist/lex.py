@@ -87,7 +87,7 @@ _keywords = dict(
     STATS=r"statistics",
     SIMULATOR=r"simulator",
     LANG=r"lang",
-    PARAMETERS=r"parameters",
+    PARAMETERS=r"(parameters|params)",
     PARAM=r"(param|PARAM)",
     OPTIONS=r"(options|OPTIONS)",
     OPTION=r"(option|OPTION)",
@@ -137,6 +137,7 @@ class Lexer:
         self.line_num = 1
         self.lexed_nonwhite_on_this_line = False
         self.toks = iter(pat.scanner(self.line).match, None)
+        self.recent_lines = []
 
     def nxt(self) -> Optional[Token]:
         """Get our next Token, pulling a new line if necessary."""
@@ -146,6 +147,12 @@ class Lexer:
             if self.line is None:  # End of input
                 return None
             self.line_num += 1
+
+            # buffer last 5 lines for debugging
+            self.recent_lines.append(self.line.rstrip('\n'))
+            if len(self.recent_lines) > 5:
+                self.recent_lines.pop(0)
+
             self.toks = iter(pat.scanner(self.line).match, None)
             m = next(self.toks, None)
             if m is None:
