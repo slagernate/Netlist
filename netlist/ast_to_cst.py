@@ -11,7 +11,7 @@ from typing import Optional, Union, List, Dict, Generic, TypeVar, Sequence, Set
 
 # PyPi Imports
 from pydantic.dataclasses import dataclass
-from pydantic.generics import GenericModel
+from pydantic import BaseModel
 
 # Local Imports
 from .data import *
@@ -47,7 +47,7 @@ class ScopeId:
 DataT = TypeVar("DataT")
 
 
-class NoRedefDict(GenericModel, Generic[DataT]):
+class NoRedefDict(BaseModel, Generic[DataT]):
     """A strongly typed Dictionary which throws an error if one overwrites any of its keys.
     The key-type is always `str`, and the value-types are `DataT`."""
 

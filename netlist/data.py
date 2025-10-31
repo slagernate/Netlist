@@ -15,7 +15,7 @@ from typing import Optional, Union, List, Tuple, Generic, TypeVar
 
 # PyPi Imports
 from pydantic.dataclasses import dataclass
-from pydantic.generics import GenericModel
+from pydantic import BaseModel
 
 
 class NetlistParseError(Exception):
@@ -126,7 +126,7 @@ class ExternalRef:
 Referent = TypeVar("Referent")
 
 
-class Ref(GenericModel, Generic[Referent]):
+class Ref(BaseModel, Generic[Referent]):
     """# Reference to another Netlist object
     Intially an identifier, then in later stages resolved to a generic `Referent`."""
 
@@ -612,7 +612,15 @@ Expr = Union[UnaryOp, BinaryOp, TernOp, Int, Float, MetricNum, Ref, Call]
 
 # Update all the forward type-references
 for tp in datatypes:
-    tp.__pydantic_model__.update_forward_refs()
+    # Pydantic v1: pydantic dataclasses need to update forward refs via __pydantic_model__
+    if hasattr(tp, '__pydantic_model__'):
+        tp.__pydantic_model__.update_forward_refs()
+    # BaseModel classes use update_forward_refs() directly
+    elif issubclass(tp, BaseModel):
+        tp.update_forward_refs()
+
+# Also update Ref which is a BaseModel but not in datatypes
+Ref.update_forward_refs()
 
 # And solely export the defined datatypes
 # (at least with star-imports, which are hard to avoid using with all these types)
