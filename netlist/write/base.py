@@ -127,6 +127,7 @@ class Netlister:
         self.ext_module_names = (
             dict()
         )  # Visited ExternalModule names, checked for duplicates
+        self.output_line_num = 1
 
     def netlist(self) -> None:
         """Primary API Method.
@@ -204,10 +205,12 @@ class Netlister:
     def write(self, s: str) -> None:
         """Helper/wrapper, passing to `self.dest`"""
         self.dest.write(s)
+        self.output_line_num += s.count('\n')
 
     def writeln(self, s: str) -> None:
         """Write `s` as a line, at our current `indent` level."""
         self.write(f"{self.indent.state}{s}\n")
+        self.output_line_num += 1
 
     # @classmethod
     # def get_module_name(cls, module: vlsir.circuit.Module) -> str:
@@ -521,6 +524,10 @@ class Netlister:
     def write_expr(self, expr: Expr) -> None:
         """Write a (potentially nested) mathematical expression `expr`"""
         raise NotImplementedError
+
+    def get_current_line_info(self) -> str:
+        """Get a string with current input/output line info for warnings."""
+        input_line = getattr(self, 'lex', None) and self.lex.line_num or "unknown"
 
     """ 
     Other Virtual Methods 

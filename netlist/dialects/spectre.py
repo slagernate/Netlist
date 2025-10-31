@@ -54,7 +54,8 @@ class SpectreSpiceDialectParser(SpectreMixin, SpiceDialectParser):
            if pk.tp == Tokens.SIMULATOR:
                return self.parse_dialect_change()
            elif pk.tp in (Tokens.PARAMETERS, Tokens.STATS):
-               warn("Detected Spectre syntax while parsing Spice! Switching to Spectre")
+               line_info = f"(input line: {self.lex.line_num})"
+               warn(f"Detected Spectre syntax while parsing Spice {line_info}! Switching to Spectre")
                from ..data import DialectChange
                change = DialectChange(dialect='spectre')
                self.parent.notify(change)
@@ -104,6 +105,11 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
 
         if pk is None:  # End-of-input case
             return None
+
+        if self.match(Tokens.DOT):
+            pk = self.peek() # peek past DOT
+            # TODO: Add user facing option(s) specifying how to handle this
+            warn("Detected Spice .DOT syntax while parsing Spectre! Interpreting as Spectre syntax...")
 
         rules = self.get_rules()
         if pk.tp not in rules:
