@@ -426,12 +426,25 @@ class Netlister:
         """Format a unary operator"""
         return tp.value
 
+    precedence = {
+        BinaryOperator.ADD: 1,
+        BinaryOperator.SUB: 1,
+        BinaryOperator.MUL: 2,
+        BinaryOperator.DIV: 2,
+    }
+
     def format_binary_op(self, op: BinaryOp) -> str:
         """Format a binary operation ."""
 
         left = self.format_expr(op.left)
         operator = self.format_binary_operator(op.tp)
         right = self.format_expr(op.right)
+
+        # If an operand is a BinaryOp with lower precedence, wrap it in ()
+        if isinstance(op.left, BinaryOp) and self.precedence.get(op.left.tp, 0) < self.precedence.get(op.tp, 0):
+            left = f"({left})"
+        if isinstance(op.right, BinaryOp) and self.precedence.get(op.right.tp, 0) < self.precedence.get(op.tp, 0):
+            right = f"({right})"
 
         return f"{left}{operator}{right}"
 

@@ -729,3 +729,59 @@ def test_spectre_multiply_starting_continuation():
     )
     parse_str(txt, options=ParseOptions(dialect=NetlistDialects.SPECTRE_SPICE))
     parse_str(txt, options=ParseOptions(dialect=NetlistDialects.NGSPICE))
+
+
+def test_nested_expression_parens():
+    """Test parsing and writing of nested expressions with parentheses, specifically ensuring parentheses are added for operator precedence in output."""
+    from netlist.dialects.spectre import SpectreDialectParser
+    from netlist.data import BinaryOp, BinaryOperator, Int, Float, Ref, Ident
+
+    # This should parse with nested ops and require parentheses around (c + d * e) in output.
+    expr_str = "a * b * (c + d * e)"
+    parser = SpectreDialectParser.from_str(expr_str)
+    parsed = parser.parse(parser.parse_expr)
+
+    # Debug: Print the parsed AST to verify structure (optional, for troubleshooting)
+    print(f"Parsed AST: {parsed}")
+    print(f"Type: {type(parsed)}")
+    if isinstance(parsed, BinaryOp):
+        print(f"Root op: {parsed.tp}")
+        print(f"Left: {parsed.left}")
+        print(f"Right: {parsed.right}")
+        if isinstance(parsed.right, BinaryOp):
+            print(f"Right op: {parsed.right.tp}")
+            print(f"Right.Right: {parsed.right.right}")
+            if isinstance(parsed.right.right, BinaryOp):
+                print(f"Right.Right op: {parsed.right.right.tp}")
+                print(f"Right.Right.Right: {parsed.right.right.right}")
+
+    # Assertions: Verify left-associative parsing (a * (b * (c + (d * e))))
+    assert isinstance(parsed, BinaryOp)
+    assert parsed.tp == BinaryOperator.MUL
+    assert isinstance(parsed.right, BinaryOp)  # b * (...)
+    assert parsed.right.tp == BinaryOperator.MUL
+    assert isinstance(parsed.right.right, BinaryOp)  # The (c + ...)
+    assert parsed.right.right.tp == BinaryOperator.ADD  # Now this should match
+    assert isinstance(parsed.right.right.left, Ref) and parsed.right.right.left.ident.name == "c"
+    assert isinstance(parsed.right.right.right, BinaryOp) and parsed.right.right.right.tp == BinaryOperator.MUL
+
+
+def test_writer_parentheses_precedence():
+    """Test that the writer adds parentheses for operator precedence in expressions"""
+    from netlist.dialects.spectre import SpectreDialectParser
+    from netlist.write.spice import XyceNetlister
+    from io import StringIO
+
+    # Parse the expression that exposes the precedence issue
+    expr_str = "a * b * (c + d * e)"
+    parser = SpectreDialectParser.from_str(expr_str)
+    parsed_expr = parser.parse(parser.parse_expr)
+
+    # Create a minimal XyceNetlister to test formatting
+    netlister = XyceNetlister(src=None, dest=StringIO())  # src can be None for this isolated test
+    formatted = netlister.format_expr(parsed_expr)
+
+    # Expected: {a*b*(c+d*e)} (with parentheses around the addition)
+    # Current buggy output: {a*b*c+d*e} (missing parentheses, which changes meaning)
+    expected = "{a*b*(c+d*e)}"
+    assert formatted == expected, f"Writer failed to add parentheses for precedence: got {formatted}, expected {expected}"
