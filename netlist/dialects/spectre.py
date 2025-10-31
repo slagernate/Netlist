@@ -8,6 +8,7 @@ from typing import Optional, Union, List, Dict, Callable
 from ..data import *
 from ..lex import Tokens
 from .spice import DialectParser, SpiceDialectParser
+from warnings import warn
 
 
 class SpectreMixin:
@@ -46,31 +47,21 @@ class SpectreSpiceDialectParser(SpectreMixin, SpiceDialectParser):
         return rules
 
     def parse_statement(self) -> Optional[Statement]:
-        """Mix-in the `simulator lang` DialectChange Statments"""
-        self.eat_blanks()
-        pk = self.peek()
-        if pk and pk.tp == Tokens.SIMULATOR:
-            return self.parse_dialect_change()
-        elif pk.tp == Tokens.PARAMETERS:
-            return self.parse_param_statement()
-        return super().parse_statement()
+       """Override to handle Spectre-specific constructs and dynamic dialect switching."""
+       self.eat_blanks()
+       pk = self.peek()
+       if pk:
+           if pk.tp == Tokens.SIMULATOR:
+               return self.parse_dialect_change()
+           elif pk.tp in (Tokens.PARAMETERS, Tokens.STATS):
+               warn("Detected Spectre syntax while parsing Spice! Switching to Spectre")
+               from ..data import DialectChange
+               change = DialectChange(dialect='spectre')
+               self.parent.notify(change)
+               return self.parent.dialect_parser.parse_statement()
 
-    def parse_param_statement(self) -> Union[ParamDecls, FunctionDef]:
-        """Parse Spectre-style params: x y"""
-        if self.peek().tp == Tokens.PARAMETERS:
-            print(f"handling Spectre-style params: params: x y")
-            from .base import _endargs_startkwargs
-            self.expect(Tokens.PARAMETERS)
-            self.match(Tokens.COLON)
-            args = self.parse_ident_list(_endargs_startkwargs)
-            if self.nxt and self.nxt.tp == Tokens.EQUALS:
-                self.rewind()
-                args.pop()
-            args = [ParamDecl(a, None) for a in args]
-            vals = self.parse_param_declarations()
-            return ParamDecls(args + vals)
-        else:
-            return super().parse_param_statement()
+       # Fall back to base Spice parsing
+       return super().parse_statement()
 
 class SpectreDialectParser(SpectreMixin, DialectParser):
     """Spectre-Language Dialect.
@@ -166,6 +157,7 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
         from .base import _endargs_startkwargs
 
         self.expect(Tokens.PARAMETERS)
+        self.match(Tokens.COLON)
         # Parse an initial list of identifiers, i.e. non-default-valued parameters
         args = self.parse_ident_list(_endargs_startkwargs)
         # If we landed on a key-value param key, rewind it

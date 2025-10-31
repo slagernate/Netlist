@@ -495,8 +495,8 @@ class DialectParser:
         print(f"DEBUG: Current line: {repr(self.lex.line)}")
         print(f"DEBUG: Current token: {self.cur}")
         print(f"DEBUG: Recent lines (last 5):")
-        for i, line in enumerate(reversed(self.lex.recent_lines[-5:]), start=1):
-            print(f"  Line -{i}: {repr(line)}")
+        for i, line in enumerate(self.lex.recent_lines[-5:], start=1):
+            print(f" {i}: {repr(line)}")
         print("DEBUG: End debug")
         print(self)
         NetlistParseError.throw(*args, **kwargs)
