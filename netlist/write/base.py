@@ -204,11 +204,13 @@ class Netlister:
 
     def write(self, s: str) -> None:
         """Helper/wrapper, passing to `self.dest`"""
+        s = s.rstrip(' \t')
         self.dest.write(s)
         self.output_line_num += s.count('\n')
 
     def writeln(self, s: str) -> None:
         """Write `s` as a line, at our current `indent` level."""
+        s = s.rstrip(' \t')
         self.write(f"{self.indent.state}{s}\n")
         self.output_line_num += 1
 
