@@ -785,3 +785,84 @@ def test_writer_parentheses_precedence():
     # Current buggy output: {a*b*c+d*e} (missing parentheses, which changes meaning)
     expected = "{a*b*(c+d*e)}"
     assert formatted == expected, f"Writer failed to add parentheses for precedence: got {formatted}, expected {expected}"
+
+
+def test_mixed_spectre_spice_dialect():
+    """Test parsing of netlists with mixed Spectre/Spice dialects, including dialect switches."""
+    from netlist import parse_str, ParseOptions, NetlistDialects, SubcktDef, Instance, Primitive
+
+    # Sample netlist: Start in SPICE, use .subckt (SPICE syntax), then params: triggers switch to Spectre,
+    # then switch back to SPICE for final statements
+    txt = dedent("""
+        simulator lang=spice
+        .subckt my_subckt (t1 t2 b)
+           params: width length
+           r0 (t1 t2) resistor width=width length=length
+           d0 (b t1) diode area='width*length*0.5' perim='width+length'
+           d1 (b t2) diode area='width*length*0.5' perim='width+length'
+        .ends
+        simulator lang=spice
+        .model my_model resistor
+        x1 (in out) my_subckt
+    """)
+
+    # Parse using parse_str which properly handles mixed dialects via FileParser
+    program = parse_str(txt, options=ParseOptions(dialect=NetlistDialects.SPECTRE_SPICE))
+
+    # Collect all entries from the program
+    entries = []
+    for file in program.files:
+        for entry in file.contents:
+            entries.append(entry)
+
+    # Verify the parsed program has expected elements
+    assert len(entries) > 0  # Program contains entries
+    # Check for SubcktDef with Spectre params
+    subckt = next((entry for entry in entries if isinstance(entry, SubcktDef)), None)
+    assert subckt is not None
+    assert subckt.name.name == "my_subckt"
+    assert len(subckt.params) == 2  # width and length parameters
+    # Check for Spice-style instance (after dialect switch) - instances starting with 'x' in Spice
+    instance = next((entry for entry in entries if isinstance(entry, Instance)), None)
+    assert instance is not None
+    assert instance.name.name == "x1"
+    assert instance.module.ident.name == "my_subckt"
+
+
+def test_statistics_blocks():
+    """Test parsing of Spectre statistics blocks with process and mismatch variations."""
+    from netlist import SpectreDialectParser, StatisticsBlock, Variation, Ident, Float
+
+    # Sample Spectre statistics block with generic parameters and distributions
+    txt = dedent("""\
+        statistics {
+           process {
+              vary param_a dist=gauss std=1.5
+              vary param_b dist=lnorm std=0.8 mean=2.0
+           }
+           mismatch {
+              vary param_c dist=gauss std=0.5
+           }
+        }
+    """)
+
+    # Parse using SpectreDialectParser
+    parser = SpectreDialectParser.from_str(txt)
+    stats_block = parser.parse(parser.parse_statistics_block)
+
+    # Verify the StatisticsBlock structure
+    assert isinstance(stats_block, StatisticsBlock)
+    # Check process variations
+    assert len(stats_block.process) == 2
+    assert stats_block.process[0].name.name == "param_a"
+    assert stats_block.process[0].dist == "gauss"
+    assert isinstance(stats_block.process[0].std, Float) and stats_block.process[0].std.val == 1.5
+    assert stats_block.process[1].name.name == "param_b"
+    assert stats_block.process[1].dist == "lnorm"
+    assert isinstance(stats_block.process[1].mean, Float) and stats_block.process[1].mean.val == 2.0
+    # Check mismatch variations
+    assert len(stats_block.mismatch) == 1
+    assert stats_block.mismatch[0].name.name == "param_c"
+    assert stats_block.mismatch[0].dist == "gauss"
+    assert isinstance(stats_block.mismatch[0].std, Float) and stats_block.mismatch[0].std.val == 0.5
+
