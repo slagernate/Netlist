@@ -119,10 +119,41 @@ class SpiceNetlister(Netlister):
         self.write("\n")
 
     def write_subckt_instance(self, pinst: Instance) -> None:
-        """Write sub-circuit-instance `pinst` of `rmodule`."""
+        """Write sub-circuit-instance `pinst`."""
+
+        # Detect if the instance looks like a MOS device (even if parsed as subcircuit instance)
+        print(f"Debugging is_mos_like for instance: {pinst.name.name}")
+
+        cond1 = len(pinst.conns) == 4  # Exactly 4 ports (d, g, s, b)
+        print(f"  len(pinst.conns) == 4: {len(pinst.conns)} == 4 -> {cond1}")
+
+        cond2 = isinstance(pinst.module, Ref)
+        print(f"  isinstance(pinst.module, Ref): isinstance({type(pinst.module)}, Ref) -> {isinstance(pinst.module, Ref)}")
+
+        param_names = {p.name.name for p in pinst.params}  # Has both 'l' and 'w' params
+        cond3 = {'l', 'w'} <= param_names
+        print(f"  {{'l', 'w'}} <= param_names: {{'l', 'w'}} <= {param_names} -> {cond3}")
+
+        cond4 = any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet'])  # Instance name indicates MOS
+        print(f"  any(keyword in pinst.name.name.lower() for keywords): '{pinst.name.name.lower()}' contains ['mos', 'fet'] -> {cond4}")
+
+        cond5 = 'model' in pinst.module.ident.name.lower()  # Heuristic: module name contains 'model' (for unresolved refs)
+        print(f"'model' in {{pinst.module.ident.name.lower(): {pinst.module.ident.name.lower()} -> {cond5}")
+
+        # Overall is_mos_like
+        is_mos_like = cond1 and cond2 and cond3 and cond4
+        print(f"  Overall is_mos_like: {is_mos_like}")
+
+        prefix = 'M' if is_mos_like else 'X'
+
+        inst_name = self.format_ident(pinst.name)
+        if prefix and not inst_name.upper().startswith(prefix):
+            inst_name = f"{prefix}{inst_name}"
+
+        print(f"writing subckt_inst: {inst_name}")
 
         # Write the instance name
-        self.write(self.format_ident(pinst.name) + " \n")
+        self.write(inst_name + " \n")
 
         # Write its port-connections
         self.write_instance_conns(pinst)
@@ -141,33 +172,40 @@ class SpiceNetlister(Netlister):
         Note spice's primitive instances often differn syntactically from sub-circuit instances,
         in that they can have positional (only) parameters."""
 
-        # Write the instance name
-        self.write(self.format_ident(pinst.name) + " \n")
+        is_mos_like = (
+            len(pinst.args) == 5  # Exactly 4 ports + 1 model
+            and isinstance(pinst.args[-1], Ref)  # Last arg is the model reference
+            and {'l', 'w'} <= {p.name.name for p in pinst.kwargs}  # Has both 'l' and 'w' params
+            and any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet', 'pmos', 'nmos'])  # Instance name indicates MOS
+        )
+        prefix = 'M' if is_mos_like else ''
+        inst_name = self.format_ident(pinst.name)
+        if is_mos_like:
+            print(f"prepending M to {inst_name}!")
+        if prefix and not inst_name.upper().startswith(prefix):
+            inst_name = f"{prefix}{inst_name}"
+            print(f"new inst_name: {inst_name}!")
+        print(f"writing primitive: {inst_name}")
+        self.write(inst_name + " \n")
 
+        # Write ports (exluding last (model)) on a separate continuation line
         self.write("+ ")
-        for arg in pinst.args:
-            # FIXME: at this point, we don't really know which of these arguments
-            # is a connection, and which is a positional parameter-value.
-            # This matters in some contexts, as parameters can be expressions,
-            # which may need some expression-evaluation syntax.
-            # For now, write anything that looks like a compound expression as a compound expression.
+        for arg in pinst.args[:-1]:  # Ports only (exclude the model)
             if isinstance(arg, Ident):
                 self.write(self.format_ident(arg) + " ")
             elif isinstance(arg, (Int, Float, MetricNum)):
                 self.write(self.format_number(arg) + " ")
             else:
                 self.write(self.format_expr(arg) + " ")
-            # else:
-            #     msg = f"Primitive instance {pinst.name} has non-scalar argument {arg}"
-            #     self.handle_error(msg)
-        self.write(" \n")
+        self.write("\n")
+        # Write the model (last arg) on another continuation line
+        self.write("+ " + self.format_ident(pinst.args[-1]) + " \n")
 
         self.write("+ ")
         for kwarg in pinst.kwargs:
             self.write_param_val(kwarg)
             self.write(" ")
 
-        # Add a blank after each instance
         self.write("\n")
 
     def write_instance_conns(self, pinst: Instance) -> None:
@@ -536,6 +574,37 @@ class XyceNetlister(SpiceNetlister):
                 self.write_param_val(option)
                 self.write(" \n")
             self.write("\n")
+
+    def write_subckt_def(self, module: SubcktDef) -> None:
+        """Write the `SUBCKT` definition for `Module` `module` in Xyce format."""
+
+        # Create the module name
+        module_name = self.format_ident(module.name)
+
+        # Start the sub-circuit definition header with inline ports
+        self.write(f".SUBCKT {module_name}")
+        if module.ports:
+            for port in module.ports:
+                self.write(f" {self.format_ident(port)}")
+        self.write("\n")
+
+        # Add parameters on a continuation line
+        if module.params:
+            self.write_module_params(module.params)
+        else:
+            self.write("+ ")
+            self.write_comment("No parameters")
+
+        # End the header with a blank line
+        self.write("\n")
+
+        print(f"writing internal contents for .SUBCKT: {module_name}")
+        # Write internal content
+        for entry in module.entries:
+            self.write_entry(entry)
+
+        # Close up the sub-circuit
+        self.write(".ENDS\n\n")
 
 
 class NgspiceNetlister(SpiceNetlister):

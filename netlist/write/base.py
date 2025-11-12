@@ -204,7 +204,6 @@ class Netlister:
 
     def write(self, s: str) -> None:
         """Helper/wrapper, passing to `self.dest`"""
-        s = s.rstrip(' \t')
         self.dest.write(s)
         self.output_line_num += s.count('\n')
 
@@ -364,9 +363,11 @@ class Netlister:
         self.write_comment("")
         self.writeln("")
 
-    def format_ident(self, ident: Ident) -> str:
-        """Format an identifier. Default just returns its string `name`."""
-        return ident.name
+    def format_ident(self, ident_or_ref: Union[Ident, Ref]) -> str:
+        """Format an identifier or reference."""
+        if isinstance(ident_or_ref, Ref):
+            return ident_or_ref.ident.name
+        return ident_or_ref.name
 
     def expression_delimiters(self) -> Tuple[str, str]:
         """Return the starting and closing delimiters for expressions."""
