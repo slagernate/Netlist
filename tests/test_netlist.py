@@ -1,6 +1,6 @@
 """
-# Netlist Unit Tests 
- 
+# Netlist Unit Tests
+
 """
 
 from io import StringIO
@@ -454,7 +454,7 @@ def test_spectre_midstream_comment():
         """model whatever diode
         + level      =        3
         *
-        * This commentary here does not break up the statement. 
+        * This commentary here does not break up the statement.
         *
         + area       =        1.1e11
         """
@@ -687,11 +687,11 @@ def test_nested_subckt_def():
     from netlist import has_external_refs, get_external_refs, Scope
 
     txt = dedent(
-        """.subckt a 
-            .subckt b 
+        """.subckt a
+            .subckt b
                 .subckt c
                 .ends
-                .subckt d 
+                .subckt d
                 .ends
                 xc c * Instance of `c`
                 xd d * Instance of `d`
@@ -865,4 +865,71 @@ def test_statistics_blocks():
     assert stats_block.mismatch[0].name.name == "param_c"
     assert stats_block.mismatch[0].dist == "gauss"
     assert isinstance(stats_block.mismatch[0].std, Float) and stats_block.mismatch[0].std.val == 0.5
+
+
+def test_apply_statistics_variations_gauss():
+    """Test Monte Carlo (Gauss) variations are applied to matching parameters."""
+    from netlist.compile import apply_statistics_variations
+    from netlist.data import Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl, Float, BinaryOp, BinaryOperator, Ref, Ident, Call
+
+    # Create a mock program with a parameter and a statistics block
+    param = ParamDecl(name=Ident("test_param"), default=Float(1.0), distr=None)
+    stats = StatisticsBlock(
+        process=None,
+        mismatch=[Variation(name=Ident("test_param"), dist="gauss", std=Float(0.1), mean=None)]
+    )
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=[param]), stats])])
+
+    # Apply variations (enable Monte Carlo, disable process)
+    apply_statistics_variations(program, enable_monte_carlo=True, enable_process_corners=False)
+
+    # Check that the parameter's default was modified with a gauss call
+    updated_param = param
+    assert isinstance(updated_param.default, BinaryOp)
+    assert updated_param.default.tp == BinaryOperator.MUL  # Multiplied by variation
+    assert isinstance(updated_param.default.right, Call)
+    assert updated_param.default.right.func.ident.name == "gauss"
+
+def test_apply_statistics_variations_process():
+    """Test process variations are applied to matching parameters."""
+    from netlist.compile import apply_statistics_variations
+    from netlist.data import Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl, Float, BinaryOp, BinaryOperator
+
+    # Create a mock program with a parameter and a statistics block
+    param = ParamDecl(name=Ident("test_param"), default=Float(1.0), distr=None)
+    stats = StatisticsBlock(
+        process=[Variation(name=Ident("test_param"), dist="gauss", std=None, mean=Float(2.0))],
+        mismatch=None
+    )
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=[param]), stats])])
+
+    # Apply variations (disable Monte Carlo, enable process)
+    apply_statistics_variations(program, enable_monte_carlo=False, enable_process_corners=True)
+
+    # Check that the parameter's default was modified by adding the mean
+    updated_param = param
+    assert isinstance(updated_param.default, BinaryOp)
+    assert updated_param.default.tp == BinaryOperator.ADD  # Added process variation
+    assert updated_param.default.right == Float(2.0)
+
+
+def test_apply_statistics_variations_no_match():
+    """Test that variations are ignored if no matching parameter exists."""
+    from netlist.compile import apply_statistics_variations
+    from netlist.data import Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl, Float
+
+    # Create a mock program with a parameter and a non-matching statistics block
+    param = ParamDecl(name=Ident("test_param"), default=Float(1.0), distr=None)
+    stats = StatisticsBlock(
+        process=[Variation(name=Ident("non_matching_param"), dist="gauss", std=Float(0.1), mean=None)],
+        mismatch=None
+    )
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=[param]), stats])])
+
+    original_default = param.default
+    # Apply variations
+    apply_statistics_variations(program, enable_monte_carlo=True, enable_process_corners=True)
+
+    # Parameter should remain unchanged
+    assert param.default == original_default
 

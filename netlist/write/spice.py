@@ -322,47 +322,10 @@ class SpiceNetlister(Netlister):
         self.write("\n")
 
     def write_statistics_block(self, stats: StatisticsBlock) -> None:
-        """Write a StatisticsBlock `stats`
-        Extract `vary` variables and set them to nominal values based on distribution and mean."""
-
-        # Not supported currently, maybe ever, by any of the supported spice-formats.
-        # Write as a comment. FIXME: add the option to bail
-
-        self.write("\n")
-
-        # However, we provide a stop-gap solution:
-        # Simply output the variations as parameters with their default (mean) value
-
-        msg = f"Unsupported `StatisticsBlock` for writer {self.__class__.__name__}"
+        """Not implemented: Statistics are handled post-parsing."""
+        msg = f"StatisticsBlock writing is not implemented in {self.__class__.__name__}; handled post-parsing."
         warn(msg)
         self.write_comment(msg)
-
-        varied_params = {}
-        for section in (stats.process, stats.mismatch):
-            if section:
-                for var in section:
-                    dist = var.dist.lower() if var.dist else None
-                    mean_val = var.mean
-                    if mean_val is not None:
-                        nominal = self.format_expr(mean_val)
-                    else:
-                        if dist == 'gauss':
-                            nominal = 0  # Gaussian with μ=0
-                        elif dist == 'lnorm':
-                            nominal = 1  # Lognormal with μ=1 (multiplicative mean)
-                        else:
-                            nominal = 0
-                            warn(f"Unknown distribution '{var.dist}' for {var.name.name}, using nominal=0")
-                    varied_params[var.name.name] = nominal
-
-        if varied_params:
-            msg = f"Writing statistics block parameters (mean values / no variation) anyway:"
-            warn(msg)
-            self.write_comment(msg)
-            self.write(".param\n")
-            for param, nominal in varied_params.items():
-                self.write(f"+ {param} = {nominal}\n")
-            self.write("\n")
 
     def write_param_decls(self, params: ParamDecls) -> None:
         """Write parameter declarations"""
