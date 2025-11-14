@@ -122,35 +122,18 @@ class SpiceNetlister(Netlister):
         """Write sub-circuit-instance `pinst`."""
 
         # Detect if the instance looks like a MOS device (even if parsed as subcircuit instance)
-        print(f"Debugging is_mos_like for instance: {pinst.name.name}")
-
-        cond1 = len(pinst.conns) == 4  # Exactly 4 ports (d, g, s, b)
-        print(f"  len(pinst.conns) == 4: {len(pinst.conns)} == 4 -> {cond1}")
-
-        cond2 = isinstance(pinst.module, Ref)
-        print(f"  isinstance(pinst.module, Ref): isinstance({type(pinst.module)}, Ref) -> {isinstance(pinst.module, Ref)}")
-
-        param_names = {p.name.name for p in pinst.params}  # Has both 'l' and 'w' params
-        cond3 = {'l', 'w'} <= param_names
-        print(f"  {{'l', 'w'}} <= param_names: {{'l', 'w'}} <= {param_names} -> {cond3}")
-
-        cond4 = any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet'])  # Instance name indicates MOS
-        print(f"  any(keyword in pinst.name.name.lower() for keywords): '{pinst.name.name.lower()}' contains ['mos', 'fet'] -> {cond4}")
-
-        cond5 = 'model' in pinst.module.ident.name.lower()  # Heuristic: module name contains 'model' (for unresolved refs)
-        print(f"'model' in {{pinst.module.ident.name.lower(): {pinst.module.ident.name.lower()} -> {cond5}")
-
-        # Overall is_mos_like
-        is_mos_like = cond1 and cond2 and cond3 and cond4
-        print(f"  Overall is_mos_like: {is_mos_like}")
+        is_mos_like = (
+            len(pinst.conns) == 4  # Exactly 4 ports (d, g, s, b)
+            and isinstance(pinst.module, Ref)  # References a model
+            and {'l', 'w'} <= {p.name.name for p in pinst.params}  # Has both 'l' and 'w' params
+            and any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet'])  # Instance name indicates MOS
+        )
 
         prefix = 'M' if is_mos_like else 'X'
 
         inst_name = self.format_ident(pinst.name)
         if prefix and not inst_name.upper().startswith(prefix):
             inst_name = f"{prefix}{inst_name}"
-
-        print(f"writing subckt_inst: {inst_name}")
 
         # Write the instance name
         self.write(inst_name + " \n")
@@ -180,12 +163,8 @@ class SpiceNetlister(Netlister):
         )
         prefix = 'M' if is_mos_like else ''
         inst_name = self.format_ident(pinst.name)
-        if is_mos_like:
-            print(f"prepending M to {inst_name}!")
         if prefix and not inst_name.upper().startswith(prefix):
             inst_name = f"{prefix}{inst_name}"
-            print(f"new inst_name: {inst_name}!")
-        print(f"writing primitive: {inst_name}")
         self.write(inst_name + " \n")
 
         # Write ports (exluding last (model)) on a separate continuation line
@@ -598,7 +577,6 @@ class XyceNetlister(SpiceNetlister):
         # End the header with a blank line
         self.write("\n")
 
-        print(f"writing internal contents for .SUBCKT: {module_name}")
         # Write internal content
         for entry in module.entries:
             self.write_entry(entry)
