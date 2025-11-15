@@ -36,11 +36,11 @@ heavily re-using a central `SpiceNetlister` class, but requiring simulator-speci
 import sys
 from enum import Enum
 from warnings import warn
-from typing import Tuple, Union, List, get_args
+from typing import Tuple, Union, List, get_args, Dict, IO
 
 # Local Imports
 from ..data import *
-from .base import Netlister
+from .base import Netlister, ErrorMode
 from typing import Optional
 
 
@@ -432,10 +432,22 @@ class XyceNetlister(SpiceNetlister):
         and enable_mismatch parameter. This only happens when writing to Xyce format.
         """
         # Apply statistics variations with XYCE format before writing
+        # This modifies the AST directly, replacing StatisticsBlocks with generated content
         apply_statistics_variations(self.src, output_format=NetlistDialects.XYCE)
 
         # Call parent implementation to do the actual writing
         super().netlist()
+
+
+    def write_library_section(self, section: LibSectionDef) -> None:
+        """Write a Library Section definition."""
+        # Write library section normally (no process variations here)
+        self.write(f".lib {self.format_ident(section.name)}\n")
+        for entry in section.entries:
+            self.write_entry(entry)
+        self.write(f".endl {self.format_ident(section.name)}\n\n")
+
+    
 
     def write_module_params(self, params: List[ParamDecl]) -> None:
         """Write the parameter declarations for Module `module`.
@@ -632,14 +644,155 @@ class CdlNetlister(SpiceNetlister):
 # Xyce-specific statistics variations handling
 
 def find_matching_param(program: Program, param_name: str) -> Optional[ParamDecl]:
-    """Find a parameter by name in the program."""
+    """Find a parameter by name in the program.
+    
+    Searches in:
+    1. Global ParamDecls (top-level)
+    2. Library sections (LibSectionDef.entries containing ParamDecls)
+    
+    Returns the first matching parameter found.
+    """
+    # First search global ParamDecls
     for file in program.files:
         for entry in file.contents:
             if isinstance(entry, ParamDecls):
                 for param in entry.params:
                     if param.name.name == param_name:
                         return param
+    
+    # Then search library sections
+    for file in program.files:
+        for entry in file.contents:
+            if isinstance(entry, LibSectionDef):
+                for sub_entry in entry.entries:
+                    if isinstance(sub_entry, ParamDecls):
+                        for param in sub_entry.params:
+                            if param.name.name == param_name:
+                                return param
+    
     return None
+
+
+def replace_param_ref_in_expr(expr: Expr, param_name: str, func_call: Call) -> Expr:
+    """Recursively replace Ref nodes matching param_name with func_call in an expression."""
+    # Handle Ref nodes - this is the key replacement
+    if isinstance(expr, Ref):
+        if expr.ident.name == param_name:
+            return func_call
+        return expr
+    
+    # Handle Call nodes - recurse into arguments
+    if isinstance(expr, Call):
+        new_args = [replace_param_ref_in_expr(arg, param_name, func_call) for arg in expr.args]
+        if new_args != expr.args:
+            return Call(func=expr.func, args=new_args)
+        return expr
+    
+    # Handle BinaryOp - recurse into left and right
+    if isinstance(expr, BinaryOp):
+        new_left = replace_param_ref_in_expr(expr.left, param_name, func_call)
+        new_right = replace_param_ref_in_expr(expr.right, param_name, func_call)
+        if new_left != expr.left or new_right != expr.right:
+            return BinaryOp(tp=expr.tp, left=new_left, right=new_right)
+        return expr
+    
+    # Handle UnaryOp - recurse into target
+    if isinstance(expr, UnaryOp):
+        new_targ = replace_param_ref_in_expr(expr.targ, param_name, func_call)
+        if new_targ != expr.targ:
+            return UnaryOp(tp=expr.tp, targ=new_targ)
+        return expr
+    
+    # Handle TernOp - recurse into all three parts
+    if isinstance(expr, TernOp):
+        new_cond = replace_param_ref_in_expr(expr.cond, param_name, func_call)
+        new_if_true = replace_param_ref_in_expr(expr.if_true, param_name, func_call)
+        new_if_false = replace_param_ref_in_expr(expr.if_false, param_name, func_call)
+        if (new_cond != expr.cond or new_if_true != expr.if_true or 
+            new_if_false != expr.if_false):
+            return TernOp(cond=new_cond, if_true=new_if_true, if_false=new_if_false)
+        return expr
+    
+    # Literals and other types - no replacement needed
+    return expr
+
+
+def replace_param_refs_in_entry(entry: Entry, param_name: str, func_call: Call) -> None:
+    """Replace parameter references in a single Entry."""
+    # ParamDecls - replace in each param's default
+    if isinstance(entry, ParamDecls):
+        for param in entry.params:
+            if param.default is not None:
+                param.default = replace_param_ref_in_expr(param.default, param_name, func_call)
+    
+    # SubcktDef - replace in params and recurse into entries
+    elif isinstance(entry, SubcktDef):
+        for param in entry.params:
+            if param.default is not None:
+                param.default = replace_param_ref_in_expr(param.default, param_name, func_call)
+        for sub_entry in entry.entries:
+            replace_param_refs_in_entry(sub_entry, param_name, func_call)
+    
+    # ModelDef - replace in params
+    elif isinstance(entry, ModelDef):
+        for param in entry.params:
+            if param.default is not None:
+                param.default = replace_param_ref_in_expr(param.default, param_name, func_call)
+    
+    # ModelFamily - recurse into variants
+    elif isinstance(entry, ModelFamily):
+        for variant in entry.variants:
+            for param in variant.params:
+                if param.default is not None:
+                    param.default = replace_param_ref_in_expr(param.default, param_name, func_call)
+    
+    # FunctionDef - replace in return statement
+    elif isinstance(entry, FunctionDef):
+        for stmt in entry.stmts:
+            if isinstance(stmt, Return):
+                stmt.val = replace_param_ref_in_expr(stmt.val, param_name, func_call)
+    
+    # Instance - replace in param values
+    elif isinstance(entry, Instance):
+        for param_val in entry.params:
+            param_val.val = replace_param_ref_in_expr(param_val.val, param_name, func_call)
+    
+    # Primitive - replace in kwargs
+    elif isinstance(entry, Primitive):
+        for param_val in entry.kwargs:
+            param_val.val = replace_param_ref_in_expr(param_val.val, param_name, func_call)
+    
+    # Options - replace in option values (if Expr, not QuotedString)
+    elif isinstance(entry, Options):
+        for option in entry.vals:
+            # OptionVal = Union[QuotedString, Expr], so check if it's not QuotedString
+            if not isinstance(option.val, QuotedString):
+                option.val = replace_param_ref_in_expr(option.val, param_name, func_call)
+    
+    # LibSectionDef - recurse into entries
+    elif isinstance(entry, LibSectionDef):
+        for sub_entry in entry.entries:
+            replace_param_refs_in_entry(sub_entry, param_name, func_call)
+
+
+def replace_param_refs_in_program(program: Program, param_name: str, func_call: Call) -> None:
+    """Replace all references to param_name throughout the entire program with func_call."""
+    for file in program.files:
+        for entry in file.contents:
+            replace_param_refs_in_entry(entry, param_name, func_call)
+
+
+def remove_param_declaration(program: Program, param_name: str) -> None:
+    """Remove the parameter declaration from global ParamDecls and library sections."""
+    for file in program.files:
+        for entry in file.contents:
+            if isinstance(entry, ParamDecls):
+                entry.params = [p for p in entry.params if p.name.name != param_name]
+            elif isinstance(entry, LibSectionDef):
+                # Also remove from library sections
+                for sub_entry in entry.entries:
+                    if isinstance(sub_entry, ParamDecls):
+                        sub_entry.params = [p for p in sub_entry.params if p.name.name != param_name]
 
 
 def collect_statistics_blocks(program: Program) -> List[StatisticsBlock]:
@@ -664,9 +817,30 @@ def has_lognorm_distributions(stats_blocks: List[StatisticsBlock]) -> bool:
 
 
 def add_lnorm_functions(program: Program) -> None:
-    """Add lnorm and alnorm function definitions to the program (Xyce .FUNC definitions)."""
+    """Add lnorm and alnorm function definitions to the program (Xyce .FUNC definitions).
+    
+    Functions are added to the file containing statistics blocks, right before the first StatisticsBlock
+    to preserve order.
+    """
     if not program.files:
         return
+
+    # Find the file that contains statistics blocks (models.scs) to add functions there
+    stats_file = None
+    stats_block_idx = None
+    for file in program.files:
+        for idx, entry in enumerate(file.contents):
+            if isinstance(entry, StatisticsBlock):
+                stats_file = file
+                stats_block_idx = idx
+                break
+        if stats_file:
+            break
+    
+    # Fallback to first file if no stats file found
+    if not stats_file:
+        stats_file = program.files[0]
+        stats_block_idx = len(stats_file.contents)
 
     math_funcs = [
         FunctionDef(
@@ -674,14 +848,13 @@ def add_lnorm_functions(program: Program) -> None:
             rtype=ArgType.REAL,
             args=[
                 TypedArg(tp=ArgType.REAL, name=Ident("mu")),
-                TypedArg(tp=ArgType.REAL, name=Ident("sigma")),
-                TypedArg(tp=ArgType.REAL, name=Ident("seed"))
+                TypedArg(tp=ArgType.REAL, name=Ident("sigma"))
             ],
             stmts=[Return(val=Call(
                 func=Ref(ident=Ident("exp")),
                 args=[Call(
                     func=Ref(ident=Ident("gauss")),
-                    args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma")), Ref(ident=Ident("seed"))]
+                    args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma"))]
                 )]
             ))]
         ),
@@ -690,22 +863,25 @@ def add_lnorm_functions(program: Program) -> None:
             rtype=ArgType.REAL,
             args=[
                 TypedArg(tp=ArgType.REAL, name=Ident("mu")),
-                TypedArg(tp=ArgType.REAL, name=Ident("sigma")),
-                TypedArg(tp=ArgType.REAL, name=Ident("seed"))
+                TypedArg(tp=ArgType.REAL, name=Ident("sigma"))
             ],
             stmts=[Return(val=Call(
                 func=Ref(ident=Ident("exp")),
                 args=[Call(
                     func=Ref(ident=Ident("gauss")),
-                    args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma")), Ref(ident=Ident("seed"))]
+                    args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma"))]
                 )]
             ))]
         )
     ]
-    program.files[0].contents.extend(math_funcs)
+    # Insert functions before the StatisticsBlock to preserve order
+    if stats_block_idx is not None:
+        stats_file.contents[stats_block_idx:stats_block_idx] = math_funcs
+    else:
+        stats_file.contents.extend(math_funcs)
 
 
-def create_monte_carlo_distribution_call(dist_type: str, std: Float, seed: int) -> Optional[Call]:
+def create_monte_carlo_distribution_call(dist_type: str, std: Float) -> Optional[Call]:
     """Create a distribution function call (gauss or lnorm) for Monte Carlo variation.
 
     Returns a Call expression for the distribution function, or None if the distribution
@@ -716,9 +892,9 @@ def create_monte_carlo_distribution_call(dist_type: str, std: Float, seed: int) 
 
     dist_type_lower = dist_type.lower()
     if 'gauss' in dist_type_lower:
-        return Call(func=Ref(ident=Ident("gauss")), args=[Int(0), Float(1), Int(1)])
+        return Call(func=Ref(ident=Ident("gauss")), args=[Int(0), Float(1)])
     elif 'lnorm' in dist_type_lower:
-        return Call(func=Ref(ident=Ident("lnorm")), args=[Int(0), Float(1), Int(1)])
+        return Call(func=Ref(ident=Ident("lnorm")), args=[Int(0), Float(1)])
 
     # Warn about unsupported distribution type
     warn(f"Unsupported distribution type '{dist_type}' for Monte Carlo variation. Supported types: gauss, lnorm")
@@ -730,7 +906,7 @@ def apply_monte_carlo_variation(original_expr: Expr, var: Variation) -> Expr:
     if not var.dist:
         return original_expr
 
-    dist_call = create_monte_carlo_distribution_call(var.dist, var.std, 1)
+    dist_call = create_monte_carlo_distribution_call(var.dist, var.std)
     if not dist_call:
         return original_expr
 
@@ -739,50 +915,143 @@ def apply_monte_carlo_variation(original_expr: Expr, var: Variation) -> Expr:
     return BinaryOp(tp=BinaryOperator.MUL, left=original_expr, right=one_plus_variation)
 
 
-def apply_process_variation(program: Program, var: Variation) -> None:
-    """Apply a single process variation to its corresponding parameter."""
-    matching_param = find_matching_param(program, var.name.name)
-    if not matching_param:
-        warn(f"No matching parameter found for mismatch variation '{var.name.name}'. Skipping.")
-        return
-
-    original_expr = matching_param.default or Int(0)
-    new_expr = apply_monte_carlo_variation(original_expr, var)
-
+def create_relative_process_variation_expr(param_name: str, var: Variation) -> Expr:
+    """Create a relative process variation expression that references the parameter itself.
+    
+    Returns: {param_name * (1 + std * dist(...)) + mean}
+    This allows the variation to work regardless of which library section's value is used.
+    """
+    # Reference to the parameter itself
+    param_ref = Ref(ident=Ident(param_name))
+    
+    # Apply Monte Carlo variation: param_name * (1 + std * dist(...))
+    if var.dist:
+        dist_call = create_monte_carlo_distribution_call(var.dist, var.std)
+        if dist_call:
+            variation_term = BinaryOp(tp=BinaryOperator.MUL, left=var.std, right=dist_call)
+            one_plus_variation = BinaryOp(tp=BinaryOperator.ADD, left=Float(1), right=variation_term)
+            varied_expr = BinaryOp(tp=BinaryOperator.MUL, left=param_ref, right=one_plus_variation)
+        else:
+            varied_expr = param_ref
+    else:
+        varied_expr = param_ref
+    
     # Add mean value if present (for corner analysis)
     if var.mean:
-        new_expr = BinaryOp(tp=BinaryOperator.ADD, left=new_expr, right=var.mean)
+        varied_expr = BinaryOp(tp=BinaryOperator.ADD, left=varied_expr, right=var.mean)
+    
+    return varied_expr
 
-    matching_param.default = new_expr
 
-
-def apply_all_process_variations(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
-    """Apply all process variations from statistics blocks."""
+def verify_process_variation_params(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
+    """Verify that all parameters in process variations exist (in library sections or global).
+    
+    Raises RuntimeError if any parameters are missing.
+    """
+    missing_params = []
     for stats in stats_blocks:
         if stats.process:
             for var in stats.process:
-                apply_process_variation(program, var)
+                param_name = var.name.name
+                matching_param = find_matching_param(program, param_name)
+                if not matching_param:
+                    missing_params.append(param_name)
+    
+    if missing_params:
+        raise RuntimeError(
+            f"Process variation parameters not found: {', '.join(missing_params)}. "
+            f"These parameters must exist in at least one library section or as global parameters."
+        )
 
 
-def add_enable_mismatch_parameter(program: Program) -> None:
-    """Add enable_mismatch parameter to the program if it doesn't exist."""
-    if find_matching_param(program, "enable_mismatch"):
-        return  # Already exists
+def calculate_process_variation_expr(param_name: str, var: Variation) -> Expr:
+    """Calculate the relative process variation expression for a parameter.
+    
+    Returns an expression that references the parameter itself: {param_name * (1 + std * dist(...)) + mean}
+    This expression will be applied after library sections as a relative assignment.
+    """
+    return create_relative_process_variation_expr(param_name, var)
 
-    if not program.files:
-        return
 
-    enable_mismatch_decl = ParamDecl(name=Ident("enable_mismatch"), default=Float(1.0), distr=None)
+def is_param_in_process_variations(stats_blocks: List[StatisticsBlock], param_name: str) -> bool:
+    """Check if a parameter name appears in any process variations."""
+    for stats in stats_blocks:
+        if stats.process:
+            for var in stats.process:
+                if var.name.name == param_name:
+                    return True
+    return False
 
-    # Try to find existing ParamDecls to add to
+
+def is_param_in_library_section(program: Program, param_name: str) -> bool:
+    """Check if a parameter exists in a library section (not just global ParamDecls)."""
     for file in program.files:
         for entry in file.contents:
-            if isinstance(entry, ParamDecls):
-                entry.params.append(enable_mismatch_decl)
-                return
+            if isinstance(entry, LibSectionDef):
+                for sub_entry in entry.entries:
+                    if isinstance(sub_entry, ParamDecls):
+                        for param in sub_entry.params:
+                            if param.name.name == param_name:
+                                return True
+    return False
 
-    # If no ParamDecls found, create a new one
-    program.files[0].contents.insert(0, ParamDecls(params=[enable_mismatch_decl]))
+
+def apply_all_process_variations_legacy(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
+    """Legacy behavior: apply variations directly to global parameters (for non-Xyce formats)."""
+    for stats in stats_blocks:
+        if stats.process:
+            for var in stats.process:
+                # Only apply to global parameters, not library section parameters
+                if not is_param_in_library_section(program, var.name.name):
+                    matching_param = find_matching_param(program, var.name.name)
+                    if matching_param:
+                        original_expr = matching_param.default or Int(0)
+                        new_expr = apply_monte_carlo_variation(original_expr, var)
+                        if var.mean:
+                            new_expr = BinaryOp(tp=BinaryOperator.ADD, left=new_expr, right=var.mean)
+                        matching_param.default = new_expr
+
+
+def replace_statistics_blocks_with_generated_content(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
+    """Replace StatisticsBlocks in the AST with generated functions and process variations for library parameters."""
+    # First apply process variations to all parameters (library and global)
+    # This maintains backward compatibility for global parameters
+    apply_all_process_variations_legacy(program, stats_blocks)
+
+    # Verify all parameters exist (error if any missing)
+    verify_process_variation_params(program, stats_blocks)
+
+    # Process each statistics block
+    for stats in stats_blocks:
+        # Collect generated content to replace the StatisticsBlock
+        generated_content = []
+
+        # Add process variations for library parameters only
+        if stats.process:
+            # Create process variation expressions
+            process_variations = []
+            for var in stats.process:
+                param_name = var.name.name
+                if is_param_in_library_section(program, param_name):
+                    varied_expr = create_relative_process_variation_expr(param_name, var)
+                    process_variations.append((param_name, varied_expr))
+
+            if process_variations:
+                # Create a ParamDecls with the process variations
+                param_decls = []
+                for param_name, varied_expr in process_variations:
+                    param_decls.append(ParamDecl(name=Ident(param_name), default=varied_expr, distr=None))
+                generated_content.append(ParamDecls(params=param_decls))
+
+        # Replace the StatisticsBlock with generated content
+        for file in program.files:
+            for i, entry in enumerate(file.contents):
+                if isinstance(entry, StatisticsBlock) and entry is stats:
+                    file.contents[i:i+1] = generated_content
+                    break
+
+    # Now apply mismatch variations (creates functions and replaces references)
+    apply_all_mismatch_variations(program, stats_blocks)
 
 
 def create_mismatch_function(var: Variation, idx: int, original_expr: Expr) -> Optional[FunctionDef]:
@@ -826,14 +1095,20 @@ def create_mismatch_function(var: Variation, idx: int, original_expr: Expr) -> O
     )
 
 
-def apply_mismatch_variation(program: Program, var: Variation, idx: int) -> None:
-    """Apply a single mismatch variation by creating a function and updating the parameter to solely use the function call.
+def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_blocks: List[StatisticsBlock]) -> None:
+    """Apply a single mismatch variation by creating a function and replacing all references.
     
-    The original parameter definition is effectively "deleted" by this replacement.
-    The function now encapsulates the original value, so the parameter defaults to just the function call.
+    This effectively "deletes" the parameter by:
+    1. Creating a mismatch function with the original value
+    2. Replacing ALL references to the parameter with the function call
+    3. Removing the parameter declaration
     """
     matching_param = find_matching_param(program, var.name.name)
     if not matching_param:
+        # Check if parameter is in process variations - if so, silently skip (it's process-only)
+        if is_param_in_process_variations(stats_blocks, var.name.name):
+            return  # Silently skip - parameter is process-only, not a real error
+        # Otherwise, warn (real error - parameter doesn't exist)
         warn(f"No matching parameter found for mismatch variation '{var.name.name}'. Skipping.")
         return
 
@@ -846,25 +1121,53 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int) -> None
 
     func_name = mismatch_func.name.name
 
-    # Add function to the first file
-    if program.files:
-        program.files[0].contents.append(mismatch_func)
+    # Add function to the file that contains statistics blocks (models.scs)
+    # Insert it right before the StatisticsBlock to preserve order
+    stats_file = None
+    stats_block_idx = None
+    for file in program.files:
+        for idx, entry in enumerate(file.contents):
+            if isinstance(entry, StatisticsBlock):
+                stats_file = file
+                stats_block_idx = idx
+                break
+        if stats_file:
+            break
+    
+    # Fallback to first file if no stats file found
+    if not stats_file and program.files:
+        stats_file = program.files[0]
+        stats_block_idx = len(stats_file.contents)
+    
+    if stats_file:
+        # Insert before StatisticsBlock to preserve order
+        # But we need to account for functions already inserted
+        # Find the actual position (after any lnorm/alnorm functions, before StatisticsBlock)
+        if stats_block_idx is not None:
+            # Insert right before StatisticsBlock (after any lnorm functions)
+            stats_file.contents.insert(stats_block_idx, mismatch_func)
+            # Update stats_block_idx for next mismatch function
+        else:
+            stats_file.contents.append(mismatch_func)
 
-    # "Delete" the original parameter definition by replacing it solely with the function call
-    # The function now encapsulates the original value, so no need for original + function_call
+    # Create function call to use as replacement
     func_call = Call(func=Ref(ident=Ident(func_name)), args=[])
-    matching_param.default = func_call
+    
+    # Replace ALL references to this parameter throughout the program
+    replace_param_refs_in_program(program, var.name.name, func_call)
+    
+    # Remove the parameter declaration (effectively "deleting" it)
+    remove_param_declaration(program, var.name.name)
 
 
 def apply_all_mismatch_variations(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
     """Apply all mismatch variations from statistics blocks (Xyce-specific)."""
-    add_enable_mismatch_parameter(program)
 
     mismatch_idx = 0
     for stats in stats_blocks:
         if stats.mismatch:
             for var in stats.mismatch:
-                apply_mismatch_variation(program, var, mismatch_idx)
+                apply_mismatch_variation(program, var, mismatch_idx, stats_blocks)
                 mismatch_idx += 1
 
 
@@ -875,9 +1178,8 @@ def apply_statistics_variations(program: Program, output_format: Optional[Netlis
     Both process and mismatch variations use Monte Carlo (implied).
     Process variations may also include mean values for corner analysis.
 
-    Xyce-specific transformations (mismatch functions, enable_mismatch parameter, lnorm function definitions)
-    are only applied when output_format is NetlistDialects.XYCE. This allows the same program to be
-    written to different formats (e.g., Spectre) without Xyce-specific artifacts.
+    For Xyce format, replaces StatisticsBlocks in the AST with generated functions and process variations.
+    For other formats, applies variations directly to parameters (legacy behavior).
     """
     stats_blocks = collect_statistics_blocks(program)
     if not stats_blocks:
@@ -885,14 +1187,14 @@ def apply_statistics_variations(program: Program, output_format: Optional[Netlis
 
     is_xyce = output_format == NetlistDialects.XYCE
 
-    # Add lnorm functions if needed (Xyce-specific)
-    if has_lognorm_distributions(stats_blocks) and is_xyce:
-        add_lnorm_functions(program)
-
-    # Apply process variations (format-agnostic)
-    apply_all_process_variations(program, stats_blocks)
-
-    # Apply mismatch variations (Xyce-specific)
     if is_xyce:
-        apply_all_mismatch_variations(program, stats_blocks)
+        # Add lnorm functions if needed (Xyce-specific)
+        if has_lognorm_distributions(stats_blocks):
+            add_lnorm_functions(program)
+
+        # For Xyce: replace StatisticsBlocks in AST with generated content
+        replace_statistics_blocks_with_generated_content(program, stats_blocks)
+    else:
+        # Legacy behavior: apply directly to parameters (for non-Xyce formats)
+        apply_all_process_variations_legacy(program, stats_blocks)
 

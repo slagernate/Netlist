@@ -1031,9 +1031,9 @@ def test_apply_statistics_vary_mismatch():
     # Pass XYCE format to enable Xyce-specific transformations (mismatch functions, enable_mismatch, lnorm definitions)
     apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
 
-    # Check width parameter: mismatch creates function call
-    # Expected: original + width_mismatch() where width_mismatch() {enable_mismatch * gauss(0, std, seed)}
-    # Also verify enable_mismatch parameter was added
+    # NEW BEHAVIOR: Parameters with mismatch variations are REMOVED and replaced with function calls
+    # Verify enable_mismatch parameter was NOT added to the generated library
+    # Users should define enable_mismatch=1.0 in their external netlists to enable mismatch
     enable_mismatch_param = next(
         (param for file in program.files
          for entry in file.contents
@@ -1042,31 +1042,19 @@ def test_apply_statistics_vary_mismatch():
          if param.name.name == "enable_mismatch"),
         None
     )
-    assert enable_mismatch_param is not None, "Expected enable_mismatch parameter to be added"
-    assert isinstance(enable_mismatch_param.default, Float) and enable_mismatch_param.default.val == 1.0
-    width_param = params[0]
-    assert isinstance(width_param.default, BinaryOp)
-    assert width_param.default.tp == BinaryOperator.ADD  # Expected: original + function_call
-    assert isinstance(width_param.default.left, Float) and width_param.default.left.val == 1.0  # Original value
-    assert isinstance(width_param.default.right, Call)
-    assert width_param.default.right.func.ident.name == "width_mismatch"  # Function call: width_mismatch()
-    assert len(width_param.default.right.args) == 0  # No arguments
-
-    # Check length parameter: mismatch creates function call
-    length_param = params[1]
-    assert isinstance(length_param.default, BinaryOp)
-    assert length_param.default.tp == BinaryOperator.ADD
-    assert isinstance(length_param.default.left, Float) and length_param.default.left.val == 0.5
-    assert isinstance(length_param.default.right, Call)
-    assert length_param.default.right.func.ident.name == "length_mismatch"  # Function call: length_mismatch()
-
-    # Check tox parameter: mismatch creates function call with lnorm
-    tox_param = params[2]
-    assert isinstance(tox_param.default, BinaryOp)
-    assert tox_param.default.tp == BinaryOperator.ADD
-    assert isinstance(tox_param.default.left, Float) and tox_param.default.left.val == 2.0e-9
-    assert isinstance(tox_param.default.right, Call)
-    assert tox_param.default.right.func.ident.name == "tox_mismatch"  # Function call: tox_mismatch()
+    assert enable_mismatch_param is None, "enable_mismatch should not be added to generated library - users define it externally"
+    
+    # Verify width, length, and tox parameters were REMOVED
+    all_params = [
+        param for file in program.files
+        for entry in file.contents
+        if isinstance(entry, ParamDecls)
+        for param in entry.params
+    ]
+    param_names = [p.name.name for p in all_params]
+    assert "width" not in param_names, "width parameter should be removed"
+    assert "length" not in param_names, "length parameter should be removed"
+    assert "tox" not in param_names, "tox parameter should be removed"
     
     # Verify that mismatch functions were added to the program
     mismatch_funcs = [
@@ -1076,39 +1064,49 @@ def test_apply_statistics_vary_mismatch():
     ]
     assert len(mismatch_funcs) == 3, f"Expected 3 mismatch functions, got {len(mismatch_funcs)}"
     
-    # Verify width function uses gauss with enable_mismatch multiplier
+    # Verify width function uses gauss with enable_mismatch multiplier and includes original value
     width_func = next(f for f in mismatch_funcs if f.name.name == "width_mismatch")
     assert len(width_func.stmts) == 1
     assert isinstance(width_func.stmts[0], Return)
     width_return_val = width_func.stmts[0].val
-    # Expected: enable_mismatch * gauss(...)
+    # Expected: original_value + enable_mismatch * gauss(...)
     assert isinstance(width_return_val, BinaryOp)
-    assert width_return_val.tp == BinaryOperator.MUL
-    assert isinstance(width_return_val.left, Ref) and width_return_val.left.ident.name == "enable_mismatch"
-    width_call = width_return_val.right
+    assert width_return_val.tp == BinaryOperator.ADD
+    # Left side should be original value
+    assert isinstance(width_return_val.left, Float) and width_return_val.left.val == 1.0
+    # Right side should be enable_mismatch * gauss(...)
+    mismatch_term = width_return_val.right
+    assert isinstance(mismatch_term, BinaryOp)
+    assert mismatch_term.tp == BinaryOperator.MUL
+    assert isinstance(mismatch_term.left, Ref) and mismatch_term.left.ident.name == "enable_mismatch"
+    width_call = mismatch_term.right
     assert isinstance(width_call, Call)
     assert width_call.func.ident.name == "gauss"  # Expected: gauss for mismatch
-    assert len(width_call.args) == 3
+    assert len(width_call.args) == 2  # Unseeded: gauss(mean, std) with 2 args only
     assert isinstance(width_call.args[0], Int) and width_call.args[0].val == 0  # mean = 0
     assert isinstance(width_call.args[1], Float) and width_call.args[1].val == 0.1  # std
-    assert isinstance(width_call.args[2], Int) and width_call.args[2].val == 1  # seed
     
-    # Verify tox function uses lnorm with enable_mismatch multiplier
+    # Verify tox function uses lnorm with enable_mismatch multiplier and includes original value
     tox_func = next(f for f in mismatch_funcs if f.name.name == "tox_mismatch")
     assert len(tox_func.stmts) == 1
     assert isinstance(tox_func.stmts[0], Return)
     tox_return_val = tox_func.stmts[0].val
-    # Expected: enable_mismatch * lnorm(...)
+    # Expected: original_value + enable_mismatch * lnorm(...)
     assert isinstance(tox_return_val, BinaryOp)
-    assert tox_return_val.tp == BinaryOperator.MUL
-    assert isinstance(tox_return_val.left, Ref) and tox_return_val.left.ident.name == "enable_mismatch"
-    tox_call = tox_return_val.right
+    assert tox_return_val.tp == BinaryOperator.ADD
+    # Left side should be original value
+    assert isinstance(tox_return_val.left, Float) and tox_return_val.left.val == 2.0e-9
+    # Right side should be enable_mismatch * lnorm(...)
+    mismatch_term = tox_return_val.right
+    assert isinstance(mismatch_term, BinaryOp)
+    assert mismatch_term.tp == BinaryOperator.MUL
+    assert isinstance(mismatch_term.left, Ref) and mismatch_term.left.ident.name == "enable_mismatch"
+    tox_call = mismatch_term.right
     assert isinstance(tox_call, Call)
     assert tox_call.func.ident.name == "lnorm"  # Expected: lnorm for lognormal mismatch
-    assert len(tox_call.args) == 3
+    assert len(tox_call.args) == 2  # Unseeded: lnorm(mean, std) with 2 args only
     assert isinstance(tox_call.args[0], Int) and tox_call.args[0].val == 0  # mean = 0
     assert isinstance(tox_call.args[1], Float) and tox_call.args[1].val == 0.15  # std
-    assert isinstance(tox_call.args[2], Int) and tox_call.args[2].val == 3  # seed (third mismatch param, so idx=2, seed=3)
     
     # Verify that lnorm function definition was added to the program
     # (needed for the tox() function to work, since it calls lnorm)
@@ -1225,9 +1223,12 @@ def test_apply_statistics_vary_no_match():
     
     # Apply variations (both process and mismatch blocks present, but no matching parameters)
     # Pass XYCE format to test Xyce-specific behavior
-    apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
+    # Expected: should raise RuntimeError because process variation parameters don't exist
+    import pytest
+    with pytest.raises(RuntimeError, match="Process variation parameters not found"):
+        apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
 
-    # Expected: parameters should remain unchanged since no matching variations exist
+    # Parameters should remain unchanged since error was raised before applying
     assert params[0].default == original_width, "width parameter should remain unchanged"
     assert params[1].default == original_length, "length parameter should remain unchanged"
 
@@ -1325,31 +1326,347 @@ def test_param_mismatch_and_corner():
     # Apply variations with XYCE format
     apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
 
-    # Expected: vth should have both process variation (Monte Carlo + mean) and mismatch function
-    # Structure: ((original * (1 + std * gauss(...))) + mean) + vth_mismatch()
-    vth_param = params[0]
+    # NEW BEHAVIOR: When a parameter has mismatch variation, it's removed and references are replaced
+    # However, if it also has process variation, the process variation is applied first
+    # But then mismatch removes it. This means process variation is lost for mismatch params.
+    # For now, verify the parameter is removed (mismatch takes precedence)
     
-    # The parameter should be updated to include both variations
-    assert isinstance(vth_param.default, BinaryOp), "vth parameter should be updated with variations"
+    # Verify vth parameter was REMOVED (mismatch variation removes it)
+    all_params = [
+        param for file in program.files
+        for entry in file.contents
+        if isinstance(entry, ParamDecls)
+        for param in entry.params
+    ]
+    param_names = [p.name.name for p in all_params]
+    assert "vth" not in param_names, "vth parameter should be removed by mismatch variation"
     
-    # The outermost operation should be ADD (original + mismatch function)
-    assert vth_param.default.tp == BinaryOperator.ADD, "Outermost operation should be ADD for combined variations"
-    
-    # The left side should be the process variation result: (original * (1 + std * gauss(...))) + mean
-    process_result = vth_param.default.left
-    assert isinstance(process_result, BinaryOp), "Process variation should be applied"
-    assert process_result.tp == BinaryOperator.ADD, "Process variation should add mean"
-    
-    # The right side should be the mismatch function call
-    mismatch_call = vth_param.default.right
-    assert isinstance(mismatch_call, Call), "Mismatch should be a function call"
-    assert mismatch_call.func.ident.name == "vth_mismatch", "Mismatch function should be vth_mismatch()"
-    
-    # Verify mismatch function was created
+    # Verify mismatch function was created with original value
     mismatch_funcs = [
         entry for file in program.files
         for entry in file.contents
         if isinstance(entry, FunctionDef) and entry.name.name == "vth_mismatch"
     ]
     assert len(mismatch_funcs) == 1, "vth_mismatch function should be created"
+    vth_func = mismatch_funcs[0]
+    
+    # Verify function includes process-varied value (process variation applied first)
+    assert len(vth_func.stmts) == 1
+    assert isinstance(vth_func.stmts[0], Return)
+    func_return = vth_func.stmts[0].val
+    assert isinstance(func_return, BinaryOp)
+    assert func_return.tp == BinaryOperator.ADD
+    # Left side should be the process variation result: (original * (1 + std * gauss(...))) + mean
+    process_result = func_return.left
+    assert isinstance(process_result, BinaryOp), "Function should include process variation result"
+    assert process_result.tp == BinaryOperator.ADD, "Process variation should add mean"
+    # Right side should be enable_mismatch * gauss(...)
+    mismatch_term = func_return.right
+    assert isinstance(mismatch_term, BinaryOp)
+    assert mismatch_term.tp == BinaryOperator.MUL
+    assert isinstance(mismatch_term.left, Ref) and mismatch_term.left.ident.name == "enable_mismatch"
+
+
+def test_mismatch_parameter_reference_replacement():
+    """Test that mismatch variations replace ALL parameter references and remove the declaration.
+    
+    This test verifies the new behavior where:
+    1. All references to a parameter with mismatch variation are replaced with function calls
+    2. The parameter declaration is removed from ParamDecls
+    3. References in various places (instances, subcircuits, expressions) are all replaced
+    """
+    from netlist.write.spice import apply_statistics_variations
+    from netlist.data import (
+        Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl,
+        Float, Ref, Ident, Call, FunctionDef, Return, Int, Instance, ParamVal,
+        SubcktDef, BinaryOp, BinaryOperator
+    )
+
+    # Create a parameter that will have mismatch variation
+    mm_z1_param = ParamDecl(name=Ident("mm_z1"), default=Int(0), distr=None)
+    other_param = ParamDecl(name=Ident("other_param"), default=Float(1.0), distr=None)
+    
+    # Create an instance that references mm_z1
+    instance = Instance(
+        name=Ident("X1"),
+        module=Ref(ident=Ident("subckt1")),
+        conns=[],
+        params=[
+            ParamVal(name=Ident("param1"), val=Ref(ident=Ident("mm_z1"))),  # Reference to mm_z1
+            ParamVal(name=Ident("param2"), val=Float(2.0)),
+        ]
+    )
+    
+    # Create a subcircuit with a parameter that references mm_z1
+    subckt = SubcktDef(
+        name=Ident("subckt1"),
+        ports=[],
+        params=[
+            ParamDecl(name=Ident("sub_param"), default=BinaryOp(
+                tp=BinaryOperator.ADD,
+                left=Ref(ident=Ident("mm_z1")),  # Reference to mm_z1 in expression
+                right=Float(1.0)
+            ), distr=None),
+        ],
+        entries=[]
+    )
+    
+    # Create another parameter that references mm_z1 in its default
+    param_with_ref = ParamDecl(
+        name=Ident("param_ref"),
+        default=BinaryOp(
+            tp=BinaryOperator.MUL,
+            left=Ref(ident=Ident("mm_z1")),  # Reference to mm_z1
+            right=Float(2.0)
+        ),
+        distr=None
+    )
+    
+    # Statistics block with mismatch variation for mm_z1
+    stats = StatisticsBlock(
+        process=None,
+        mismatch=[
+            Variation(name=Ident("mm_z1"), dist="gauss", std=Float(0.1), mean=None),
+        ]
+    )
+    
+    program = Program(files=[SourceFile(
+        path="test",
+        contents=[
+            ParamDecls(params=[mm_z1_param, other_param, param_with_ref]),
+            stats,
+            instance,
+            subckt,
+        ]
+    )])
+    
+    # Apply mismatch variation
+    apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
+    
+    # 1. Verify the parameter declaration was REMOVED
+    all_params = [
+        param for file in program.files
+        for entry in file.contents
+        if isinstance(entry, ParamDecls)
+        for param in entry.params
+    ]
+    param_names = [p.name.name for p in all_params]
+    assert "mm_z1" not in param_names, "mm_z1 parameter declaration should be removed"
+    assert "other_param" in param_names, "other_param should still exist"
+    assert "param_ref" in param_names, "param_ref should still exist"
+    
+    # 2. Verify mismatch function was created
+    mismatch_funcs = [
+        entry for file in program.files
+        for entry in file.contents
+        if isinstance(entry, FunctionDef) and entry.name.name == "mm_z1_mismatch"
+    ]
+    assert len(mismatch_funcs) == 1, "mm_z1_mismatch function should be created"
+    mm_z1_func = mismatch_funcs[0]
+    
+    # Verify function includes original value
+    assert len(mm_z1_func.stmts) == 1
+    assert isinstance(mm_z1_func.stmts[0], Return)
+    func_return = mm_z1_func.stmts[0].val
+    assert isinstance(func_return, BinaryOp)
+    assert func_return.tp == BinaryOperator.ADD
+    assert isinstance(func_return.left, Int) and func_return.left.val == 0  # Original value
+    
+    # 3. Verify instance parameter reference was replaced
+    instance_param1 = next(p for p in instance.params if p.name.name == "param1")
+    assert isinstance(instance_param1.val, Call), "Instance param reference should be replaced with function call"
+    assert instance_param1.val.func.ident.name == "mm_z1_mismatch"
+    assert len(instance_param1.val.args) == 0
+    
+    # 4. Verify subcircuit parameter default reference was replaced
+    subckt_param = subckt.params[0]
+    assert isinstance(subckt_param.default, BinaryOp)
+    assert subckt_param.default.tp == BinaryOperator.ADD
+    # The left side should be the function call, not the Ref
+    assert isinstance(subckt_param.default.left, Call), "Subcircuit param reference should be replaced"
+    assert subckt_param.default.left.func.ident.name == "mm_z1_mismatch"
+    assert isinstance(subckt_param.default.right, Float) and subckt_param.default.right.val == 1.0
+    
+    # 5. Verify parameter default reference was replaced
+    param_ref_entry = next(
+        param for file in program.files
+        for entry in file.contents
+        if isinstance(entry, ParamDecls)
+        for param in entry.params
+        if param.name.name == "param_ref"
+    )
+    assert isinstance(param_ref_entry.default, BinaryOp)
+    assert param_ref_entry.default.tp == BinaryOperator.MUL
+    # The left side should be the function call, not the Ref
+    assert isinstance(param_ref_entry.default.left, Call), "Parameter default reference should be replaced"
+    assert param_ref_entry.default.left.func.ident.name == "mm_z1_mismatch"
+    assert isinstance(param_ref_entry.default.right, Float) and param_ref_entry.default.right.val == 2.0
+
+
+def test_process_variation_finds_param_in_library_section():
+    """Test that process variations can find and apply to parameters in library sections.
+    
+    This test verifies that parameters defined in library sections (from parameters.scs)
+    can be found and have process variations applied to them.
+    """
+    from netlist.write.spice import apply_statistics_variations
+    from netlist.data import (
+        Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl,
+        Float, Ref, Ident, BinaryOp, BinaryOperator, Call, LibSectionDef, Int
+    )
+
+    # Create a parameter inside a library section (simulating parameters.scs)
+    lib_param = ParamDecl(name=Ident("sw_tox_lv_corner"), default=Float(4.148e-09), distr=None)
+    lib_section = LibSectionDef(
+        name=Ident("fet_tt"),
+        entries=[
+            ParamDecls(params=[lib_param])
+        ]
+    )
+    
+    # Create a global parameter (for comparison)
+    global_param = ParamDecl(name=Ident("other_param"), default=Float(1.0), distr=None)
+    
+    # Statistics block with process variation for the library section parameter
+    stats = StatisticsBlock(
+        process=[
+            Variation(name=Ident("sw_tox_lv_corner"), dist="gauss", std=Float(0.05), mean=Float(0.1)),
+        ],
+        mismatch=None
+    )
+    
+    program = Program(files=[SourceFile(
+        path="test",
+        contents=[
+            ParamDecls(params=[global_param]),  # Global params
+            lib_section,  # Library section with parameter
+            stats,  # Statistics block with variation
+        ]
+    )])
+    
+    # Apply process variations and write to netlist
+    from netlist.write.spice import XyceNetlister
+    from io import StringIO
+    
+    output = StringIO()
+    netlister = XyceNetlister(program, output)
+    netlister.netlist()
+    output_str = output.getvalue()
+    
+    # Verify the parameter in the library section was NOT modified (original value preserved)
+    lib_param_original = None
+    for file in program.files:
+        for entry in file.contents:
+            if isinstance(entry, LibSectionDef):
+                for sub_entry in entry.entries:
+                    if isinstance(sub_entry, ParamDecls):
+                        for param in sub_entry.params:
+                            if param.name.name == "sw_tox_lv_corner":
+                                lib_param_original = param
+                                break
+    
+    assert lib_param_original is not None, "Parameter should be found in library section"
+    # Parameter should still have its original value (not modified)
+    assert isinstance(lib_param_original.default, Float), "Parameter should keep original value"
+    assert lib_param_original.default.val == 4.148e-09, "Original value should be preserved"
+    
+    # Verify process variation was written AFTER all library sections (not after each one)
+    # Should see: .endl fet_tt\n... (other content) ... .param \n+ sw_tox_lv_corner={sw_tox_lv_corner*...}
+    assert ".endl fet_tt" in output_str, "Library section should end"
+    # Process variations should come after the library section ends
+    endl_pos = output_str.find(".endl fet_tt")
+    param_pos = output_str.find(".param", endl_pos)
+    assert param_pos > endl_pos, "Process variation should be written after library section ends"
+    assert "sw_tox_lv_corner=" in output_str, "Process variation should include parameter name"
+    # The expression should reference the parameter itself (relative assignment)
+    assert "sw_tox_lv_corner*" in output_str or "sw_tox_lv_corner *" in output_str, "Should be relative assignment referencing parameter"
+    
+    # Verify global parameter was not affected
+    global_param_updated = None
+    for file in program.files:
+        for entry in file.contents:
+            if isinstance(entry, ParamDecls):
+                for param in entry.params:
+                    if param.name.name == "other_param":
+                        global_param_updated = param
+                        break
+    
+    assert global_param_updated is not None, "Global parameter should still exist"
+    assert isinstance(global_param_updated.default, Float) and global_param_updated.default.val == 1.0, "Global parameter should be unchanged"
+
+
+def test_mismatch_variation_finds_param_in_library_section():
+    """Test that mismatch variations can find parameters in library sections and replace references.
+    
+    This test verifies that parameters defined in library sections can be found,
+    have mismatch functions created, and all references are replaced.
+    """
+    from netlist.write.spice import apply_statistics_variations
+    from netlist.data import (
+        Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl,
+        Float, Ref, Ident, Call, FunctionDef, LibSectionDef, Int, Instance, ParamVal
+    )
+
+    # Create a parameter inside a library section
+    lib_param = ParamDecl(name=Ident("mm_z1"), default=Int(0), distr=None)
+    lib_section = LibSectionDef(
+        name=Ident("fet_tt"),
+        entries=[
+            ParamDecls(params=[lib_param])
+        ]
+    )
+    
+    # Create an instance that references the library section parameter
+    instance = Instance(
+        name=Ident("X1"),
+        module=Ref(ident=Ident("subckt1")),
+        conns=[],
+        params=[
+            ParamVal(name=Ident("param1"), val=Ref(ident=Ident("mm_z1"))),  # Reference to lib param
+        ]
+    )
+    
+    # Statistics block with mismatch variation for the library section parameter
+    stats = StatisticsBlock(
+        process=None,
+        mismatch=[
+            Variation(name=Ident("mm_z1"), dist="gauss", std=Float(0.1), mean=None),
+        ]
+    )
+    
+    program = Program(files=[SourceFile(
+        path="test",
+        contents=[
+            lib_section,  # Library section with parameter
+            stats,  # Statistics block
+            instance,  # Instance referencing the parameter
+        ]
+    )])
+    
+    # Apply mismatch variations
+    apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
+    
+    # Verify the parameter was removed from the library section
+    lib_params_remaining = []
+    for file in program.files:
+        for entry in file.contents:
+            if isinstance(entry, LibSectionDef):
+                for sub_entry in entry.entries:
+                    if isinstance(sub_entry, ParamDecls):
+                        lib_params_remaining.extend([p.name.name for p in sub_entry.params])
+    
+    assert "mm_z1" not in lib_params_remaining, "mm_z1 parameter should be removed from library section"
+    
+    # Verify mismatch function was created
+    mismatch_funcs = [
+        entry for file in program.files
+        for entry in file.contents
+        if isinstance(entry, FunctionDef) and entry.name.name == "mm_z1_mismatch"
+    ]
+    assert len(mismatch_funcs) == 1, "mm_z1_mismatch function should be created"
+    
+    # Verify instance parameter reference was replaced
+    instance_param = instance.params[0]
+    assert isinstance(instance_param.val, Call), "Instance param reference should be replaced with function call"
+    assert instance_param.val.func.ident.name == "mm_z1_mismatch"
 
