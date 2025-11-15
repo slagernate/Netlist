@@ -195,7 +195,8 @@ class Netlister:
             return self.write_statistics_block(entry)
 
         # Explicitly note these data-types as unsupported for writing
-        unsupported = (DialectChange, FunctionDef, Unknown, AhdlInclude, Library)
+        unsupported = (DialectChange, Unknown, AhdlInclude, Library)
+        # Note: FunctionDef is supported in XyceNetlister
         # FIXME: is writing `Library` even really a thing?
         if isinstance(entry, unsupported):
             return self.handle_error(entry, f"Unsupported Entry: {entry}")
@@ -504,8 +505,13 @@ class Netlister:
         raise NotImplementedError
 
     def write_statistics_block(self, stats: StatisticsBlock) -> None:
-        """Write a StatisticsBlock `stats`"""
-        raise NotImplementedError
+        """Write a StatisticsBlock `stats`.
+        
+        Format-specific implementations should override this method.
+        For Spectre format, statistics blocks should be written as-is.
+        For Xyce/Spice formats, statistics are applied to parameters instead.
+        """
+        raise NotImplementedError(f"write_statistics_block not implemented for {self.__class__.__name__}")
 
     def write_param_decls(self, params: ParamDecls) -> None:
         """Write parameter declarations"""

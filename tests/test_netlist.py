@@ -533,6 +533,110 @@ def test_write2():
     write_netlist(src=src, dest=StringIO())
 
 
+def test_write_xyce_func():
+    """Test writing Xyce .FUNC definitions"""
+    from netlist.data import FunctionDef, ArgType, TypedArg, Return, Call, Ref, Int, Float
+    from netlist.write import WriteOptions, NetlistDialects
+    
+    # Create a simple function: mm_p1() {gauss(0, 0.1, 1)}
+    func = FunctionDef(
+        name=Ident("mm_p1"),
+        rtype=ArgType.REAL,
+        args=[],  # No arguments
+        stmts=[
+            Return(
+                val=Call(
+                    func=Ref(ident=Ident("gauss")),
+                    args=[Int(0), Float(0.1), Int(1)]
+                )
+            )
+        ]
+    )
+    
+    src = Program(
+        files=[
+            SourceFile(
+                path="/",
+                contents=[func]
+            )
+        ]
+    )
+    
+    # Write using Xyce format
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output = dest.getvalue()
+    
+    # Verify output format: .FUNC mm_p1() { gauss(0,0.1,1) }
+    assert ".FUNC" in output
+    assert "mm_p1()" in output
+    assert "gauss" in output
+    # Check that it's properly formatted
+    lines = [line.strip() for line in output.split('\n') if line.strip()]
+    func_line = next((line for line in lines if ".FUNC" in line), None)
+    assert func_line is not None
+    assert func_line.startswith(".FUNC")
+    assert "mm_p1()" in func_line
+    assert "{" in func_line
+    assert "}" in func_line
+
+
+def test_write_xyce_func_with_args():
+    """Test writing Xyce .FUNC definitions with arguments"""
+    from netlist.data import FunctionDef, ArgType, TypedArg, Return, Call, Ref, Ident, BinaryOp, BinaryOperator
+    from netlist.write import WriteOptions, NetlistDialects
+    
+    # Create a function with arguments: lnorm(mu, sigma, seed) { exp(gauss(mu, sigma, seed)) }
+    func = FunctionDef(
+        name=Ident("lnorm"),
+        rtype=ArgType.REAL,
+        args=[
+            TypedArg(tp=ArgType.REAL, name=Ident("mu")),
+            TypedArg(tp=ArgType.REAL, name=Ident("sigma")),
+            TypedArg(tp=ArgType.REAL, name=Ident("seed")),
+        ],
+        stmts=[
+            Return(
+                val=Call(
+                    func=Ref(ident=Ident("exp")),
+                    args=[
+                        Call(
+                            func=Ref(ident=Ident("gauss")),
+                            args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma")), Ref(ident=Ident("seed"))]
+                        )
+                    ]
+                )
+            )
+        ]
+    )
+    
+    src = Program(
+        files=[
+            SourceFile(
+                path="/",
+                contents=[func]
+            )
+        ]
+    )
+    
+    # Write using Xyce format
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output = dest.getvalue()
+    
+    # Verify output format: .FUNC lnorm(mu,sigma,seed) { exp(gauss(mu,sigma,seed)) }
+    assert ".FUNC" in output
+    assert "lnorm" in output
+    assert "exp" in output
+    assert "gauss" in output
+    # Check that arguments are included
+    lines = [line.strip() for line in output.split('\n') if line.strip()]
+    func_line = next((line for line in lines if ".FUNC" in line), None)
+    assert func_line is not None
+    assert "lnorm(" in func_line
+    assert "mu" in func_line or "sigma" in func_line  # Arguments should be present
+
+
 def test_protection():
     """Test the `protect` / `unprotect` encryption features"""
     from netlist import SpectreDialectParser, SpectreSpiceDialectParser
@@ -833,15 +937,18 @@ def test_statistics_blocks():
     """Test parsing of Spectre statistics blocks with process and mismatch variations."""
     from netlist import SpectreDialectParser, StatisticsBlock, Variation, Ident, Float
 
-    # Sample Spectre statistics block with generic parameters and distributions
+    # Sample Spectre statistics block with multiple parameters and distributions
+    # Expected: parse process variations (param_a, param_b) and mismatch variations (param_c, param_d)
     txt = dedent("""\
         statistics {
            process {
               vary param_a dist=gauss std=1.5
               vary param_b dist=lnorm std=0.8 mean=2.0
+              vary param_e dist=gauss std=0.3 mean=0.5
            }
            mismatch {
               vary param_c dist=gauss std=0.5
+              vary param_d dist=lnorm std=0.2
            }
         }
     """)
@@ -852,84 +959,397 @@ def test_statistics_blocks():
 
     # Verify the StatisticsBlock structure
     assert isinstance(stats_block, StatisticsBlock)
-    # Check process variations
-    assert len(stats_block.process) == 2
+    
+    # Check process variations - expected: 3 variations
+    assert len(stats_block.process) == 3, "Expected 3 process variations"
+    
+    # First process variation: param_a with gauss distribution
     assert stats_block.process[0].name.name == "param_a"
     assert stats_block.process[0].dist == "gauss"
     assert isinstance(stats_block.process[0].std, Float) and stats_block.process[0].std.val == 1.5
+    assert stats_block.process[0].mean is None  # No mean specified
+    
+    # Second process variation: param_b with lnorm distribution and mean
     assert stats_block.process[1].name.name == "param_b"
     assert stats_block.process[1].dist == "lnorm"
+    assert isinstance(stats_block.process[1].std, Float) and stats_block.process[1].std.val == 0.8
     assert isinstance(stats_block.process[1].mean, Float) and stats_block.process[1].mean.val == 2.0
-    # Check mismatch variations
-    assert len(stats_block.mismatch) == 1
+    
+    # Third process variation: param_e with gauss distribution and mean
+    assert stats_block.process[2].name.name == "param_e"
+    assert stats_block.process[2].dist == "gauss"
+    assert isinstance(stats_block.process[2].std, Float) and stats_block.process[2].std.val == 0.3
+    assert isinstance(stats_block.process[2].mean, Float) and stats_block.process[2].mean.val == 0.5
+    
+    # Check mismatch variations - expected: 2 variations
+    assert len(stats_block.mismatch) == 2, "Expected 2 mismatch variations"
+    
+    # First mismatch variation: param_c with gauss distribution
     assert stats_block.mismatch[0].name.name == "param_c"
     assert stats_block.mismatch[0].dist == "gauss"
     assert isinstance(stats_block.mismatch[0].std, Float) and stats_block.mismatch[0].std.val == 0.5
+    assert stats_block.mismatch[0].mean is None  # No mean specified
+    
+    # Second mismatch variation: param_d with lnorm distribution
+    assert stats_block.mismatch[1].name.name == "param_d"
+    assert stats_block.mismatch[1].dist == "lnorm"
+    assert isinstance(stats_block.mismatch[1].std, Float) and stats_block.mismatch[1].std.val == 0.2
+    assert stats_block.mismatch[1].mean is None  # No mean specified
 
 
-def test_apply_statistics_variations_gauss():
-    """Test Monte Carlo (Gauss) variations are applied to matching parameters."""
-    from netlist.compile import apply_statistics_variations
-    from netlist.data import Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl, Float, BinaryOp, BinaryOperator, Ref, Ident, Call
+def test_apply_statistics_vary_mismatch():
+    """Test mismatch variations (Gauss and Lognorm) are applied to corresponding parameters.
+    
+    Mismatch variations use Monte Carlo (implied). Both gauss and lnorm distributions
+    are tested to verify proper handling of different distribution types.
+    """
+    from netlist.write.spice import apply_statistics_variations
+    from netlist.data import Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl, Float, BinaryOp, BinaryOperator, Ref, Ident, Call, FunctionDef, Return, Int
 
-    # Create a mock program with a parameter and a statistics block
-    param = ParamDecl(name=Ident("test_param"), default=Float(1.0), distr=None)
+    # Create a program with multiple parameters and statistics blocks
+    # Parameters: width, length, tox (oxide thickness)
+    params = [
+        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None),
+        ParamDecl(name=Ident("length"), default=Float(0.5), distr=None),
+        ParamDecl(name=Ident("tox"), default=Float(2.0e-9), distr=None),
+    ]
+    
+    # Statistics block with mismatch variations (Monte Carlo implied)
+    # Expected: gauss variations multiply by (1 + std * gauss(...))
+    # Expected: lnorm variations multiply by (1 + std * lnorm(...)) where lnorm is exp(gauss(...))
     stats = StatisticsBlock(
         process=None,
-        mismatch=[Variation(name=Ident("test_param"), dist="gauss", std=Float(0.1), mean=None)]
+        mismatch=[
+            Variation(name=Ident("width"), dist="gauss", std=Float(0.1), mean=None),  # Gaussian mismatch
+            Variation(name=Ident("length"), dist="gauss", std=Float(0.05), mean=None),  # Gaussian mismatch
+            Variation(name=Ident("tox"), dist="lnorm", std=Float(0.15), mean=None),  # Lognormal mismatch
+        ]
     )
-    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=[param]), stats])])
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=params), stats])])
 
-    # Apply variations (enable Monte Carlo, disable process)
-    apply_statistics_variations(program, enable_monte_carlo=True, enable_process_corners=False)
+    # Apply variations (mismatch block detected, functions created automatically)
+    # Pass XYCE format to enable Xyce-specific transformations (mismatch functions, enable_mismatch, lnorm definitions)
+    apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
 
-    # Check that the parameter's default was modified with a gauss call
-    updated_param = param
-    assert isinstance(updated_param.default, BinaryOp)
-    assert updated_param.default.tp == BinaryOperator.MUL  # Multiplied by variation
-    assert isinstance(updated_param.default.right, Call)
-    assert updated_param.default.right.func.ident.name == "gauss"
+    # Check width parameter: mismatch creates function call
+    # Expected: original + width_mismatch() where width_mismatch() {enable_mismatch * gauss(0, std, seed)}
+    # Also verify enable_mismatch parameter was added
+    enable_mismatch_param = next(
+        (param for file in program.files
+         for entry in file.contents
+         if isinstance(entry, ParamDecls)
+         for param in entry.params
+         if param.name.name == "enable_mismatch"),
+        None
+    )
+    assert enable_mismatch_param is not None, "Expected enable_mismatch parameter to be added"
+    assert isinstance(enable_mismatch_param.default, Float) and enable_mismatch_param.default.val == 1.0
+    width_param = params[0]
+    assert isinstance(width_param.default, BinaryOp)
+    assert width_param.default.tp == BinaryOperator.ADD  # Expected: original + function_call
+    assert isinstance(width_param.default.left, Float) and width_param.default.left.val == 1.0  # Original value
+    assert isinstance(width_param.default.right, Call)
+    assert width_param.default.right.func.ident.name == "width_mismatch"  # Function call: width_mismatch()
+    assert len(width_param.default.right.args) == 0  # No arguments
 
-def test_apply_statistics_variations_process():
-    """Test process variations are applied to matching parameters."""
-    from netlist.compile import apply_statistics_variations
+    # Check length parameter: mismatch creates function call
+    length_param = params[1]
+    assert isinstance(length_param.default, BinaryOp)
+    assert length_param.default.tp == BinaryOperator.ADD
+    assert isinstance(length_param.default.left, Float) and length_param.default.left.val == 0.5
+    assert isinstance(length_param.default.right, Call)
+    assert length_param.default.right.func.ident.name == "length_mismatch"  # Function call: length_mismatch()
+
+    # Check tox parameter: mismatch creates function call with lnorm
+    tox_param = params[2]
+    assert isinstance(tox_param.default, BinaryOp)
+    assert tox_param.default.tp == BinaryOperator.ADD
+    assert isinstance(tox_param.default.left, Float) and tox_param.default.left.val == 2.0e-9
+    assert isinstance(tox_param.default.right, Call)
+    assert tox_param.default.right.func.ident.name == "tox_mismatch"  # Function call: tox_mismatch()
+    
+    # Verify that mismatch functions were added to the program
+    mismatch_funcs = [
+        entry for file in program.files
+        for entry in file.contents
+        if isinstance(entry, FunctionDef) and entry.name.name in ["width_mismatch", "length_mismatch", "tox_mismatch"]
+    ]
+    assert len(mismatch_funcs) == 3, f"Expected 3 mismatch functions, got {len(mismatch_funcs)}"
+    
+    # Verify width function uses gauss with enable_mismatch multiplier
+    width_func = next(f for f in mismatch_funcs if f.name.name == "width_mismatch")
+    assert len(width_func.stmts) == 1
+    assert isinstance(width_func.stmts[0], Return)
+    width_return_val = width_func.stmts[0].val
+    # Expected: enable_mismatch * gauss(...)
+    assert isinstance(width_return_val, BinaryOp)
+    assert width_return_val.tp == BinaryOperator.MUL
+    assert isinstance(width_return_val.left, Ref) and width_return_val.left.ident.name == "enable_mismatch"
+    width_call = width_return_val.right
+    assert isinstance(width_call, Call)
+    assert width_call.func.ident.name == "gauss"  # Expected: gauss for mismatch
+    assert len(width_call.args) == 3
+    assert isinstance(width_call.args[0], Int) and width_call.args[0].val == 0  # mean = 0
+    assert isinstance(width_call.args[1], Float) and width_call.args[1].val == 0.1  # std
+    assert isinstance(width_call.args[2], Int) and width_call.args[2].val == 1  # seed
+    
+    # Verify tox function uses lnorm with enable_mismatch multiplier
+    tox_func = next(f for f in mismatch_funcs if f.name.name == "tox_mismatch")
+    assert len(tox_func.stmts) == 1
+    assert isinstance(tox_func.stmts[0], Return)
+    tox_return_val = tox_func.stmts[0].val
+    # Expected: enable_mismatch * lnorm(...)
+    assert isinstance(tox_return_val, BinaryOp)
+    assert tox_return_val.tp == BinaryOperator.MUL
+    assert isinstance(tox_return_val.left, Ref) and tox_return_val.left.ident.name == "enable_mismatch"
+    tox_call = tox_return_val.right
+    assert isinstance(tox_call, Call)
+    assert tox_call.func.ident.name == "lnorm"  # Expected: lnorm for lognormal mismatch
+    assert len(tox_call.args) == 3
+    assert isinstance(tox_call.args[0], Int) and tox_call.args[0].val == 0  # mean = 0
+    assert isinstance(tox_call.args[1], Float) and tox_call.args[1].val == 0.15  # std
+    assert isinstance(tox_call.args[2], Int) and tox_call.args[2].val == 3  # seed (third mismatch param, so idx=2, seed=3)
+    
+    # Verify that lnorm function definition was added to the program
+    # (needed for the tox() function to work, since it calls lnorm)
+    lnorm_funcs = [
+        entry for file in program.files
+        for entry in file.contents
+        if isinstance(entry, FunctionDef) and entry.name.name == "lnorm"
+    ]
+    assert len(lnorm_funcs) == 1, "Expected lnorm function to be added for lognormal mismatch"
+    lnorm_func = lnorm_funcs[0]
+    assert len(lnorm_func.stmts) == 1
+    assert isinstance(lnorm_func.stmts[0], Return)
+    # Verify lnorm is defined as exp(gauss(...))
+    lnorm_body = lnorm_func.stmts[0].val
+    assert isinstance(lnorm_body, Call)
+    assert lnorm_body.func.ident.name == "exp"  # lnorm = exp(gauss(...))
+    assert len(lnorm_body.args) == 1
+    gauss_call = lnorm_body.args[0]
+    assert isinstance(gauss_call, Call)
+    assert gauss_call.func.ident.name == "gauss"  # lnorm uses gauss internally
+
+def test_apply_statistics_vary_process():
+    """Test process variations are applied to corresponding parameters.
+    
+    Process variations use Monte Carlo (implied) and may include mean values for corner analysis.
+    """
+    from netlist.write.spice import apply_statistics_variations
     from netlist.data import Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl, Float, BinaryOp, BinaryOperator
 
-    # Create a mock program with a parameter and a statistics block
-    param = ParamDecl(name=Ident("test_param"), default=Float(1.0), distr=None)
+    # Create a program with multiple parameters for process variations
+    # Parameters: vth (threshold voltage), mobility, junction_depth
+    params = [
+        ParamDecl(name=Ident("vth"), default=Float(0.4), distr=None),
+        ParamDecl(name=Ident("mobility"), default=Float(300.0), distr=None),
+        ParamDecl(name=Ident("junction_depth"), default=Float(0.1e-6), distr=None),
+    ]
+    
+    # Statistics block with process variations (Monte Carlo implied, mean values for corners)
+    # Expected: process variations apply Monte Carlo and add mean value if present
     stats = StatisticsBlock(
-        process=[Variation(name=Ident("test_param"), dist="gauss", std=None, mean=Float(2.0))],
+        process=[
+            Variation(name=Ident("vth"), dist="gauss", std=Float(0.05), mean=Float(0.1)),  # Fast corner: +0.1V
+            Variation(name=Ident("mobility"), dist="gauss", std=Float(10.0), mean=Float(-50.0)),  # Slow corner: -50 cm²/V·s
+            Variation(name=Ident("junction_depth"), dist="gauss", std=Float(0.01e-6), mean=Float(0.02e-6)),  # Deep junction corner
+        ],
         mismatch=None
     )
-    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=[param]), stats])])
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=params), stats])])
 
-    # Apply variations (disable Monte Carlo, enable process)
-    apply_statistics_variations(program, enable_monte_carlo=False, enable_process_corners=True)
+    # Apply variations (process block detected, Monte Carlo and mean applied automatically)
+    # Pass XYCE format (though process variations are format-agnostic, this ensures consistency)
+    apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
 
-    # Check that the parameter's default was modified by adding the mean
-    updated_param = param
-    assert isinstance(updated_param.default, BinaryOp)
-    assert updated_param.default.tp == BinaryOperator.ADD  # Added process variation
-    assert updated_param.default.right == Float(2.0)
+    # Check vth parameter: process variations apply Monte Carlo first, then add mean
+    # Expected structure: (original * (1 + std * gauss(...))) + mean
+    vth_param = params[0]
+    assert isinstance(vth_param.default, BinaryOp)
+    assert vth_param.default.tp == BinaryOperator.ADD  # Expected: (Monte Carlo result) + mean
+    # Left side should be: original * (1 + std * gauss(...))
+    assert isinstance(vth_param.default.left, BinaryOp)
+    assert vth_param.default.left.tp == BinaryOperator.MUL
+    assert isinstance(vth_param.default.left.left, Float) and vth_param.default.left.left.val == 0.4  # Original value
+    assert vth_param.default.right == Float(0.1)  # Expected: mean value added
+
+    # Check mobility parameter: process variations apply Monte Carlo first, then add mean
+    mobility_param = params[1]
+    assert isinstance(mobility_param.default, BinaryOp)
+    assert mobility_param.default.tp == BinaryOperator.ADD
+    # Left side should be: original * (1 + std * gauss(...))
+    assert isinstance(mobility_param.default.left, BinaryOp)
+    assert mobility_param.default.left.tp == BinaryOperator.MUL
+    assert isinstance(mobility_param.default.left.left, Float) and mobility_param.default.left.left.val == 300.0
+    assert mobility_param.default.right == Float(-50.0)  # Expected: negative mean value added
+
+    # Check junction_depth parameter: process variations apply Monte Carlo first, then add mean
+    jd_param = params[2]
+    assert isinstance(jd_param.default, BinaryOp)
+    assert jd_param.default.tp == BinaryOperator.ADD
+    # Left side should be: original * (1 + std * gauss(...))
+    assert isinstance(jd_param.default.left, BinaryOp)
+    assert jd_param.default.left.tp == BinaryOperator.MUL
+    assert isinstance(jd_param.default.left.left, Float) and jd_param.default.left.left.val == 0.1e-6
+    assert jd_param.default.right == Float(0.02e-6)  # Expected: mean value added
 
 
-def test_apply_statistics_variations_no_match():
-    """Test that variations are ignored if no matching parameter exists."""
-    from netlist.compile import apply_statistics_variations
+def test_apply_statistics_vary_no_match():
+    """Test that variations are ignored if no corresponding parameter exists."""
+    from netlist.write.spice import apply_statistics_variations
     from netlist.data import Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl, Float
 
-    # Create a mock program with a parameter and a non-matching statistics block
-    param = ParamDecl(name=Ident("test_param"), default=Float(1.0), distr=None)
+    # Create a program with parameters that don't match the statistics variations
+    # Parameters: width, length
+    params = [
+        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None),
+        ParamDecl(name=Ident("length"), default=Float(0.5), distr=None),
+    ]
+    
+    # Statistics block with variations for parameters that don't exist
+    # Expected: variations should be ignored, parameters remain unchanged
     stats = StatisticsBlock(
-        process=[Variation(name=Ident("non_matching_param"), dist="gauss", std=Float(0.1), mean=None)],
-        mismatch=None
+        process=[
+            Variation(name=Ident("non_existent_param1"), dist="gauss", std=Float(0.1), mean=Float(2.0)),
+            Variation(name=Ident("non_existent_param2"), dist="lnorm", std=Float(0.2), mean=None),
+        ],
+        mismatch=[
+            Variation(name=Ident("non_existent_param3"), dist="gauss", std=Float(0.15), mean=None),
+        ]
     )
-    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=[param]), stats])])
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=params), stats])])
 
-    original_default = param.default
-    # Apply variations
-    apply_statistics_variations(program, enable_monte_carlo=True, enable_process_corners=True)
+    # Store original values
+    original_width = params[0].default
+    original_length = params[1].default
+    
+    # Apply variations (both process and mismatch blocks present, but no matching parameters)
+    # Pass XYCE format to test Xyce-specific behavior
+    apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
 
-    # Parameter should remain unchanged
-    assert param.default == original_default
+    # Expected: parameters should remain unchanged since no matching variations exist
+    assert params[0].default == original_width, "width parameter should remain unchanged"
+    assert params[1].default == original_length, "length parameter should remain unchanged"
+
+
+def test_apply_statistics_vary_spectre_no_xyce_transformations():
+    """Test that Xyce-specific transformations are NOT applied when output format is Spectre.
+    
+    When writing to Spectre format, mismatch functions, enable_mismatch parameter, and lnorm
+    function definitions should NOT be created, as these are Xyce-specific.
+    """
+    from netlist.write.spice import apply_statistics_variations
+    from netlist.data import Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl, Float, FunctionDef
+
+    # Create a program with parameters and mismatch variations
+    params = [
+        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None),
+        ParamDecl(name=Ident("tox"), default=Float(2.0e-9), distr=None),
+    ]
+    
+    # Statistics block with mismatch variations (which would create Xyce .FUNC definitions)
+    stats = StatisticsBlock(
+        process=None,
+        mismatch=[
+            Variation(name=Ident("width"), dist="gauss", std=Float(0.1), mean=None),
+            Variation(name=Ident("tox"), dist="lnorm", std=Float(0.15), mean=None),
+        ]
+    )
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=params), stats])])
+
+    # Apply variations with SPECTRE format (not XYCE)
+    apply_statistics_variations(program, output_format=NetlistDialects.SPECTRE)
+
+    # Verify enable_mismatch parameter was NOT added
+    enable_mismatch_param = next(
+        (param for file in program.files
+         for entry in file.contents
+         if isinstance(entry, ParamDecls)
+         for param in entry.params
+         if param.name.name == "enable_mismatch"),
+        None
+    )
+    assert enable_mismatch_param is None, "enable_mismatch parameter should NOT be added for Spectre format"
+
+    # Verify mismatch functions were NOT created
+    mismatch_funcs = [
+        entry for file in program.files
+        for entry in file.contents
+        if isinstance(entry, FunctionDef) and entry.name.name.endswith("_mismatch")
+    ]
+    assert len(mismatch_funcs) == 0, "Mismatch functions should NOT be created for Spectre format"
+
+    # Verify lnorm function definitions were NOT created
+    lnorm_funcs = [
+        entry for file in program.files
+        for entry in file.contents
+        if isinstance(entry, FunctionDef) and entry.name.name in ("lnorm", "alnorm")
+    ]
+    assert len(lnorm_funcs) == 0, "lnorm function definitions should NOT be created for Spectre format"
+
+    # Verify parameters remain unchanged (mismatch variations are not applied for non-Xyce formats)
+    assert params[0].default == Float(1.0), "width parameter should remain unchanged for Spectre format"
+    assert params[1].default == Float(2.0e-9), "tox parameter should remain unchanged for Spectre format"
+
+
+def test_param_mismatch_and_corner():
+    """Test that parameters with both process corner and mismatch variations are handled correctly.
+    
+    This test verifies that parameters appearing in both process and mismatch blocks are handled correctly.
+    The expected behavior:
+    - Process variation: original * (1 + std * gauss(...)) + mean (corner analysis)
+    - Mismatch variation: creates mismatch function and adds it
+    - Combined: (original * (1 + std * gauss(...)) + mean) + mismatch_function()
+    
+    This represents a parameter that has both global process corner variation and per-instance mismatch.
+    """
+    from netlist.write.spice import apply_statistics_variations
+    from netlist.data import Program, SourceFile, StatisticsBlock, Variation, ParamDecls, ParamDecl, Float, BinaryOp, BinaryOperator, Ref, Ident, Call, FunctionDef, Return, Int
+
+    # Create a program with a parameter that appears in both process and mismatch blocks
+    params = [
+        ParamDecl(name=Ident("vth"), default=Float(0.4), distr=None),
+    ]
+    
+    # Statistics block with the same parameter in both process and mismatch
+    stats = StatisticsBlock(
+        process=[
+            Variation(name=Ident("vth"), dist="gauss", std=Float(0.05), mean=Float(0.1)),  # Process variation
+        ],
+        mismatch=[
+            Variation(name=Ident("vth"), dist="gauss", std=Float(0.02), mean=None),  # Mismatch variation
+        ]
+    )
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=params), stats])])
+
+    # Apply variations with XYCE format
+    apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
+
+    # Expected: vth should have both process variation (Monte Carlo + mean) and mismatch function
+    # Structure: ((original * (1 + std * gauss(...))) + mean) + vth_mismatch()
+    vth_param = params[0]
+    
+    # The parameter should be updated to include both variations
+    assert isinstance(vth_param.default, BinaryOp), "vth parameter should be updated with variations"
+    
+    # The outermost operation should be ADD (original + mismatch function)
+    assert vth_param.default.tp == BinaryOperator.ADD, "Outermost operation should be ADD for combined variations"
+    
+    # The left side should be the process variation result: (original * (1 + std * gauss(...))) + mean
+    process_result = vth_param.default.left
+    assert isinstance(process_result, BinaryOp), "Process variation should be applied"
+    assert process_result.tp == BinaryOperator.ADD, "Process variation should add mean"
+    
+    # The right side should be the mismatch function call
+    mismatch_call = vth_param.default.right
+    assert isinstance(mismatch_call, Call), "Mismatch should be a function call"
+    assert mismatch_call.func.ident.name == "vth_mismatch", "Mismatch function should be vth_mismatch()"
+    
+    # Verify mismatch function was created
+    mismatch_funcs = [
+        entry for file in program.files
+        for entry in file.contents
+        if isinstance(entry, FunctionDef) and entry.name.name == "vth_mismatch"
+    ]
+    assert len(mismatch_funcs) == 1, "vth_mismatch function should be created"
 
