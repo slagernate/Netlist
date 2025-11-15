@@ -426,14 +426,14 @@ class XyceNetlister(SpiceNetlister):
 
     def netlist(self) -> None:
         """Override netlist() to apply Xyce-specific statistics variations before writing.
-        
+
         This applies statistics variations (process and mismatch) to the Program,
         creating Xyce-specific artifacts like .FUNC definitions for mismatch parameters
         and enable_mismatch parameter. This only happens when writing to Xyce format.
         """
         # Apply statistics variations with XYCE format before writing
         apply_statistics_variations(self.src, output_format=NetlistDialects.XYCE)
-        
+
         # Call parent implementation to do the actual writing
         super().netlist()
 
@@ -575,21 +575,21 @@ class XyceNetlister(SpiceNetlister):
 
     def write_function_def(self, func: FunctionDef) -> None:
         """Write a Xyce .FUNC definition for FunctionDef `func`.
-        
+
         Format: .FUNC func_name(arg1, arg2, ...) { expression }
         """
         func_name = self.format_ident(func.name)
-        
+
         # Write function signature
         self.write(f".FUNC {func_name}(")
-        
+
         # Write arguments
         if func.args:
             arg_names = [self.format_ident(arg.name) for arg in func.args]
             self.write(",".join(arg_names))
-        
+
         self.write(") { ")
-        
+
         # Write function body - should be a single Return statement
         if func.stmts and len(func.stmts) == 1 and isinstance(func.stmts[0], Return):
             expr_str = self.format_expr(func.stmts[0].val)
@@ -597,7 +597,7 @@ class XyceNetlister(SpiceNetlister):
         else:
             # Fallback: handle multiple statements (shouldn't happen for our use case)
             self.handle_error(func, "FunctionDef with multiple statements not supported")
-        
+
         self.write(" }\n")
 
 
@@ -667,7 +667,7 @@ def add_lnorm_functions(program: Program) -> None:
     """Add lnorm and alnorm function definitions to the program (Xyce .FUNC definitions)."""
     if not program.files:
         return
-    
+
     math_funcs = [
         FunctionDef(
             name=Ident("lnorm"),
@@ -707,19 +707,19 @@ def add_lnorm_functions(program: Program) -> None:
 
 def create_monte_carlo_distribution_call(dist_type: str, std: Float, seed: int) -> Optional[Call]:
     """Create a distribution function call (gauss or lnorm) for Monte Carlo variation.
-    
+
     Returns a Call expression for the distribution function, or None if the distribution
     type is not supported. Warns if an unsupported distribution type is encountered.
     """
     if not dist_type:
         return None
-    
+
     dist_type_lower = dist_type.lower()
     if 'gauss' in dist_type_lower:
         return Call(func=Ref(ident=Ident("gauss")), args=[Int(0), Float(1), Int(1)])
     elif 'lnorm' in dist_type_lower:
         return Call(func=Ref(ident=Ident("lnorm")), args=[Int(0), Float(1), Int(1)])
-    
+
     # Warn about unsupported distribution type
     warn(f"Unsupported distribution type '{dist_type}' for Monte Carlo variation. Supported types: gauss, lnorm")
     return None
@@ -729,11 +729,11 @@ def apply_monte_carlo_variation(original_expr: Expr, var: Variation) -> Expr:
     """Apply Monte Carlo variation to an expression: original * (1 + std * dist(...))."""
     if not var.dist:
         return original_expr
-    
+
     dist_call = create_monte_carlo_distribution_call(var.dist, var.std, 1)
     if not dist_call:
         return original_expr
-    
+
     variation_term = BinaryOp(tp=BinaryOperator.MUL, left=var.std, right=dist_call)
     one_plus_variation = BinaryOp(tp=BinaryOperator.ADD, left=Float(1), right=variation_term)
     return BinaryOp(tp=BinaryOperator.MUL, left=original_expr, right=one_plus_variation)
@@ -743,15 +743,16 @@ def apply_process_variation(program: Program, var: Variation) -> None:
     """Apply a single process variation to its corresponding parameter."""
     matching_param = find_matching_param(program, var.name.name)
     if not matching_param:
+        warn(f"No matching parameter found for mismatch variation '{var.name.name}'. Skipping.")
         return
-    
+
     original_expr = matching_param.default or Int(0)
     new_expr = apply_monte_carlo_variation(original_expr, var)
-    
+
     # Add mean value if present (for corner analysis)
     if var.mean:
         new_expr = BinaryOp(tp=BinaryOperator.ADD, left=new_expr, right=var.mean)
-    
+
     matching_param.default = new_expr
 
 
@@ -767,82 +768,98 @@ def add_enable_mismatch_parameter(program: Program) -> None:
     """Add enable_mismatch parameter to the program if it doesn't exist."""
     if find_matching_param(program, "enable_mismatch"):
         return  # Already exists
-    
+
     if not program.files:
         return
-    
+
     enable_mismatch_decl = ParamDecl(name=Ident("enable_mismatch"), default=Float(1.0), distr=None)
-    
+
     # Try to find existing ParamDecls to add to
     for file in program.files:
         for entry in file.contents:
             if isinstance(entry, ParamDecls):
                 entry.params.append(enable_mismatch_decl)
                 return
-    
+
     # If no ParamDecls found, create a new one
     program.files[0].contents.insert(0, ParamDecls(params=[enable_mismatch_decl]))
 
 
-def create_mismatch_function(var: Variation, idx: int) -> Optional[FunctionDef]:
-    """Create a mismatch function definition for a variation."""
+def create_mismatch_function(var: Variation, idx: int, original_expr: Expr) -> Optional[FunctionDef]:
+    """Create a mismatch function definition that includes the original parameter value and uses unseeded gauss calls.
+    
+    The function returns: {original_value + enable_mismatch * distribution(...)}
+    This allows the function to be called at each instance with the base value plus variation.
+    Uses unseeded gauss calls: gauss(mean, std) with two arguments only.
+    """
     if not var.dist:
         return None
-    
+
     func_name = f"{var.name.name}_mismatch"
     dist_type_lower = var.dist.lower()
-    
+
     if 'gauss' in dist_type_lower:
         dist_func_name = "gauss"
     elif 'lnorm' in dist_type_lower:
         dist_func_name = "lnorm"
     else:
         return None
-    
+
+    # Unseeded gauss call: gauss(mean, std) with two args only
     dist_call = Call(
         func=Ref(ident=Ident(dist_func_name)),
-        args=[Int(0), var.std, Int(idx + 1)]  # seed = idx+1 for uniqueness
+        args=[Int(0), var.std]  # mean=0, std from variation; no seed
     )
-    
+
     # Multiply by enable_mismatch to allow toggling mismatch on/off
     enable_ref = Ref(ident=Ident("enable_mismatch"))
     mismatch_value = BinaryOp(tp=BinaryOperator.MUL, left=enable_ref, right=dist_call)
-    
+
+    # Include the original parameter value in the function's return
+    new_val = BinaryOp(tp=BinaryOperator.ADD, left=original_expr, right=mismatch_value)
+
     return FunctionDef(
         name=Ident(func_name),
         rtype=ArgType.REAL,
         args=[],  # No arguments - called as param_name_mismatch()
-        stmts=[Return(val=mismatch_value)]
+        stmts=[Return(val=new_val)]
     )
 
 
 def apply_mismatch_variation(program: Program, var: Variation, idx: int) -> None:
-    """Apply a single mismatch variation by creating a function and updating the parameter."""
+    """Apply a single mismatch variation by creating a function and updating the parameter to solely use the function call.
+    
+    The original parameter definition is effectively "deleted" by this replacement.
+    The function now encapsulates the original value, so the parameter defaults to just the function call.
+    """
     matching_param = find_matching_param(program, var.name.name)
     if not matching_param:
+        warn(f"No matching parameter found for mismatch variation '{var.name.name}'. Skipping.")
         return
+
+    # Get the original value before creating the function
+    original_expr = matching_param.default or Int(0)
     
-    mismatch_func = create_mismatch_function(var, idx)
+    mismatch_func = create_mismatch_function(var, idx, original_expr)
     if not mismatch_func:
         return
-    
+
     func_name = mismatch_func.name.name
-    
+
     # Add function to the first file
     if program.files:
         program.files[0].contents.append(mismatch_func)
-    
-    # Update parameter to reference the function call
-    original_expr = matching_param.default or Int(0)
+
+    # "Delete" the original parameter definition by replacing it solely with the function call
+    # The function now encapsulates the original value, so no need for original + function_call
     func_call = Call(func=Ref(ident=Ident(func_name)), args=[])
-    new_expr = BinaryOp(tp=BinaryOperator.ADD, left=original_expr, right=func_call)
-    matching_param.default = new_expr
+    matching_param.default = func_call
 
 
 def apply_all_mismatch_variations(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
     """Apply all mismatch variations from statistics blocks (Xyce-specific)."""
     add_enable_mismatch_parameter(program)
-    
+
     mismatch_idx = 0
     for stats in stats_blocks:
         if stats.mismatch:
@@ -853,11 +870,11 @@ def apply_all_mismatch_variations(program: Program, stats_blocks: List[Statistic
 
 def apply_statistics_variations(program: Program, output_format: Optional[NetlistDialects] = None) -> None:
     """Apply statistics vary statements to corresponding parameters.
-    
+
     Automatically detects process {} and mismatch {} blocks and applies variations accordingly.
     Both process and mismatch variations use Monte Carlo (implied).
     Process variations may also include mean values for corner analysis.
-    
+
     Xyce-specific transformations (mismatch functions, enable_mismatch parameter, lnorm function definitions)
     are only applied when output_format is NetlistDialects.XYCE. This allows the same program to be
     written to different formats (e.g., Spectre) without Xyce-specific artifacts.
@@ -865,16 +882,17 @@ def apply_statistics_variations(program: Program, output_format: Optional[Netlis
     stats_blocks = collect_statistics_blocks(program)
     if not stats_blocks:
         return  # No statistics to apply
-    
+
     is_xyce = output_format == NetlistDialects.XYCE
-    
+
     # Add lnorm functions if needed (Xyce-specific)
     if has_lognorm_distributions(stats_blocks) and is_xyce:
         add_lnorm_functions(program)
-    
+
     # Apply process variations (format-agnostic)
     apply_all_process_variations(program, stats_blocks)
-    
+
     # Apply mismatch variations (Xyce-specific)
     if is_xyce:
         apply_all_mismatch_variations(program, stats_blocks)
+
