@@ -366,9 +366,14 @@ class SpiceNetlister(Netlister):
 
         mname = self.format_ident(model.name)
         mtype = self.format_ident(model.mtype)
-        self.writeln(f".model {mname} {mtype}")
+
+        if mtype.lower() == "bsim4":
+            self.writeln(f".model {mname}")
+        else:
+            self.writeln(f".model {mname} {mtype}")
 
         self.write("+ ")
+
         for arg in model.args:
             self.write(self.format_expr(arg) + " ")
 
@@ -438,6 +443,20 @@ class XyceNetlister(SpiceNetlister):
         # Call parent implementation to do the actual writing
         super().netlist()
 
+    def _validate_content(self) -> None:
+        """Validate that the program content matches the expected file_type."""
+        from ..data import LibSectionDef
+
+        for source_file in self.src.files:
+            for entry in source_file.contents:
+                if self.file_type == "library":
+                    # Library files should ONLY contain LibSectionDef (no subcircuits, no loose parameters)
+                    if not isinstance(entry, LibSectionDef):
+                        raise ValueError(f"Library file contains non-library content: {type(entry).__name__}. "
+                                       "Library files should only contain library sections.")
+                # For models files, allow anything (SubcktDef, ParamDecls, FunctionDef, FlatStatement, etc.)
+                # No validation needed for models files
+
 
     def write_library_section(self, section: LibSectionDef) -> None:
         """Write a Library Section definition."""
@@ -476,9 +495,12 @@ class XyceNetlister(SpiceNetlister):
         if not pvals:  # Write a quick comment for no parameters
             return self.write_comment("No parameters")
 
+        # Filter out delvto and deltox parameters for BSIM4 compatibility
+        filtered_pvals = [pval for pval in pvals if pval.name not in ('delvto', 'deltox')]
+
         self.write("PARAMS: ")  # <= Xyce-specific
         # And write them
-        for pval in pvals:
+        for pval in filtered_pvals:
             self.write_param_val(pval)
             self.write(" ")
 

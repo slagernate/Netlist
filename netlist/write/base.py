@@ -114,11 +114,12 @@ class Netlister:
     """
 
     def __init__(
-        self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE
+        self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = ""
     ) -> None:
         self.src = src
         self.dest = dest
         self.errormode = errormode
+        self.file_type = file_type
         self.expr_state = ExpressionState.PROGRAM
         self.indent = Indent(chars="  ")
         self.module_names = set()  # Netlisted Module names

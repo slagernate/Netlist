@@ -54,6 +54,9 @@ class WriteOptions:
     errormode: ErrorMode = (
         ErrorMode.RAISE
     )  # Error-handling mode, enumerated in `ErrorMode`
+    file_type: str = (
+        ""
+    )  # File type hint for validation ("library" or "models")
 
 
 def netlist(
@@ -89,7 +92,7 @@ def netlist(
         options = WriteOptions()
 
     netlister_cls = writer(options.fmt)
-    netlister = netlister_cls(src=src, dest=dest, errormode=options.errormode)
+    netlister = netlister_cls(src=src, dest=dest, errormode=options.errormode, file_type=options.file_type)
     netlister.netlist()
 
 
