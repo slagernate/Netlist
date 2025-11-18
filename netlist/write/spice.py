@@ -480,7 +480,7 @@ class XyceNetlister(SpiceNetlister):
             self.write(" ")
         self.write("\n")
 
-    def write_instance_params(self, pvals: List[ParamVal], is_mos_like: bool = False) -> None:
+    def write_instance_params(self, pvals: List[ParamVal], is_mos_like: bool = False, module_ref: Optional[Ref] = None) -> None:
         """Write the parameter-values for Instance `pinst`.
 
         Parameter-values format:
@@ -490,20 +490,32 @@ class XyceNetlister(SpiceNetlister):
         + <subckt-name>
         + PARAMS: name1=val1 name2=val2 name3=val3  (for subcircuits)
         + name1=val1 name2=val2 name3=val3  (for MOS primitives, no PARAMS:)
+        
+        Args:
+            pvals: List of parameter values to write
+            is_mos_like: Whether this is a MOS-like instance
+            module_ref: Optional Ref to the module/model being instantiated (for BSIM4 detection)
         """
         self.write("+ ")
 
         if not pvals:  # Write a quick comment for no parameters
             return self.write_comment("No parameters")
 
-        # Filter out delvto and deltox parameters for BSIM4 compatibility
-        filtered_pvals = [pval for pval in pvals if pval.name not in ('delvto', 'deltox')]
+        # Filter deltox from instance parameters if this instance references a BSIM4 model
+        params_to_write = pvals
+        if module_ref and self._is_bsim4_model_ref(module_ref):
+            # Check if deltox is present before filtering
+            has_deltox = any(pval.name.name == "deltox" for pval in pvals)
+            if has_deltox:
+                warn(f"Filtering 'deltox' parameter from instance parameters for BSIM4 model '{module_ref.ident.name}'. "
+                     f"Xyce does not support deltox for BSIM4 models.")
+            params_to_write = [pval for pval in pvals if pval.name.name != "deltox"]
 
         # MOS primitive instances should NOT have PARAMS: keyword
         if not is_mos_like:
             self.write("PARAMS: ")  # <= Xyce-specific for subcircuits
         # And write them
-        for pval in filtered_pvals:
+        for pval in params_to_write:
             self.write_param_val(pval)
             self.write(" ")
 
@@ -535,10 +547,60 @@ class XyceNetlister(SpiceNetlister):
         # Write the sub-circuit name
         self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
 
-        # Write its parameter values (pass is_mos_like to skip PARAMS: for MOS)
-        self.write_instance_params(pinst.params, is_mos_like=is_mos_like)
+        # Write its parameter values (pass is_mos_like to skip PARAMS: for MOS, and module_ref for BSIM4 detection)
+        module_ref = pinst.module if isinstance(pinst.module, Ref) else None
+        self.write_instance_params(pinst.params, is_mos_like=is_mos_like, module_ref=module_ref)
 
         # Add a blank after each instance
+        self.write("\n")
+
+    def write_primitive_instance(self, pinst: Instance) -> None:
+        """Write primitive-instance `pinst` of `rmodule`."""
+        is_mos_like = (
+            len(pinst.args) == 5  # Exactly 4 ports + 1 model
+            and isinstance(pinst.args[-1], Ref)  # Last arg is the model reference
+            and {'l', 'w'} <= {p.name.name for p in pinst.kwargs}  # Has both 'l' and 'w' params
+            and any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet', 'pmos', 'nmos'])  # Instance name indicates MOS
+        )
+        prefix = 'M' if is_mos_like else ''
+        inst_name = self.format_ident(pinst.name)
+        if prefix and not inst_name.upper().startswith(prefix):
+            inst_name = f"{prefix}{inst_name}"
+        self.write(inst_name + " \n")
+
+        # Write ports (excluding last (model)) on a separate continuation line
+        self.write("+ ")
+        for arg in pinst.args[:-1]:  # Ports only (exclude the model)
+            if isinstance(arg, Ident):
+                self.write(self.format_ident(arg) + " ")
+            elif isinstance(arg, (Int, Float, MetricNum)):
+                self.write(self.format_number(arg) + " ")
+            else:
+                self.write(self.format_expr(arg) + " ")
+        self.write("\n")
+        # Write the model (last arg) on another continuation line
+        self.write("+ " + self.format_ident(pinst.args[-1]) + " \n")
+
+        # Extract module_ref from args for BSIM4 detection
+        module_ref = None
+        if pinst.args and isinstance(pinst.args[-1], Ref):
+            module_ref = pinst.args[-1]
+        
+        # Filter deltox if referencing BSIM4 model
+        kwargs_to_write = pinst.kwargs
+        if module_ref and self._is_bsim4_model_ref(module_ref):
+            # Check if deltox is present before filtering
+            has_deltox = any(kw.name.name == "deltox" for kw in pinst.kwargs)
+            if has_deltox:
+                warn(f"Filtering 'deltox' parameter from instance parameters for BSIM4 model '{module_ref.ident.name}'. "
+                     f"Xyce does not support deltox for BSIM4 models.")
+            kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name != "deltox"]
+        
+        self.write("+ ")
+        for kwarg in kwargs_to_write:
+            self.write_param_val(kwarg)
+            self.write(" ")
+
         self.write("\n")
 
     def write_comment(self, comment: str) -> None:
@@ -713,6 +775,123 @@ class XyceNetlister(SpiceNetlister):
             default = self.format_expr(param.default)
 
         self.write(f"{param_name}={default}")
+
+    def _is_bsim4_model_ref(self, ref: Ref) -> bool:
+        """Check if a Ref points to a BSIM4 model definition.
+        
+        First checks if ref.resolved is already set (more direct).
+        Otherwise searches through the program recursively, including library sections.
+        
+        Handles:
+        - Direct ModelDef matches (exact name)
+        - ModelFamily base name matches (instance references base, model has variants)
+        - ModelVariant matches (standalone variants)
+        - Models nested in LibSectionDef entries
+        
+        Args:
+            ref: A Ref object pointing to a model name
+            
+        Returns:
+            True if the reference points to a BSIM4 model, False otherwise
+        """
+        if not isinstance(ref, Ref):
+            return False
+        
+        # First, check if ref.resolved is already set (more direct and reliable)
+        if ref.resolved is not None:
+            from ..data import Model, ModelDef, ModelFamily
+            if isinstance(ref.resolved, Model):
+                if isinstance(ref.resolved, ModelDef):
+                    return ref.resolved.mtype.name.lower() == "bsim4"
+                elif isinstance(ref.resolved, ModelFamily):
+                    return any(v.mtype.name.lower() == "bsim4" for v in ref.resolved.variants)
+            return False
+        
+        # If not resolved, search through the program
+        model_name = ref.ident.name  # e.g., "plowvt_model"
+        
+        # Import model types for use in nested function
+        from ..data import ModelDef, ModelFamily, ModelVariant, LibSectionDef
+        
+        def check_entry(entry) -> bool:
+            """Helper to check if an entry is a BSIM4 model matching model_name."""
+            if isinstance(entry, ModelDef):
+                if entry.name.name == model_name:
+                    return entry.mtype.name.lower() == "bsim4"
+            elif isinstance(entry, ModelFamily):
+                if entry.name.name == model_name:
+                    return any(v.mtype.name.lower() == "bsim4" for v in entry.variants)
+            elif isinstance(entry, ModelVariant):
+                variant_name = f"{entry.model.name}.{entry.variant.name}"
+                if variant_name == model_name or entry.model.name == model_name:
+                    return entry.mtype.name.lower() == "bsim4"
+            return False
+        
+        # Search through all files in the program
+        for file in self.src.files:
+            for entry in file.contents:
+                if check_entry(entry):
+                    return True
+                # Also search inside library sections recursively
+                elif isinstance(entry, LibSectionDef):
+                    for lib_entry in entry.entries:
+                        if check_entry(lib_entry):
+                            return True
+        
+        return False
+
+    def write_model_def(self, model: ModelDef) -> None:
+        """Write a model definition in Xyce format, handling BSIM4 conversions."""
+        mname = self.format_ident(model.name)
+        mtype = self.format_ident(model.mtype).lower()
+        
+        # Use local variable for params to avoid mutating the model object
+        params_to_write = list(model.params)  # Create a copy
+        
+        # Handle BSIM4: replace with pmos/nmos, add level, omit deltox
+        if mtype == "bsim4":
+            # Determine pmos/nmos from type parameter
+            type_param = next((p for p in model.params if p.name.name == "type"), None)
+            if type_param and isinstance(type_param.default, Ref) and type_param.default.ident.name == "p":
+                mtype = "pmos"
+            elif type_param and isinstance(type_param.default, Ref) and type_param.default.ident.name == "n":
+                mtype = "nmos"
+            else:
+                # Default to nmos if type parameter is not found or unclear
+                mtype = "nmos"
+            
+            # Check if level parameter already exists
+            has_level = any(p.name.name == "level" for p in params_to_write)
+            
+            # Filter out deltox parameter
+            params_to_write = [p for p in params_to_write if p.name.name != "deltox"]
+            
+            # Add level=54 at the beginning if not already present
+            if not has_level:
+                level_param = ParamDecl(name=Ident("level"), default=Float(54.0), distr=None)
+                params_to_write.insert(0, level_param)
+        
+        # Write model header
+        if mtype.lower() == "bsim4":
+            # Should not happen after conversion, but handle just in case
+            self.writeln(f".model {mname}")
+        else:
+            self.writeln(f".model {mname} {mtype}")
+        
+        # Write arguments if any
+        if model.args:
+            self.write("+ ")
+            for arg in model.args:
+                self.write(self.format_expr(arg) + " ")
+            self.write("\n")
+        
+        # Write parameters using the filtered list
+        for param in params_to_write:
+            self.write("+ ")
+            self.write_param_decl(param)
+            self.write("\n")
+        
+        self.write("\n")  # Ending blank-line
 
 
 class NgspiceNetlister(SpiceNetlister):

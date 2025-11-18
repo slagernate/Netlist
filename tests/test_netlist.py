@@ -1750,3 +1750,48 @@ def test_primitive_instance_no_params_keyword():
     assert "PARAMS:" in output_str2, "Regular subcircuit instances should have PARAMS: keyword"
 
 
+def test_bsim4_model_translation():
+    """Test that Spectre BSIM4 model cards get translated properly to Xyce format."""
+    from netlist.data import Program, SourceFile, ModelDef, ModelFamily, ModelVariant, SubcktDef, Instance, Ident, ParamDecl, ParamVal, Ref, Float
+    from netlist.write import WriteOptions, NetlistDialects
+    from netlist import netlist as write_netlist
+    from io import StringIO
+    
+    # Test 1: type={p} → pmos with level=54
+    pmos = ModelDef(name=Ident("pmos_model"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)])
+    output = StringIO()
+    write_netlist(src=Program(files=[SourceFile(path="test.cir", contents=[pmos])]), dest=output, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output_str = output.getvalue()
+    assert ".model pmos_model pmos" in output_str and ("level=54.0" in output_str or "level=54" in output_str), "BSIM4 type=p should become pmos with level=54"
+    
+    # Test 2: type={n} → nmos with level=54
+    nmos = ModelDef(name=Ident("nmos_model"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("n")), distr=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)])
+    output2 = StringIO()
+    write_netlist(src=Program(files=[SourceFile(path="test2.cir", contents=[nmos])]), dest=output2, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output_str2 = output2.getvalue()
+    assert ".model nmos_model nmos" in output_str2 and ("level=54.0" in output_str2 or "level=54" in output_str2), "BSIM4 type=n should become nmos with level=54"
+    
+    # Test 3: existing level=14 → keep level=14
+    with_level = ModelDef(name=Ident("model_with_level"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None), ParamDecl(name=Ident("level"), default=Float(14.0), distr=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)])
+    output3 = StringIO()
+    write_netlist(src=Program(files=[SourceFile(path="test3.cir", contents=[with_level])]), dest=output3, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output_str3 = output3.getvalue()
+    assert ".model model_with_level pmos" in output_str3 and ("level=14.0" in output_str3 or "level=14" in output_str3) and output_str3.count("level=") == 1, "BSIM4 with existing level=14 should preserve it"
+    
+    # Test 4: deltox in model → filtered out
+    with_deltox = ModelDef(name=Ident("model_with_deltox"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("n")), distr=None), ParamDecl(name=Ident("deltox"), default=Float(1e-9), distr=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)])
+    output4 = StringIO()
+    write_netlist(src=Program(files=[SourceFile(path="test4.cir", contents=[with_deltox])]), dest=output4, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output_str4 = output4.getvalue()
+    assert ".model model_with_deltox nmos" in output_str4 and "deltox=" not in output_str4 and ("level=54.0" in output_str4 or "level=54" in output_str4), "BSIM4 deltox should be filtered, level=54 added"
+    
+    # Test 5: deltox in instance params → filtered when referencing ModelFamily BSIM4
+    model_family = ModelFamily(name=Ident("plowvt_model"), mtype=Ident("bsim4"), variants=[ModelVariant(model=Ident("plowvt_model"), variant=Ident("1"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)])])
+    subckt = SubcktDef(name=Ident("pmos_lvt"), ports=[Ident("d"), Ident("g"), Ident("s"), Ident("b")], params=[], entries=[Instance(name=Ident("Mpmos_lvt"), module=Ref(ident=Ident("plowvt_model")), conns=[Ident("d"), Ident("g"), Ident("s"), Ident("b")], params=[ParamVal(name=Ident("l"), val=Float(1.0)), ParamVal(name=Ident("w"), val=Float(2.0)), ParamVal(name=Ident("deltox"), val=Ref(ident=Ident("expr")))])])
+    output5 = StringIO()
+    write_netlist(src=Program(files=[SourceFile(path="test5.cir", contents=[model_family, subckt])]), dest=output5, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output_str5 = output5.getvalue()
+    instance_section = output_str5.split("Mpmos_lvt")[1].split("\n\n")[0]
+    assert "deltox=" not in instance_section and "l=" in instance_section and "w=" in instance_section, "deltox should be filtered from instance params when referencing BSIM4 ModelFamily"
+
+
