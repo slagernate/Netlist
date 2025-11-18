@@ -5,14 +5,15 @@ description = "Circuit Netlist Generation and Parsing"
 authors = ["Dan Fritchman <dan@fritch.mn>", "Nathan Slager <slagernate@gmail.com>"]
 
 [tool.poetry.dependencies]
-python = ">=3.9,<3.13"
+python = ">=3.10,<3.13"
 pydantic = "^1.7.3"
 packaging = "^22.0"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.0"
+pytest = "^9.0.1"
 poethepoet = "^0.9.0"
 black = "^24"
+py = "^1.11.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

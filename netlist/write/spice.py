@@ -480,7 +480,7 @@ class XyceNetlister(SpiceNetlister):
             self.write(" ")
         self.write("\n")
 
-    def write_instance_params(self, pvals: List[ParamVal]) -> None:
+    def write_instance_params(self, pvals: List[ParamVal], is_mos_like: bool = False) -> None:
         """Write the parameter-values for Instance `pinst`.
 
         Parameter-values format:
@@ -488,7 +488,8 @@ class XyceNetlister(SpiceNetlister):
         XNAME
         + <ports>
         + <subckt-name>
-        + PARAMS: name1=val1 name2=val2 name3=val3
+        + PARAMS: name1=val1 name2=val2 name3=val3  (for subcircuits)
+        + name1=val1 name2=val2 name3=val3  (for MOS primitives, no PARAMS:)
         """
         self.write("+ ")
 
@@ -498,12 +499,46 @@ class XyceNetlister(SpiceNetlister):
         # Filter out delvto and deltox parameters for BSIM4 compatibility
         filtered_pvals = [pval for pval in pvals if pval.name not in ('delvto', 'deltox')]
 
-        self.write("PARAMS: ")  # <= Xyce-specific
+        # MOS primitive instances should NOT have PARAMS: keyword
+        if not is_mos_like:
+            self.write("PARAMS: ")  # <= Xyce-specific for subcircuits
         # And write them
         for pval in filtered_pvals:
             self.write_param_val(pval)
             self.write(" ")
 
+        self.write("\n")
+
+    def write_subckt_instance(self, pinst: Instance) -> None:
+        """Write sub-circuit-instance `pinst`. Override to handle MOS instances without PARAMS:."""
+        
+        # Detect if the instance looks like a MOS device (even if parsed as subcircuit instance)
+        is_mos_like = (
+            len(pinst.conns) == 4  # Exactly 4 ports (d, g, s, b)
+            and isinstance(pinst.module, Ref)  # References a model
+            and {'l', 'w'} <= {p.name.name for p in pinst.params}  # Has both 'l' and 'w' params
+            and any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet', 'pmos', 'nmos'])  # Instance name indicates MOS
+        )
+
+        prefix = 'M' if is_mos_like else 'X'
+
+        inst_name = self.format_ident(pinst.name)
+        if prefix and not inst_name.upper().startswith(prefix):
+            inst_name = f"{prefix}{inst_name}"
+
+        # Write the instance name
+        self.write(inst_name + " \n")
+
+        # Write its port-connections
+        self.write_instance_conns(pinst)
+
+        # Write the sub-circuit name
+        self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
+
+        # Write its parameter values (pass is_mos_like to skip PARAMS: for MOS)
+        self.write_instance_params(pinst.params, is_mos_like=is_mos_like)
+
+        # Add a blank after each instance
         self.write("\n")
 
     def write_comment(self, comment: str) -> None:
@@ -633,6 +668,51 @@ class XyceNetlister(SpiceNetlister):
             self.handle_error(func, "FunctionDef with multiple statements not supported")
 
         self.write(" }\n")
+
+    def write_param_decl(self, param: ParamDecl) -> str:
+        """Format a parameter declaration, with special handling for param functions in Xyce."""
+        if param.distr is not None:
+            msg = f"Unsupported `distr` for parameter {param.name} will be ignored"
+            warn(msg)
+            self.write("\n+ ")
+            self.write_comment(msg)
+            self.write("\n+ ")
+
+        param_name = self.format_ident(param.name)
+
+        # Check if this is a param function (name contains parentheses)
+        if '(' in param_name and param_name.endswith(')'):
+            # This is a param function like lnorm(mu,sigma) or mm_z1_mismatch(dummy_param)
+            if param.default is None:
+                msg = f"Required (non-default) param function {param.name} is not supported."
+                warn(msg)
+                default = str(sys.float_info.max)
+            else:
+                # For param functions, use = for lnorm, ' quotes for mismatch
+                default = param.default
+                if isinstance(default, str):
+                    # Already formatted
+                    pass
+                else:
+                    default = self.format_expr(default)
+                # Remove outer braces/quotes if present
+                if (default.startswith('{') and default.endswith('}')) or (default.startswith("'") and default.endswith("'")):
+                    default = default[1:-1]
+
+                # Use single quotes for all param functions
+                self.write(f"{param_name}='{default}'")
+                return
+
+        # Normal parameter declaration
+        if param.default is None:
+            msg = f"Required (non-default) parameter {param.name} is not supported by {self.__class__.__name__}. "
+            msg += "Setting to maximum floating-point value {sys.float_info.max}, which almost certainly will not work if instantiated."
+            warn(msg)
+            default = str(sys.float_info.max)
+        else:
+            default = self.format_expr(param.default)
+
+        self.write(f"{param_name}={default}")
 
 
 class NgspiceNetlister(SpiceNetlister):
@@ -839,68 +919,54 @@ def has_lognorm_distributions(stats_blocks: List[StatisticsBlock]) -> bool:
 
 
 def add_lnorm_functions(program: Program) -> None:
-    """Add lnorm and alnorm function definitions to the program (Xyce .FUNC definitions).
-    
-    Functions are added to the file containing statistics blocks, right before the first StatisticsBlock
-    to preserve order.
+    """Add lnorm and alnorm .param declarations to the program.
+
+    Creates: .param lnorm(mu,sigma)=exp(gauss(mu,sigma))
+    These are added to the beginning of the file containing statistics blocks.
     """
     if not program.files:
         return
 
-    # Find the file that contains statistics blocks (models.scs) to add functions there
+    # Find the file that contains statistics blocks (models.scs) to add params there
     stats_file = None
-    stats_block_idx = None
     for file in program.files:
-        for idx, entry in enumerate(file.contents):
+        for entry in file.contents:
             if isinstance(entry, StatisticsBlock):
                 stats_file = file
-                stats_block_idx = idx
                 break
         if stats_file:
             break
-    
+
     # Fallback to first file if no stats file found
     if not stats_file:
         stats_file = program.files[0]
-        stats_block_idx = len(stats_file.contents)
 
-    math_funcs = [
-        FunctionDef(
-            name=Ident("lnorm"),
-            rtype=ArgType.REAL,
-            args=[
-                TypedArg(tp=ArgType.REAL, name=Ident("mu")),
-                TypedArg(tp=ArgType.REAL, name=Ident("sigma"))
-            ],
-            stmts=[Return(val=Call(
-                func=Ref(ident=Ident("exp")),
-                args=[Call(
-                    func=Ref(ident=Ident("gauss")),
-                    args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma"))]
-                )]
-            ))]
+    # Create .param declarations for lnorm and alnorm
+    # Create expression: exp(gauss(mu,sigma))
+    gauss_call = Call(
+        func=Ref(ident=Ident("gauss")),
+        args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma"))]
+    )
+    exp_call = Call(
+        func=Ref(ident=Ident("exp")),
+        args=[gauss_call]
+    )
+
+    math_params = [
+        ParamDecl(
+            name=Ident("lnorm(mu,sigma)"),
+            default=exp_call,
+            distr=None
         ),
-        FunctionDef(
-            name=Ident("alnorm"),
-            rtype=ArgType.REAL,
-            args=[
-                TypedArg(tp=ArgType.REAL, name=Ident("mu")),
-                TypedArg(tp=ArgType.REAL, name=Ident("sigma"))
-            ],
-            stmts=[Return(val=Call(
-                func=Ref(ident=Ident("exp")),
-                args=[Call(
-                    func=Ref(ident=Ident("gauss")),
-                    args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma"))]
-                )]
-            ))]
+        ParamDecl(
+            name=Ident("alnorm(mu,sigma)"),
+            default=exp_call,
+            distr=None
         )
     ]
-    # Insert functions before the StatisticsBlock to preserve order
-    if stats_block_idx is not None:
-        stats_file.contents[stats_block_idx:stats_block_idx] = math_funcs
-    else:
-        stats_file.contents.extend(math_funcs)
+
+    # Insert params at the beginning of the file
+    stats_file.contents.insert(0, ParamDecls(params=math_params))
 
 
 def create_monte_carlo_distribution_call(dist_type: str, std: Float) -> Optional[Call]:
@@ -1076,44 +1142,43 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
     apply_all_mismatch_variations(program, stats_blocks)
 
 
-def create_mismatch_function(var: Variation, idx: int, original_expr: Expr) -> Optional[FunctionDef]:
-    """Create a mismatch function definition that includes the original parameter value and uses unseeded gauss calls.
-    
-    The function returns: {original_value + enable_mismatch * distribution(...)}
-    This allows the function to be called at each instance with the base value plus variation.
-    Uses unseeded gauss calls: gauss(mean, std) with two arguments only.
+def create_mismatch_function(var: Variation, idx: int) -> Optional[ParamDecl]:
+    """Create a mismatch .param declaration with dummy parameter syntax as requested.
+
+    Creates: mm_z1_mismatch(dummy_param) with expression 0+enable_mismatch*gauss(0,mismatch_factor)
+    This is placed near the top and called as mm_z1_mismatch(0).
     """
     if not var.dist:
         return None
 
-    func_name = f"{var.name.name}_mismatch"
+    param_name = f"{var.name.name}_mismatch(dummy_param)"
     dist_type_lower = var.dist.lower()
 
+    # Create expression: 0 + enable_mismatch * gauss(0,mismatch_factor)
+    zero = Int(0)
+    enable_mismatch_ref = Ref(ident=Ident("enable_mismatch"))
+    mismatch_factor_ref = Ref(ident=Ident("mismatch_factor"))
+
     if 'gauss' in dist_type_lower:
-        dist_func_name = "gauss"
+        dist_call = Call(
+            func=Ref(ident=Ident("gauss")),
+            args=[Int(0), mismatch_factor_ref]
+        )
     elif 'lnorm' in dist_type_lower:
-        dist_func_name = "lnorm"
+        dist_call = Call(
+            func=Ref(ident=Ident("lnorm")),
+            args=[Int(0), mismatch_factor_ref]
+        )
     else:
         return None
 
-    # Unseeded gauss call: gauss(mean, std) with two args only
-    dist_call = Call(
-        func=Ref(ident=Ident(dist_func_name)),
-        args=[Int(0), var.std]  # mean=0, std from variation; no seed
-    )
+    mismatch_term = BinaryOp(tp=BinaryOperator.MUL, left=enable_mismatch_ref, right=dist_call)
+    param_expr = BinaryOp(tp=BinaryOperator.ADD, left=zero, right=mismatch_term)
 
-    # Multiply by enable_mismatch to allow toggling mismatch on/off
-    enable_ref = Ref(ident=Ident("enable_mismatch"))
-    mismatch_value = BinaryOp(tp=BinaryOperator.MUL, left=enable_ref, right=dist_call)
-
-    # Include the original parameter value in the function's return
-    new_val = BinaryOp(tp=BinaryOperator.ADD, left=original_expr, right=mismatch_value)
-
-    return FunctionDef(
-        name=Ident(func_name),
-        rtype=ArgType.REAL,
-        args=[],  # No arguments - called as param_name_mismatch()
-        stmts=[Return(val=new_val)]
+    return ParamDecl(
+        name=Ident(param_name),
+        default=param_expr,
+        distr=None
     )
 
 
@@ -1134,50 +1199,63 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_b
         warn(f"No matching parameter found for mismatch variation '{var.name.name}'. Skipping.")
         return
 
-    # Get the original value before creating the function
-    original_expr = matching_param.default or Int(0)
-    
-    mismatch_func = create_mismatch_function(var, idx, original_expr)
-    if not mismatch_func:
+    mismatch_param = create_mismatch_function(var, idx)
+    if not mismatch_param:
         return
 
-    func_name = mismatch_func.name.name
+    param_name = mismatch_param.name.name
 
-    # Add function to the file that contains statistics blocks (models.scs)
-    # Insert it right before the StatisticsBlock to preserve order
+    # Add param as a separate entry at the top of the file
+    # Find the file that contains statistics blocks
     stats_file = None
-    stats_block_idx = None
     for file in program.files:
-        for idx, entry in enumerate(file.contents):
+        for entry in file.contents:
             if isinstance(entry, StatisticsBlock):
                 stats_file = file
-                stats_block_idx = idx
                 break
         if stats_file:
             break
-    
-    # Fallback to first file if no stats file found
-    if not stats_file and program.files:
-        stats_file = program.files[0]
-        stats_block_idx = len(stats_file.contents)
-    
-    if stats_file:
-        # Insert before StatisticsBlock to preserve order
-        # But we need to account for functions already inserted
-        # Find the actual position (after any lnorm/alnorm functions, before StatisticsBlock)
-        if stats_block_idx is not None:
-            # Insert right before StatisticsBlock (after any lnorm functions)
-            stats_file.contents.insert(stats_block_idx, mismatch_func)
-            # Update stats_block_idx for next mismatch function
-        else:
-            stats_file.contents.append(mismatch_func)
 
-    # Create function call to use as replacement
-    func_call = Call(func=Ref(ident=Ident(func_name)), args=[])
+    # Fallback to first file if no stats file found
+    if not stats_file:
+        stats_file = program.files[0]
+
+    # Insert param at the beginning of the file (after lnorm/alnorm if they exist)
+    # Look for existing ParamDecls containers that contain param functions, or find insertion point
+    found_paramdecls = None
+    insert_idx = 0
     
+    # First, look for existing ParamDecls with param functions (like lnorm/alnorm or other mismatch params)
+    for i, entry in enumerate(stats_file.contents):
+        if isinstance(entry, ParamDecls):
+            # Check if this ParamDecls is for param functions (contains params with parentheses in name)
+            if entry.params and any('(' in param.name.name for param in entry.params):
+                found_paramdecls = entry
+                # Continue to find where to insert if we need a new container
+                insert_idx = i + 1
+            else:
+                # Regular ParamDecls, skip it
+                insert_idx = i + 1
+        else:
+            # Found first non-ParamDecls entry, insert before it
+            insert_idx = i
+            break
+
+    # If we found an existing ParamDecls container for param functions, add to it
+    if found_paramdecls:
+        found_paramdecls.params.append(mismatch_param)
+    else:
+        # Create a new ParamDecls container with this param
+        stats_file.contents.insert(insert_idx, ParamDecls(params=[mismatch_param]))
+
+    # Create param function call to use as replacement (with dummy argument)
+    # Extract the base name without (dummy_param)
+    base_name = param_name.split('(')[0]
+    param_call = Call(func=Ref(ident=Ident(base_name)), args=[Int(0)])  # Use 0 as dummy arg
+
     # Replace ALL references to this parameter throughout the program
-    replace_param_refs_in_program(program, var.name.name, func_call)
-    
+    replace_param_refs_in_program(program, var.name.name, param_call)
+
     # Remove the parameter declaration (effectively "deleting" it)
     remove_param_declaration(program, var.name.name)
 
