@@ -1795,3 +1795,34 @@ def test_bsim4_model_translation():
     assert "deltox=" not in instance_section and "l=" in instance_section and "w=" in instance_section, "deltox should be filtered from instance params when referencing BSIM4 ModelFamily"
 
 
+def test_bsim4_deltox_filtering_in_subckt():
+    """Test that deltox is filtered from instances in subcircuits when ModelFamily is inside subcircuit."""
+    from netlist.data import Program, SourceFile, ModelFamily, ModelVariant, SubcktDef, Instance, Ident, ParamVal, Ref, Float, ParamDecl
+    from netlist.write import WriteOptions, NetlistDialects
+    from netlist import netlist as write_netlist
+    from io import StringIO
+    
+    # ModelFamily inside subcircuit, instance references it with deltox
+    model_family = ModelFamily(name=Ident("test_model"), mtype=Ident("bsim4"), variants=[
+        ModelVariant(model=Ident("test_model"), variant=Ident("1"), mtype=Ident("bsim4"), args=[], 
+                   params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None)]),
+        ModelVariant(model=Ident("test_model"), variant=Ident("2"), mtype=Ident("bsim4"), args=[], 
+                   params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None)])
+    ])
+    subckt = SubcktDef(name=Ident("test_pmos"), ports=[Ident("d"), Ident("g"), Ident("s"), Ident("b")], 
+                      params=[], entries=[
+        Instance(name=Ident("test_pmos"), module=Ref(ident=Ident("test_model")), 
+                conns=[Ident("d"), Ident("g"), Ident("s"), Ident("b")], 
+                params=[ParamVal(name=Ident("l"), val=Float(1.0)), ParamVal(name=Ident("w"), val=Float(2.0)), 
+                       ParamVal(name=Ident("deltox"), val=Float(1e-9)), ParamVal(name=Ident("delvto"), val=Float(0.1))]),
+        model_family
+    ])
+    output = StringIO()
+    write_netlist(src=Program(files=[SourceFile(path="test.cir", contents=[subckt])]), dest=output, 
+                 options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output_str = output.getvalue()
+    instance_section = output_str.split("Mtest_pmos")[1].split("\n\n")[0]
+    assert "deltox=" not in instance_section, "deltox should be filtered from instance in subcircuit"
+    assert "l=" in instance_section and "w=" in instance_section, "other params should remain"
+    assert "delvto=" in instance_section, "delvto should remain (not deltox)"
+

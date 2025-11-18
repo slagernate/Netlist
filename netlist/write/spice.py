@@ -98,7 +98,10 @@ class SpiceNetlister(Netlister):
         self.write("\n")
 
         # Write its internal content/ entries
+        import sys
+        print(f"DEBUG: SubcktDef {module.name.name} has {len(module.entries)} entries", file=sys.stderr)
         for entry in module.entries:
+            print(f"DEBUG: SubcktDef {module.name.name} writing entry: {type(entry).__name__}", file=sys.stderr)
             self.write_entry(entry)
 
         # And close up the sub-circuit
@@ -121,14 +124,27 @@ class SpiceNetlister(Netlister):
 
     def write_subckt_instance(self, pinst: Instance) -> None:
         """Write sub-circuit-instance `pinst`."""
+        from warnings import warn
+        
+        # Log instance details
+        conn_count = len(pinst.conns)
+        has_l_w = {'l', 'w'} <= {p.name.name for p in pinst.params}
+        is_module_ref = isinstance(pinst.module, Ref)
+        module_ref_name = pinst.module.ident.name if is_module_ref else None
+        name_has_mos = any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet'])
+        
+        warn(f"DEBUG write_subckt_instance: instance={pinst.name.name}, conns={conn_count}, "
+             f"has_l_w={has_l_w}, is_module_ref={is_module_ref}, module_ref={module_ref_name}, "
+             f"name_has_mos={name_has_mos}")
 
         # Detect if the instance looks like a MOS device (even if parsed as subcircuit instance)
         is_mos_like = (
-            len(pinst.conns) == 4  # Exactly 4 ports (d, g, s, b)
-            and isinstance(pinst.module, Ref)  # References a model
-            and {'l', 'w'} <= {p.name.name for p in pinst.params}  # Has both 'l' and 'w' params
-            and any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet'])  # Instance name indicates MOS
+            conn_count == 4  # Exactly 4 ports (d, g, s, b)
+            and is_module_ref  # References a model
+            and has_l_w  # Has both 'l' and 'w' params
+            and name_has_mos  # Instance name indicates MOS
         )
+        warn(f"DEBUG write_subckt_instance: {pinst.name.name} is_mos_like={is_mos_like}")
 
         prefix = 'M' if is_mos_like else 'X'
 
@@ -146,7 +162,9 @@ class SpiceNetlister(Netlister):
         self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
 
         # Write its parameter values
-        self.write_instance_params(pinst.params)
+        module_ref = pinst.module if isinstance(pinst.module, Ref) else None
+        warn(f"DEBUG write_subckt_instance: Calling write_instance_params with module_ref={module_ref.ident.name if module_ref else None}, is_mos_like={is_mos_like}")
+        self.write_instance_params(pinst.params, is_mos_like=is_mos_like, module_ref=module_ref)
 
         # Add a blank after each instance
         self.write("\n")
@@ -496,6 +514,9 @@ class XyceNetlister(SpiceNetlister):
             is_mos_like: Whether this is a MOS-like instance
             module_ref: Optional Ref to the module/model being instantiated (for BSIM4 detection)
         """
+        from warnings import warn
+        warn(f"DEBUG write_instance_params: called with module_ref={module_ref.ident.name if module_ref else None}, is_mos_like={is_mos_like}, num_params={len(pvals)}")
+        
         self.write("+ ")
 
         if not pvals:  # Write a quick comment for no parameters
@@ -503,13 +524,18 @@ class XyceNetlister(SpiceNetlister):
 
         # Filter deltox from instance parameters if this instance references a BSIM4 model
         params_to_write = pvals
-        if module_ref and self._is_bsim4_model_ref(module_ref):
-            # Check if deltox is present before filtering
-            has_deltox = any(pval.name.name == "deltox" for pval in pvals)
-            if has_deltox:
-                warn(f"Filtering 'deltox' parameter from instance parameters for BSIM4 model '{module_ref.ident.name}'. "
-                     f"Xyce does not support deltox for BSIM4 models.")
-            params_to_write = [pval for pval in pvals if pval.name.name != "deltox"]
+        if module_ref:
+            is_bsim4 = self._is_bsim4_model_ref(module_ref)
+            warn(f"DEBUG write_instance_params: _is_bsim4_model_ref({module_ref.ident.name}) = {is_bsim4}")
+            if is_bsim4:
+                # Check if deltox is present before filtering
+                has_deltox = any(pval.name.name == "deltox" for pval in pvals)
+                warn(f"DEBUG write_instance_params: has_deltox={has_deltox}")
+                if has_deltox:
+                    warn(f"Filtering 'deltox' parameter from instance parameters for BSIM4 model '{module_ref.ident.name}'. "
+                         f"Xyce does not support deltox for BSIM4 models.")
+                params_to_write = [pval for pval in pvals if pval.name.name != "deltox"]
+                warn(f"DEBUG write_instance_params: params_to_write count={len(params_to_write)} (original={len(pvals)})")
 
         # MOS primitive instances should NOT have PARAMS: keyword
         if not is_mos_like:
@@ -794,50 +820,86 @@ class XyceNetlister(SpiceNetlister):
         Returns:
             True if the reference points to a BSIM4 model, False otherwise
         """
+        from warnings import warn
         if not isinstance(ref, Ref):
+            warn(f"DEBUG _is_bsim4_model_ref: ref is not a Ref, type={type(ref)}")
             return False
+        
+        model_name = ref.ident.name
+        warn(f"DEBUG _is_bsim4_model_ref: called with model_name={model_name}, ref.resolved={ref.resolved}")
         
         # First, check if ref.resolved is already set (more direct and reliable)
         if ref.resolved is not None:
             from ..data import Model, ModelDef, ModelFamily
+            warn(f"DEBUG _is_bsim4_model_ref: ref.resolved is set, type={type(ref.resolved)}")
             if isinstance(ref.resolved, Model):
                 if isinstance(ref.resolved, ModelDef):
-                    return ref.resolved.mtype.name.lower() == "bsim4"
+                    result = ref.resolved.mtype.name.lower() == "bsim4"
+                    warn(f"DEBUG _is_bsim4_model_ref: ModelDef check, mtype={ref.resolved.mtype.name.lower()}, result={result}")
+                    return result
                 elif isinstance(ref.resolved, ModelFamily):
-                    return any(v.mtype.name.lower() == "bsim4" for v in ref.resolved.variants)
+                    result = any(v.mtype.name.lower() == "bsim4" for v in ref.resolved.variants)
+                    warn(f"DEBUG _is_bsim4_model_ref: ModelFamily check, variants={len(ref.resolved.variants)}, result={result}")
+                    return result
+            warn(f"DEBUG _is_bsim4_model_ref: ref.resolved is not a Model, returning False")
             return False
         
         # If not resolved, search through the program
         model_name = ref.ident.name  # e.g., "plowvt_model"
+        warn(f"DEBUG _is_bsim4_model_ref: ref.resolved is None, searching program for {model_name}")
         
         # Import model types for use in nested function
-        from ..data import ModelDef, ModelFamily, ModelVariant, LibSectionDef
+        from ..data import ModelDef, ModelFamily, ModelVariant, LibSectionDef, SubcktDef
         
         def check_entry(entry) -> bool:
             """Helper to check if an entry is a BSIM4 model matching model_name."""
             if isinstance(entry, ModelDef):
                 if entry.name.name == model_name:
-                    return entry.mtype.name.lower() == "bsim4"
+                    result = entry.mtype.name.lower() == "bsim4"
+                    warn(f"DEBUG _is_bsim4_model_ref: Found ModelDef {entry.name.name}, mtype={entry.mtype.name.lower()}, result={result}")
+                    return result
             elif isinstance(entry, ModelFamily):
                 if entry.name.name == model_name:
-                    return any(v.mtype.name.lower() == "bsim4" for v in entry.variants)
+                    result = any(v.mtype.name.lower() == "bsim4" for v in entry.variants)
+                    warn(f"DEBUG _is_bsim4_model_ref: Found ModelFamily {entry.name.name}, variants={len(entry.variants)}, result={result}")
+                    return result
             elif isinstance(entry, ModelVariant):
                 variant_name = f"{entry.model.name}.{entry.variant.name}"
                 if variant_name == model_name or entry.model.name == model_name:
-                    return entry.mtype.name.lower() == "bsim4"
+                    result = entry.mtype.name.lower() == "bsim4"
+                    warn(f"DEBUG _is_bsim4_model_ref: Found ModelVariant {variant_name}, mtype={entry.mtype.name.lower()}, result={result}")
+                    return result
             return False
         
         # Search through all files in the program
-        for file in self.src.files:
-            for entry in file.contents:
+        warn(f"DEBUG _is_bsim4_model_ref: Searching {len(self.src.files)} files")
+        for file_idx, file in enumerate(self.src.files):
+            warn(f"DEBUG _is_bsim4_model_ref: Searching file {file_idx}: {file.path}, {len(file.contents)} entries")
+            for entry_idx, entry in enumerate(file.contents):
+                entry_type = type(entry).__name__
+                entry_name = getattr(entry, 'name', None)
+                entry_name_str = entry_name.name if entry_name else "unnamed"
+                if entry_type in ('ModelDef', 'ModelFamily', 'ModelVariant'):
+                    warn(f"DEBUG _is_bsim4_model_ref: Checking entry {entry_idx}: {entry_type} {entry_name_str}")
                 if check_entry(entry):
+                    warn(f"DEBUG _is_bsim4_model_ref: Match found! Returning True")
                     return True
                 # Also search inside library sections recursively
                 elif isinstance(entry, LibSectionDef):
+                    warn(f"DEBUG _is_bsim4_model_ref: Checking LibSectionDef {entry.name.name}, {len(entry.entries)} entries")
                     for lib_entry in entry.entries:
                         if check_entry(lib_entry):
+                            warn(f"DEBUG _is_bsim4_model_ref: Match found in LibSectionDef! Returning True")
+                            return True
+                # Also search inside subcircuit definitions recursively
+                elif isinstance(entry, SubcktDef):
+                    warn(f"DEBUG _is_bsim4_model_ref: Checking SubcktDef {entry.name.name}, {len(entry.entries)} entries")
+                    for subckt_entry in entry.entries:
+                        if check_entry(subckt_entry):
+                            warn(f"DEBUG _is_bsim4_model_ref: Match found in SubcktDef! Returning True")
                             return True
         
+        warn(f"DEBUG _is_bsim4_model_ref: No match found for {model_name}, returning False")
         return False
 
     def write_model_def(self, model: ModelDef) -> None:

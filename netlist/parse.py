@@ -366,6 +366,8 @@ class HierarchyCollector:
                 s = self.collect_subckt(start=stmt)
             else:  # Anything else, copy along
                 s = stmt
+            # Debug: print what we're collecting
+            print(f"DEBUG: collect_subckt {start.name.name} collecting: {type(s).__name__}")
             nodes.append(s)
 
         return SubcktDef(
