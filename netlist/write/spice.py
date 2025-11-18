@@ -353,9 +353,8 @@ class SpiceNetlister(Netlister):
 
     def write_param_decls(self, params: ParamDecls) -> None:
         """Write parameter declarations"""
-        self.write(".param \n")
         for p in params.params:
-            self.write("+ ")
+            self.write(".param ")
             self.write_param_decl(p)
             self.write("\n")
         self.write("\n")
@@ -770,7 +769,7 @@ class XyceNetlister(SpiceNetlister):
 
         # Check if this is a param function (name contains parentheses)
         if '(' in param_name and param_name.endswith(')'):
-            # This is a param function like lnorm(mu,sigma) or mm_z1_mismatch(dummy_param)
+            # This is a param function like lnorm(mu,sigma) or mm_z1__mismatch__(dummy_param)
             if param.default is None:
                 msg = f"Required (non-default) param function {param.name} is not supported."
                 warn(msg)
@@ -1386,13 +1385,13 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
 def create_mismatch_function(var: Variation, idx: int) -> Optional[ParamDecl]:
     """Create a mismatch .param declaration with dummy parameter syntax as requested.
 
-    Creates: mm_z1_mismatch(dummy_param) with expression 0+enable_mismatch*gauss(0,mismatch_factor)
-    This is placed near the top and called as mm_z1_mismatch(0).
+    Creates: mm_z1__mismatch__(dummy_param) with expression 0+enable_mismatch*gauss(0,mismatch_factor)
+    This is placed near the top and called as mm_z1__mismatch__(0).
     """
     if not var.dist:
         return None
 
-    param_name = f"{var.name.name}_mismatch(dummy_param)"
+    param_name = f"{var.name.name}__mismatch__(dummy_param)"
     dist_type_lower = var.dist.lower()
 
     # Create expression: 0 + enable_mismatch * gauss(0,mismatch_factor)
