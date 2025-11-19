@@ -1062,12 +1062,12 @@ def test_apply_statistics_vary_mismatch():
         for entry in file.contents
         if isinstance(entry, ParamDecls)
         for param in entry.params
-        if param.name.name in ["width_mismatch(dummy_param)", "length_mismatch(dummy_param)", "tox_mismatch(dummy_param)"]
+        if param.name.name in ["width__mismatch__(dummy_param)", "length__mismatch__(dummy_param)", "tox__mismatch__(dummy_param)"]
     ]
     assert len(mismatch_params) == 3, f"Expected 3 mismatch param functions, got {len(mismatch_params)}"
     
     # Verify width param function uses gauss with enable_mismatch multiplier
-    width_param = next(p for p in mismatch_params if p.name.name == "width_mismatch(dummy_param)")
+    width_param = next(p for p in mismatch_params if p.name.name == "width__mismatch__(dummy_param)")
     width_expr = width_param.default
     # Expected: 0 + enable_mismatch * gauss(0, mismatch_factor)
     assert isinstance(width_expr, BinaryOp)
@@ -1087,7 +1087,7 @@ def test_apply_statistics_vary_mismatch():
     assert isinstance(width_call.args[1], Ref) and width_call.args[1].ident.name == "mismatch_factor"  # std ref
     
     # Verify tox param function uses lnorm with enable_mismatch multiplier
-    tox_param = next(p for p in mismatch_params if p.name.name == "tox_mismatch(dummy_param)")
+    tox_param = next(p for p in mismatch_params if p.name.name == "tox__mismatch__(dummy_param)")
     tox_expr = tox_param.default
     # Expected: 0 + enable_mismatch * lnorm(0, mismatch_factor)
     assert isinstance(tox_expr, BinaryOp)
@@ -1345,9 +1345,9 @@ def test_param_mismatch_and_corner():
         for entry in file.contents
         if isinstance(entry, ParamDecls)
         for param in entry.params
-        if param.name.name == "vth_mismatch(dummy_param)"
+        if param.name.name == "vth__mismatch__(dummy_param)"
     ]
-    assert len(mismatch_params) == 1, "vth_mismatch param function should be created"
+    assert len(mismatch_params) == 1, "vth__mismatch__ param function should be created"
     vth_param = mismatch_params[0]
     
     # Verify param function expression: 0 + enable_mismatch * gauss(0, mismatch_factor)
@@ -1457,9 +1457,9 @@ def test_mismatch_parameter_reference_replacement():
         for entry in file.contents
         if isinstance(entry, ParamDecls)
         for param in entry.params
-        if param.name.name == "mismatch_var_a_mismatch(dummy_param)"
+        if param.name.name == "mismatch_var_a__mismatch__(dummy_param)"
     ]
-    assert len(mismatch_params) == 1, "mismatch_var_a_mismatch param function should be created"
+    assert len(mismatch_params) == 1, "mismatch_var_a__mismatch__ param function should be created"
     mismatch_var_a_param = mismatch_params[0]
     
     # Verify param function expression: 0 + enable_mismatch * gauss(0, mismatch_factor)
@@ -1471,7 +1471,7 @@ def test_mismatch_parameter_reference_replacement():
     # 3. Verify instance parameter reference was replaced
     instance_param1 = next(p for p in instance.params if p.name.name == "param1")
     assert isinstance(instance_param1.val, Call), "Instance param reference should be replaced with function call"
-    assert instance_param1.val.func.ident.name == "mismatch_var_a_mismatch"
+    assert instance_param1.val.func.ident.name == "mismatch_var_a__mismatch__"
     assert len(instance_param1.val.args) == 1, "Param function should be called with dummy argument"
     assert isinstance(instance_param1.val.args[0], Int) and instance_param1.val.args[0].val == 0
     
@@ -1481,7 +1481,7 @@ def test_mismatch_parameter_reference_replacement():
     assert subckt_param.default.tp == BinaryOperator.ADD
     # The left side should be the function call, not the Ref
     assert isinstance(subckt_param.default.left, Call), "Subcircuit param reference should be replaced"
-    assert subckt_param.default.left.func.ident.name == "mismatch_var_a_mismatch"
+    assert subckt_param.default.left.func.ident.name == "mismatch_var_a__mismatch__"
     assert len(subckt_param.default.left.args) == 1
     assert isinstance(subckt_param.default.left.args[0], Int) and subckt_param.default.left.args[0].val == 0
     assert isinstance(subckt_param.default.right, Float) and subckt_param.default.right.val == 1.0
@@ -1498,7 +1498,7 @@ def test_mismatch_parameter_reference_replacement():
     assert param_ref_entry.default.tp == BinaryOperator.MUL
     # The left side should be the function call, not the Ref
     assert isinstance(param_ref_entry.default.left, Call), "Parameter default reference should be replaced"
-    assert param_ref_entry.default.left.func.ident.name == "mismatch_var_a_mismatch"
+    assert param_ref_entry.default.left.func.ident.name == "mismatch_var_a__mismatch__"
     assert len(param_ref_entry.default.left.args) == 1
     assert isinstance(param_ref_entry.default.left.args[0], Int) and param_ref_entry.default.left.args[0].val == 0
     assert isinstance(param_ref_entry.default.right, Float) and param_ref_entry.default.right.val == 2.0
@@ -1653,8 +1653,8 @@ def test_spectre_statistics_param_generation():
     # Should have mismatch params
     assert len(mismatch_params) == 2, f"Expected 2 mismatch params, got {len(mismatch_params)}"
     mismatch_names = [p.name.name for p in mismatch_params]
-    assert 'param_c_mismatch(dummy_param)' in mismatch_names
-    assert 'param_d_mismatch(dummy_param)' in mismatch_names
+    assert 'param_c__mismatch__(dummy_param)' in mismatch_names
+    assert 'param_d__mismatch__(dummy_param)' in mismatch_names
 
     # Check that expressions are AST objects, not strings
     for param in lnorm_params + mismatch_params:
