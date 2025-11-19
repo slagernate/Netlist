@@ -1,0 +1,12 @@
+; Written by XyceNetlister
+; 
+
+; Source File: /home/nates/github/Netlist/examples/spectre_to_xyce/statistics/spectre_statistics.scs
+.param lnorm(mu,sigma)='exp(gauss(mu,sigma))'
+.param alnorm(mu,sigma)='exp(gauss(mu,sigma))'
+.param vth0__mismatch__(dummy_param)='0+enable_mismatch*gauss(0,mismatch_factor)'
+
+.param vth0_nom=0.45
+.param tox_nom=4.0n
+.param tox={tox_nom*(1.0+0.05*lnorm(0,1.0))}
+

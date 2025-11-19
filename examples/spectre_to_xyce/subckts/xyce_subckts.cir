@@ -1,0 +1,19 @@
+; Written by XyceNetlister
+; 
+
+; Source File: /home/nates/github/Netlist/examples/spectre_to_xyce/subckts/spectre_subckts.scs
+.SUBCKT inverter in out vdd vss
++ PARAMS: w=1.0u l=0.18u 
+
+Xm1 
++ out in vdd vdd 
++ pmos 
++ PARAMS: w={w} l={l} 
+
+Xm2 
++ out in vss vss 
++ nmos 
++ PARAMS: w={w} l={l} 
+
+.ENDS
+

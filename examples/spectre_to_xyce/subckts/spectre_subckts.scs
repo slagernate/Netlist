@@ -1,0 +1,9 @@
+simulator lang=spectre
+
+* Minimal example: Subcircuit definition
+subckt inverter in out vdd vss
+    parameters w=1.0u l=0.18u
+    m1 out in vdd vdd pmos w=w l=l
+    m2 out in vss vss nmos w=w l=l
+ends inverter
+

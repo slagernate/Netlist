@@ -1,0 +1,19 @@
+simulator lang=spectre
+
+* Minimal example: Statistics block with process and mismatch variations
+parameters
++    vth0_nom = 0.45
++    tox_nom = 4.0n
++    vth0 = vth0_nom
++    tox = tox_nom
+
+statistics {
+    process {
+        vary vth0 dist=gauss std=0.01
+        vary tox dist=lnorm std=0.05
+    }
+    mismatch {
+        vary vth0 dist=gauss std=0.002
+    }
+}
+

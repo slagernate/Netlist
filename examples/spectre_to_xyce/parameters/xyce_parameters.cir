@@ -1,0 +1,10 @@
+; Written by XyceNetlister
+; 
+
+; Source File: /home/nates/github/Netlist/examples/spectre_to_xyce/parameters/spectre_parameters.scs
+.param vdd=1.8
+.param vss=0.0
+.param width=1.0u
+.param length=0.18u
+.param tox=4.0n
+
