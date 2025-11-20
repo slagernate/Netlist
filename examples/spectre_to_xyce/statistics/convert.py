@@ -4,7 +4,7 @@ from netlist import parse_files, netlist, NetlistDialects, ParseOptions, WriteOp
 from netlist.write.spice import apply_statistics_variations
 
 # Parse the Spectre input file
-input_file = "spectre_statistics.scs"
+input_file = "in.scs"
 options_parse = ParseOptions(dialect=NetlistDialects.SPECTRE)
 program = parse_files(input_file, options=options_parse)
 
@@ -12,7 +12,7 @@ program = parse_files(input_file, options=options_parse)
 apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
 
 # Write to Xyce format
-output_file = "xyce_statistics.cir"
+output_file = "out.cir"
 options_write = WriteOptions(fmt=NetlistDialects.XYCE)
 with open(output_file, "w") as f:
     netlist(src=program, dest=f, options=options_write)

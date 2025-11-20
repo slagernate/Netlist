@@ -1158,36 +1158,58 @@ def test_apply_statistics_vary_process():
     # Pass XYCE format (though process variations are format-agnostic, this ensures consistency)
     apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
 
-    # Check vth parameter: process variations apply Monte Carlo first, then add mean
-    # Expected structure: (original * (1 + std * gauss(...))) + mean
+    # For Xyce format, original parameters now reference the __process__ version
+    # Check vth parameter: should reference vth__process__
     vth_param = params[0]
-    assert isinstance(vth_param.default, BinaryOp)
-    assert vth_param.default.tp == BinaryOperator.ADD  # Expected: (Monte Carlo result) + mean
-    # Left side should be: original * (1 + std * gauss(...))
-    assert isinstance(vth_param.default.left, BinaryOp)
-    assert vth_param.default.left.tp == BinaryOperator.MUL
-    assert isinstance(vth_param.default.left.left, Float) and vth_param.default.left.left.val == 0.4  # Original value
-    assert vth_param.default.right == Float(0.1)  # Expected: mean value added
+    from netlist.data import Ref
+    assert isinstance(vth_param.default, Ref), f"Expected Ref to vth__process__, got {type(vth_param.default)}"
+    assert vth_param.default.ident.name == "vth__process__"
 
-    # Check mobility parameter: process variations apply Monte Carlo first, then add mean
+    # Check mobility parameter: should reference mobility__process__
     mobility_param = params[1]
-    assert isinstance(mobility_param.default, BinaryOp)
-    assert mobility_param.default.tp == BinaryOperator.ADD
-    # Left side should be: original * (1 + std * gauss(...))
-    assert isinstance(mobility_param.default.left, BinaryOp)
-    assert mobility_param.default.left.tp == BinaryOperator.MUL
-    assert isinstance(mobility_param.default.left.left, Float) and mobility_param.default.left.left.val == 300.0
-    assert mobility_param.default.right == Float(-50.0)  # Expected: negative mean value added
+    assert isinstance(mobility_param.default, Ref)
+    assert mobility_param.default.ident.name == "mobility__process__"
 
-    # Check junction_depth parameter: process variations apply Monte Carlo first, then add mean
+    # Check junction_depth parameter: should reference junction_depth__process__
     jd_param = params[2]
-    assert isinstance(jd_param.default, BinaryOp)
-    assert jd_param.default.tp == BinaryOperator.ADD
-    # Left side should be: original * (1 + std * gauss(...))
-    assert isinstance(jd_param.default.left, BinaryOp)
-    assert jd_param.default.left.tp == BinaryOperator.MUL
-    assert isinstance(jd_param.default.left.left, Float) and jd_param.default.left.left.val == 0.1e-6
-    assert jd_param.default.right == Float(0.02e-6)  # Expected: mean value added
+    assert isinstance(jd_param.default, Ref)
+    assert jd_param.default.ident.name == "junction_depth__process__"
+
+    # Verify that __process__ parameters were created with correct expressions
+    all_params = [
+        param for file in program.files
+        for entry in file.contents
+        if isinstance(entry, ParamDecls)
+        for param in entry.params
+    ]
+    
+    # Find the __process__ parameters
+    vth_process = next((p for p in all_params if p.name.name == "vth__process__"), None)
+    assert vth_process is not None, "vth__process__ parameter should be created"
+    assert isinstance(vth_process.default, BinaryOp)
+    assert vth_process.default.tp == BinaryOperator.ADD  # Expected: (Monte Carlo result) + mean
+    assert isinstance(vth_process.default.left, BinaryOp)
+    assert vth_process.default.left.tp == BinaryOperator.MUL
+    assert isinstance(vth_process.default.left.left, Float) and vth_process.default.left.left.val == 0.4  # Original value
+    assert vth_process.default.right == Float(0.1)  # Expected: mean value added
+
+    mobility_process = next((p for p in all_params if p.name.name == "mobility__process__"), None)
+    assert mobility_process is not None, "mobility__process__ parameter should be created"
+    assert isinstance(mobility_process.default, BinaryOp)
+    assert mobility_process.default.tp == BinaryOperator.ADD
+    assert isinstance(mobility_process.default.left, BinaryOp)
+    assert mobility_process.default.left.tp == BinaryOperator.MUL
+    assert isinstance(mobility_process.default.left.left, Float) and mobility_process.default.left.left.val == 300.0
+    assert mobility_process.default.right == Float(-50.0)  # Expected: negative mean value added
+
+    jd_process = next((p for p in all_params if p.name.name == "junction_depth__process__"), None)
+    assert jd_process is not None, "junction_depth__process__ parameter should be created"
+    assert isinstance(jd_process.default, BinaryOp)
+    assert jd_process.default.tp == BinaryOperator.ADD
+    assert isinstance(jd_process.default.left, BinaryOp)
+    assert jd_process.default.left.tp == BinaryOperator.MUL
+    assert isinstance(jd_process.default.left.left, Float) and jd_process.default.left.left.val == 0.1e-6
+    assert jd_process.default.right == Float(0.02e-6)  # Expected: mean value added
 
 
 def test_apply_statistics_vary_no_match():
@@ -1572,15 +1594,16 @@ def test_process_variation_finds_param_in_library_section():
     assert lib_param_original.default.val == 4.148e-09, "Original value should be preserved"
     
     # Verify process variation was written AFTER all library sections (not after each one)
-    # Should see: .endl fet_tt\n... (other content) ... .param \n+ process_var_a={process_var_a*...}
+    # Should see: .endl fet_tt\n... (other content) ... .param \n+ process_var_a__process__={process_var_a*...}
     assert ".endl fet_tt" in output_str, "Library section should end"
     # Process variations should come after the library section ends
     endl_pos = output_str.find(".endl fet_tt")
     param_pos = output_str.find(".param", endl_pos)
     assert param_pos > endl_pos, "Process variation should be written after library section ends"
-    assert "process_var_a=" in output_str, "Process variation should include parameter name"
-    # The expression should reference the parameter itself (relative assignment)
-    assert "process_var_a*" in output_str or "process_var_a *" in output_str, "Should be relative assignment referencing parameter"
+    assert "process_var_a__process__=" in output_str, "Process variation should include parameter name with __process__ suffix"
+    # The expression should reference the original parameter itself (relative assignment)
+    # The parameter name has __process__ suffix, but the expression references the original parameter name
+    assert "process_var_a*" in output_str or "process_var_a *" in output_str, "Should be relative assignment referencing original parameter name in expression"
     
     # Verify global parameter was not affected
     global_param_updated = None

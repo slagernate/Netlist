@@ -1438,10 +1438,6 @@ def apply_all_process_variations_legacy(program: Program, stats_blocks: List[Sta
 
 def replace_statistics_blocks_with_generated_content(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
     """Replace StatisticsBlocks in the AST with generated functions and process variations for library parameters."""
-    # First apply process variations to all parameters (library and global)
-    # This maintains backward compatibility for global parameters
-    apply_all_process_variations_legacy(program, stats_blocks)
-
     # Verify all parameters exist (error if any missing)
     verify_process_variation_params(program, stats_blocks)
 
@@ -1450,22 +1446,54 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
         # Collect generated content to replace the StatisticsBlock
         generated_content = []
 
-        # Add process variations for library parameters only
+        # Add process variations for ALL parameters (both global and library section)
         if stats.process:
             # Create process variation expressions
             process_variations = []
             for var in stats.process:
                 param_name = var.name.name
+                # Skip if parameter also has mismatch variation (mismatch takes precedence)
+                if is_param_in_process_variations(stats_blocks, param_name):
+                    # Check if it's in mismatch variations
+                    has_mismatch = any(
+                        stats.mismatch and any(mvar.name.name == param_name for mvar in stats.mismatch)
+                        for stats in stats_blocks
+                    )
+                    if has_mismatch:
+                        continue  # Skip - mismatch takes precedence
+                
+                # Check if parameter is in library section or global
                 if is_param_in_library_section(program, param_name):
+                    # Library section parameter: use relative expression
                     varied_expr = create_relative_process_variation_expr(param_name, var)
-                    process_variations.append((param_name, varied_expr))
+                else:
+                    # Global parameter: get original value and apply variation
+                    matching_param = find_matching_param(program, param_name)
+                    if matching_param:
+                        original_expr = matching_param.default or Int(0)
+                        varied_expr = apply_monte_carlo_variation(original_expr, var)
+                        if var.mean:
+                            varied_expr = BinaryOp(tp=BinaryOperator.ADD, left=varied_expr, right=var.mean)
+                    else:
+                        continue  # Skip if parameter not found
+                process_variations.append((param_name, varied_expr))
 
             if process_variations:
                 # Create a ParamDecls with the process variations
                 param_decls = []
                 for param_name, varied_expr in process_variations:
-                    param_decls.append(ParamDecl(name=Ident(param_name), default=varied_expr, distr=None))
+                    process_param_name = f"{param_name}__process__"
+                    param_decls.append(ParamDecl(name=Ident(process_param_name), default=varied_expr, distr=None))
                 generated_content.append(ParamDecls(params=param_decls))
+                
+                # Update original global parameters to reference the __process__ version
+                for param_name, _ in process_variations:
+                    if not is_param_in_library_section(program, param_name):
+                        matching_param = find_matching_param(program, param_name)
+                        if matching_param:
+                            # Update original parameter to reference the __process__ version
+                            process_param_ref = Ref(ident=Ident(f"{param_name}__process__"))
+                            matching_param.default = process_param_ref
 
         # Replace the StatisticsBlock with generated content
         for file in program.files:
