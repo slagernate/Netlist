@@ -501,9 +501,12 @@ class XyceNetlister(SpiceNetlister):
 
         return NetlistFormat.XYCE
 
-    def _collect_param_names(self, program: Program) -> set:
+    def _collect_param_names(self, program: Optional[Program]) -> set:
         """Collect all parameter names from the program AST."""
         param_names = set()
+        
+        if program is None:
+            return param_names
         
         def collect_from_entry(entry):
             if isinstance(entry, ParamDecl):
