@@ -481,6 +481,18 @@ class XyceNetlister(SpiceNetlister):
     def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "") -> None:
         super().__init__(src, dest, errormode=errormode, file_type=file_type)
         self._last_entry_was_instance = False  # Track if last entry written was an instance
+        # Track reserved parameter name mappings (reserved_name -> safe_name)
+        self._reserved_param_map: Dict[str, str] = {}
+        # Xyce reserved variable names that cannot be used as parameters (case-insensitive)
+        # Note: 'temp', 'time', etc. are built-in variables that can be used in expressions
+        # but should NOT be renamed. Only truly reserved parameter names are listed here.
+        self._reserved_names = {'vt'}  # VT is reserved (thermal voltage)
+        # Collect all parameter names from the AST to only rename actual parameters
+        self._param_names = self._collect_param_names(src)
+        # Track reserved parameter name mappings (reserved_name -> safe_name)
+        self._reserved_param_map: Dict[str, str] = {}
+        # Xyce reserved variable names (case-insensitive)
+        self._reserved_names = {'vt', 'temp', 'time', 'freq', 'omega', 'pi', 'e'}
 
     @property
     def enum(self):
@@ -488,6 +500,56 @@ class XyceNetlister(SpiceNetlister):
         from . import NetlistFormat
 
         return NetlistFormat.XYCE
+
+    def _collect_param_names(self, program: Program) -> set:
+        """Collect all parameter names from the program AST."""
+        param_names = set()
+        
+        def collect_from_entry(entry):
+            if isinstance(entry, ParamDecl):
+                param_names.add(entry.name.name.lower())
+            elif isinstance(entry, ParamDecls):
+                for param in entry.params:
+                    param_names.add(param.name.name.lower())
+            elif isinstance(entry, SubcktDef):
+                # Subcircuit formal parameters
+                for param in entry.params:
+                    param_names.add(param.name.name.lower())
+                # Parameters declared inside subcircuit body
+                for sub_entry in entry.entries:
+                    collect_from_entry(sub_entry)
+            elif isinstance(entry, LibSectionDef):
+                for sub_entry in entry.entries:
+                    collect_from_entry(sub_entry)
+        
+        for file in program.files:
+            for entry in file.contents:
+                collect_from_entry(entry)
+        
+        return param_names
+    
+    def format_ident(self, ident_or_ref: Union[Ident, Ref]) -> str:
+        """Format an identifier or reference, renaming reserved Xyce parameter names."""
+        # Get the base name
+        if isinstance(ident_or_ref, Ref):
+            name = ident_or_ref.ident.name
+        else:
+            name = ident_or_ref.name
+        
+        # Only rename if this is both:
+        # 1. A reserved name (case-insensitive)
+        # 2. Actually a parameter name (not a built-in variable)
+        name_lower = name.lower()
+        if name_lower in self._reserved_names and name_lower in self._param_names:
+            # Check if we've already created a mapping for this name
+            if name_lower not in self._reserved_param_map:
+                # Create a safe name by appending _param
+                safe_name = f"{name}_param"
+                self._reserved_param_map[name_lower] = safe_name
+                warn(f"Renaming reserved parameter '{name}' to '{safe_name}' for Xyce compatibility")
+            return self._reserved_param_map[name_lower]
+        
+        return name
 
     def netlist(self) -> None:
         """Override netlist() to apply Xyce-specific statistics variations before writing.

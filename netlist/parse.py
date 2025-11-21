@@ -351,11 +351,26 @@ class HierarchyCollector:
             if isinstance(stmt, EndSubckt):
                 break  # done with this module
 
-            # Parameter statements in subckt scope should remain as entries, not be promoted
-            # to subckt/module-parameters. Only parameters declared on the .subckt line itself
-            # should be in the subcircuit definition. Parameters declared inside the body
-            # are local/global and should be written as .param statements in the body.
-            # So we just add them as entries, not to params.
+            # Parameter statements in subckt scope:
+            # - Formal parameters (from "parameters:" statement, no defaults) should be promoted to subcircuit params
+            # - Local/global parameters (from ".param" or ".PARAM", with defaults) should remain as entries
+            if isinstance(stmt, ParamDecl):
+                # Single parameter declaration - check if it's a formal param (no default)
+                if stmt.default is None:
+                    params.append(stmt)  # Formal parameter - promote to subcircuit param
+                else:
+                    nodes.append(stmt)  # Local parameter - keep as entry
+                continue
+            elif isinstance(stmt, ParamDecls):
+                # Check if all params are formal (no defaults) - if so, promote them
+                formal_params = [p for p in stmt.params if p.default is None]
+                local_params = [p for p in stmt.params if p.default is not None]
+                if formal_params:
+                    params.extend(formal_params)  # Promote formal params
+                if local_params:
+                    # Keep local params as ParamDecls entry
+                    nodes.append(ParamDecls(params=local_params))
+                continue
 
             if isinstance(stmt, StartSubckt):
                 # Collect nested sub-circuit definitions
