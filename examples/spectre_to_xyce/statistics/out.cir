@@ -4,11 +4,10 @@
 ; Source File: /home/nates/github/Netlist/examples/spectre_to_xyce/statistics/in.scs
 .param lnorm(mu,sigma)='exp(gauss(mu,sigma))'
 .param alnorm(mu,sigma)='exp(gauss(mu,sigma))'
-.param vth0__mismatch__(dummy_param)='0+enable_mismatch*gauss(0,mismatch_factor)'
+.param vth0__process____mismatch__(dummy_param)='vth0_nom*(1.0+0.01*gauss(0,1.0))+enable_mismatch*gauss(0,mismatch_factor)'
 
 .param vth0_nom=0.45
 .param tox_nom=4.0n
-.param tox={tox__process__}
 
 .param tox__process__={tox_nom*(1.0+0.05*lnorm(0,1.0))}
 

@@ -2,8 +2,24 @@
 ; 
 
 ; Source File: /home/nates/github/Netlist/examples/spectre_to_xyce/subckts/in.scs
-.SUBCKT inverter in out vdd vss
-+ PARAMS: w=1.0u l=0.18u 
+.SUBCKT test_spacing d g s b
++ PARAMS: w=60u rdrift=1000 vgdep=0.1 vth=0.7 vbdep={-0.5} hvvsat=1.8 avsat=0.7 vth2=0.1 hvvbdep={-0.02} 
+
+Xr1 
++ d 
++ g 
++ PARAMS: r=1k 
+
+Xrldd 
++ d 
++ d1 
++ PARAMS: r={abs(1/w*rdrift/(1+vgdep*(v(g,s)-vth-vbdep*v(b,s)))*(1+pwr(abs(v(d,s)+vth2-min(v(d1,s),60))/hvvsat*(1+hvvbdep*v(b,s)),avsat)))} tc1=0 tc2=0 
+
+.model test_model nmos
++ lmin=0.1u
++ lmax=1.0u
++ wmin=0.5u
++ wmax=10u
 
 .ENDS
 

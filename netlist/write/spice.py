@@ -478,6 +478,10 @@ class HspiceNetlister(SpiceNetlister):
 class XyceNetlister(SpiceNetlister):
     """Xyce-Format Netlister"""
 
+    def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "") -> None:
+        super().__init__(src, dest, errormode=errormode, file_type=file_type)
+        self._last_entry_was_instance = False  # Track if last entry written was an instance
+
     @property
     def enum(self):
         """Get our entry in the `NetlistFormat` enumeration"""
@@ -636,8 +640,11 @@ class XyceNetlister(SpiceNetlister):
         module_ref = pinst.module if isinstance(pinst.module, Ref) else None
         self.write_instance_params(pinst.params, is_mos_like=is_mos_like, module_ref=module_ref)
 
-        # Add a blank after each instance
+        # Add a blank line after each instance for spacing between instances
+        # If next entry is a model, write_model_def will handle spacing (but won't add extra)
         self.write("\n")
+        # Mark that last entry was an instance
+        self._last_entry_was_instance = True
 
     def write_primitive_instance(self, pinst: Instance) -> None:
         """Write primitive-instance `pinst` of `rmodule`."""
@@ -686,7 +693,11 @@ class XyceNetlister(SpiceNetlister):
             self.write_param_val(kwarg)
             self.write(" ")
 
+        # Add a blank line after each instance for spacing between instances
+        # If next entry is a model, write_model_def will handle spacing (but won't add extra)
         self.write("\n")
+        # Mark that last entry was an instance
+        self._last_entry_was_instance = True
 
     def write_comment(self, comment: str) -> None:
         """Xyce comments *kinda* support the Spice-typical `*` charater,
@@ -696,10 +707,23 @@ class XyceNetlister(SpiceNetlister):
         self.write(f"; {comment}\n")
 
     def write_entry(self, entry) -> None:
-        """Override write_entry to handle FunctionDef for Xyce."""
+        """Override write_entry to handle FunctionDef for Xyce and reset instance flag."""
+        # Handle FunctionDef specially
         if isinstance(entry, FunctionDef):
+            self._last_entry_was_instance = False
             return self.write_function_def(entry)
+        
+        # For ModelDef, let it check the flag first, then it will reset it
+        if isinstance(entry, ModelDef):
+            return self.write_model_def(entry)
+        
+        # For Instance and Primitive, let their write methods set the flag
+        # For other entries, reset the flag before calling parent
+        if not isinstance(entry, (Instance, Primitive)):
+            self._last_entry_was_instance = False
+        
         # Call parent implementation for other entries
+        # This will call write_subckt_instance or write_primitive_instance which set the flag
         return super().write_entry(entry)
 
     def expression_delimiters(self) -> Tuple[str, str]:
@@ -761,6 +785,8 @@ class XyceNetlister(SpiceNetlister):
 
     def write_subckt_def(self, module: SubcktDef) -> None:
         """Write the `SUBCKT` definition for `Module` `module` in Xyce format."""
+        # Reset instance flag at start of subcircuit
+        self._last_entry_was_instance = False
         # Store current subcircuit context for use in write_subckt_instance
         self._current_subckt = module
 
@@ -808,6 +834,9 @@ class XyceNetlister(SpiceNetlister):
         # Write internal content
         for entry in module.entries:
             self.write_entry(entry)
+        
+        # Reset instance flag after subcircuit ends
+        self._last_entry_was_instance = False
 
         # Close up the sub-circuit
         self.write(".ENDS\n\n")
@@ -959,6 +988,11 @@ class XyceNetlister(SpiceNetlister):
 
     def write_model_def(self, model: ModelDef) -> None:
         """Write a model definition in Xyce format, handling BSIM4 conversions."""
+        # Add blank line before model if last entry was an instance
+        if self._last_entry_was_instance:
+            self.write("\n")
+            self._last_entry_was_instance = False
+        
         mname = self.format_ident(model.name)
         mtype = self.format_ident(model.mtype).lower()
         
@@ -1111,41 +1145,212 @@ def expr_references_param(expr: Expr, param_name: str) -> bool:
     return False
 
 
-def replace_param_ref_in_expr(expr: Expr, param_name: str, func_call: Call) -> Expr:
-    """Recursively replace Ref nodes matching param_name with func_call in an expression."""
+def count_param_refs_in_entry(entry: Entry, param_name: str) -> int:
+    """Count how many times a parameter is referenced in an entry.
+    
+    Args:
+        entry: The entry to check
+        param_name: The parameter name to count
+        
+    Returns:
+        Number of references found
+    """
+    count = 0
+    
+    if isinstance(entry, ParamDecls):
+        for param in entry.params:
+            if param.default is not None and expr_references_param(param.default, param_name):
+                count += 1
+    
+    elif isinstance(entry, SubcktDef):
+        for param in entry.params:
+            if param.default is not None and expr_references_param(param.default, param_name):
+                count += 1
+        for sub_entry in entry.entries:
+            count += count_param_refs_in_entry(sub_entry, param_name)
+    
+    elif isinstance(entry, ModelDef):
+        for param in entry.params:
+            if param.default is not None and expr_references_param(param.default, param_name):
+                count += 1
+    
+    elif isinstance(entry, ModelVariant):
+        for param in entry.params:
+            if param.default is not None and expr_references_param(param.default, param_name):
+                count += 1
+    
+    elif isinstance(entry, ModelFamily):
+        for variant in entry.variants:
+            for param in variant.params:
+                if param.default is not None and expr_references_param(param.default, param_name):
+                    count += 1
+    
+    elif isinstance(entry, FunctionDef):
+        for stmt in entry.stmts:
+            if isinstance(stmt, Return):
+                if expr_references_param(stmt.val, param_name):
+                    count += 1
+    
+    elif isinstance(entry, Instance):
+        for param_val in entry.params:
+            if expr_references_param(param_val.val, param_name):
+                count += 1
+    
+    elif isinstance(entry, Primitive):
+        for param_val in entry.kwargs:
+            if expr_references_param(param_val.val, param_name):
+                count += 1
+    
+    elif isinstance(entry, Options):
+        for option in entry.vals:
+            if not isinstance(option.val, QuotedString):
+                if expr_references_param(option.val, param_name):
+                    count += 1
+    
+    elif isinstance(entry, Library):
+        for section in entry.sections:
+            count += count_param_refs_in_entry(section, param_name)
+    
+    elif isinstance(entry, LibSectionDef):
+        for sub_entry in entry.entries:
+            count += count_param_refs_in_entry(sub_entry, param_name)
+    
+    return count
+
+
+def debug_find_all_param_refs(program: Program, param_name: str) -> List[Tuple[str, Expr]]:
+    """Find all parameter references in the program and return their locations.
+    
+    Args:
+        program: The program to search
+        param_name: The parameter name to find
+        
+    Returns:
+        List of (location_description, expr) tuples where param_name is referenced.
+        Location format: "file:entry_type:entry_name:field_path"
+    """
+    locations = []
+    
+    def find_in_entry(entry: Entry, file_path: str, entry_path: str) -> None:
+        """Recursively find parameter references in an entry."""
+        entry_type = type(entry).__name__
+        
+        if isinstance(entry, ParamDecls):
+            for i, param in enumerate(entry.params):
+                if param.default is not None and expr_references_param(param.default, param_name):
+                    locations.append((f"{file_path}:ParamDecls:param[{i}].default", param.default))
+        
+        elif isinstance(entry, SubcktDef):
+            entry_name = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            for i, param in enumerate(entry.params):
+                if param.default is not None and expr_references_param(param.default, param_name):
+                    locations.append((f"{file_path}:SubcktDef:{entry_name}:param[{i}].default", param.default))
+            for j, sub_entry in enumerate(entry.entries):
+                find_in_entry(sub_entry, file_path, f"{entry_path}.entries[{j}]")
+        
+        elif isinstance(entry, ModelDef):
+            entry_name = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            for i, param in enumerate(entry.params):
+                if param.default is not None and expr_references_param(param.default, param_name):
+                    locations.append((f"{file_path}:ModelDef:{entry_name}:param[{i}].default", param.default))
+        
+        elif isinstance(entry, ModelVariant):
+            variant_name = entry.variant.name if hasattr(entry.variant, 'name') else str(entry.variant)
+            for i, param in enumerate(entry.params):
+                if param.default is not None and expr_references_param(param.default, param_name):
+                    locations.append((f"{file_path}:ModelVariant:{variant_name}:param[{i}].default", param.default))
+        
+        elif isinstance(entry, ModelFamily):
+            entry_name = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            for v, variant in enumerate(entry.variants):
+                for i, param in enumerate(variant.params):
+                    if param.default is not None and expr_references_param(param.default, param_name):
+                        locations.append((f"{file_path}:ModelFamily:{entry_name}:variant[{v}].param[{i}].default", param.default))
+        
+        elif isinstance(entry, FunctionDef):
+            entry_name = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            for s, stmt in enumerate(entry.stmts):
+                if isinstance(stmt, Return):
+                    if expr_references_param(stmt.val, param_name):
+                        locations.append((f"{file_path}:FunctionDef:{entry_name}:stmt[{s}].val", stmt.val))
+        
+        elif isinstance(entry, Instance):
+            entry_name = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            for i, param_val in enumerate(entry.params):
+                if expr_references_param(param_val.val, param_name):
+                    locations.append((f"{file_path}:Instance:{entry_name}:params[{i}].val", param_val.val))
+        
+        elif isinstance(entry, Primitive):
+            entry_name = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            for i, param_val in enumerate(entry.kwargs):
+                if expr_references_param(param_val.val, param_name):
+                    locations.append((f"{file_path}:Primitive:{entry_name}:kwargs[{i}].val", param_val.val))
+        
+        elif isinstance(entry, Options):
+            for i, option in enumerate(entry.vals):
+                if not isinstance(option.val, QuotedString):
+                    if expr_references_param(option.val, param_name):
+                        locations.append((f"{file_path}:Options:vals[{i}].val", option.val))
+        
+        elif isinstance(entry, Library):
+            entry_name = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            for s, section in enumerate(entry.sections):
+                find_in_entry(section, file_path, f"{entry_path}.sections[{s}]")
+        
+        elif isinstance(entry, LibSectionDef):
+            section_name = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            for j, sub_entry in enumerate(entry.entries):
+                find_in_entry(sub_entry, file_path, f"{entry_path}.entries[{j}]")
+    
+    for file in program.files:
+        file_path = str(file.path) if hasattr(file, 'path') else "unknown"
+        for i, entry in enumerate(file.contents):
+            find_in_entry(entry, file_path, f"contents[{i}]")
+    
+    return locations
+
+
+def replace_param_ref_in_expr(expr: Expr, param_name: str, replacement: Expr) -> Expr:
+    """Recursively replace Ref nodes matching param_name with replacement in an expression.
+    
+    Args:
+        expr: The expression to search and replace in
+        param_name: The parameter name to replace
+        replacement: The expression to replace with (can be Call, Ref, or other Expr)
+    """
     # Handle Ref nodes - this is the key replacement
     if isinstance(expr, Ref):
         if expr.ident.name == param_name:
-            return func_call
+            return replacement
         return expr
     
     # Handle Call nodes - recurse into arguments
     if isinstance(expr, Call):
-        new_args = [replace_param_ref_in_expr(arg, param_name, func_call) for arg in expr.args]
+        new_args = [replace_param_ref_in_expr(arg, param_name, replacement) for arg in expr.args]
         if new_args != expr.args:
             return Call(func=expr.func, args=new_args)
         return expr
     
     # Handle BinaryOp - recurse into left and right
     if isinstance(expr, BinaryOp):
-        new_left = replace_param_ref_in_expr(expr.left, param_name, func_call)
-        new_right = replace_param_ref_in_expr(expr.right, param_name, func_call)
+        new_left = replace_param_ref_in_expr(expr.left, param_name, replacement)
+        new_right = replace_param_ref_in_expr(expr.right, param_name, replacement)
         if new_left != expr.left or new_right != expr.right:
             return BinaryOp(tp=expr.tp, left=new_left, right=new_right)
         return expr
     
     # Handle UnaryOp - recurse into target
     if isinstance(expr, UnaryOp):
-        new_targ = replace_param_ref_in_expr(expr.targ, param_name, func_call)
+        new_targ = replace_param_ref_in_expr(expr.targ, param_name, replacement)
         if new_targ != expr.targ:
             return UnaryOp(tp=expr.tp, targ=new_targ)
         return expr
     
     # Handle TernOp - recurse into all three parts
     if isinstance(expr, TernOp):
-        new_cond = replace_param_ref_in_expr(expr.cond, param_name, func_call)
-        new_if_true = replace_param_ref_in_expr(expr.if_true, param_name, func_call)
-        new_if_false = replace_param_ref_in_expr(expr.if_false, param_name, func_call)
+        new_cond = replace_param_ref_in_expr(expr.cond, param_name, replacement)
+        new_if_true = replace_param_ref_in_expr(expr.if_true, param_name, replacement)
+        new_if_false = replace_param_ref_in_expr(expr.if_false, param_name, replacement)
         if (new_cond != expr.cond or new_if_true != expr.if_true or 
             new_if_false != expr.if_false):
             return TernOp(cond=new_cond, if_true=new_if_true, if_false=new_if_false)
@@ -1155,69 +1360,118 @@ def replace_param_ref_in_expr(expr: Expr, param_name: str, func_call: Call) -> E
     return expr
 
 
-def replace_param_refs_in_entry(entry: Entry, param_name: str, func_call: Call) -> None:
+def replace_param_refs_in_entry(entry: Entry, param_name: str, replacement: Expr) -> None:
     """Replace parameter references in a single Entry."""
     # ParamDecls - replace in each param's default
     if isinstance(entry, ParamDecls):
         for param in entry.params:
             if param.default is not None:
-                param.default = replace_param_ref_in_expr(param.default, param_name, func_call)
+                param.default = replace_param_ref_in_expr(param.default, param_name, replacement)
     
     # SubcktDef - replace in params and recurse into entries
     elif isinstance(entry, SubcktDef):
         for param in entry.params:
             if param.default is not None:
-                param.default = replace_param_ref_in_expr(param.default, param_name, func_call)
+                param.default = replace_param_ref_in_expr(param.default, param_name, replacement)
         for sub_entry in entry.entries:
-            replace_param_refs_in_entry(sub_entry, param_name, func_call)
+            replace_param_refs_in_entry(sub_entry, param_name, replacement)
     
     # ModelDef - replace in params
     elif isinstance(entry, ModelDef):
         for param in entry.params:
             if param.default is not None:
-                param.default = replace_param_ref_in_expr(param.default, param_name, func_call)
+                param.default = replace_param_ref_in_expr(param.default, param_name, replacement)
+            # Note: Parameters without defaults (None) are positional args and don't need replacement
+    
+    # ModelVariant - replace in params (explicit handling for completeness)
+    elif isinstance(entry, ModelVariant):
+        for param in entry.params:
+            if param.default is not None:
+                param.default = replace_param_ref_in_expr(param.default, param_name, replacement)
     
     # ModelFamily - recurse into variants
     elif isinstance(entry, ModelFamily):
         for variant in entry.variants:
             for param in variant.params:
                 if param.default is not None:
-                    param.default = replace_param_ref_in_expr(param.default, param_name, func_call)
+                    param.default = replace_param_ref_in_expr(param.default, param_name, replacement)
     
     # FunctionDef - replace in return statement
     elif isinstance(entry, FunctionDef):
         for stmt in entry.stmts:
             if isinstance(stmt, Return):
-                stmt.val = replace_param_ref_in_expr(stmt.val, param_name, func_call)
+                stmt.val = replace_param_ref_in_expr(stmt.val, param_name, replacement)
     
     # Instance - replace in param values
     elif isinstance(entry, Instance):
         for param_val in entry.params:
-            param_val.val = replace_param_ref_in_expr(param_val.val, param_name, func_call)
+            param_val.val = replace_param_ref_in_expr(param_val.val, param_name, replacement)
     
     # Primitive - replace in kwargs
     elif isinstance(entry, Primitive):
         for param_val in entry.kwargs:
-            param_val.val = replace_param_ref_in_expr(param_val.val, param_name, func_call)
+            param_val.val = replace_param_ref_in_expr(param_val.val, param_name, replacement)
     
     # Options - replace in option values (if Expr, not QuotedString)
     elif isinstance(entry, Options):
         for option in entry.vals:
             # OptionVal = Union[QuotedString, Expr], so check if it's not QuotedString
             if not isinstance(option.val, QuotedString):
-                option.val = replace_param_ref_in_expr(option.val, param_name, func_call)
+                option.val = replace_param_ref_in_expr(option.val, param_name, replacement)
+    
+    # Library - recurse into sections
+    elif isinstance(entry, Library):
+        for section in entry.sections:
+            replace_param_refs_in_entry(section, param_name, replacement)
     
     # LibSectionDef - recurse into entries
     elif isinstance(entry, LibSectionDef):
         for sub_entry in entry.entries:
-            replace_param_refs_in_entry(sub_entry, param_name, func_call)
+            replace_param_refs_in_entry(sub_entry, param_name, replacement)
+    
+    # Catch-all for unhandled entry types
+    else:
+        # Entry types that don't contain parameter references: Include, AhdlInclude, UseLibSection,
+        # DialectChange, Unknown, End, StatisticsBlock (already processed)
+        # Log a warning for any unexpected types
+        entry_type_name = type(entry).__name__
+        if entry_type_name not in ('Include', 'AhdlInclude', 'UseLibSection', 'DialectChange', 'Unknown', 'End', 'StatisticsBlock'):
+            warn(f"replace_param_refs_in_entry: Unhandled entry type {entry_type_name} for param {param_name}")
 
 
-def replace_param_refs_in_program(program: Program, param_name: str, func_call: Call) -> None:
-    """Replace all references to param_name throughout the entire program with func_call."""
+def replace_param_refs_in_program(program: Program, param_name: str, replacement: Expr, debug: bool = False) -> None:
+    """Replace all references to param_name throughout the entire program with replacement.
+    
+    Args:
+        program: The program to process
+        param_name: The parameter name to replace
+        replacement: The expression to replace with
+        debug: If True, log entry types processed and replacement counts
+    """
+    if debug:
+        entry_type_counts = {}
+        replacement_counts = {}
+    
     for file in program.files:
         for entry in file.contents:
-            replace_param_refs_in_entry(entry, param_name, func_call)
+            entry_type = type(entry).__name__
+            if debug:
+                entry_type_counts[entry_type] = entry_type_counts.get(entry_type, 0) + 1
+            
+            # Count references before replacement
+            if debug:
+                before_count = count_param_refs_in_entry(entry, param_name)
+                if before_count > 0:
+                    replacement_counts[entry_type] = replacement_counts.get(entry_type, 0) + before_count
+            
+            replace_param_refs_in_entry(entry, param_name, replacement)
+    
+    if debug:
+        warn(f"replace_param_refs_in_program({param_name}): Processed {sum(entry_type_counts.values())} entries")
+        for entry_type, count in sorted(entry_type_counts.items()):
+            replacements = replacement_counts.get(entry_type, 0)
+            if replacements > 0:
+                warn(f"  {entry_type}: {count} entries, {replacements} replacements")
 
 
 def remove_param_declaration(program: Program, param_name: str) -> None:
@@ -1231,6 +1485,36 @@ def remove_param_declaration(program: Program, param_name: str) -> None:
                 for sub_entry in entry.entries:
                     if isinstance(sub_entry, ParamDecls):
                         sub_entry.params = [p for p in sub_entry.params if p.name.name != param_name]
+
+
+def find_alias_parameters(program: Program, target_param_name: str) -> List[ParamDecl]:
+    """Find all parameters that are defined as simple references to target_param_name.
+    
+    An alias parameter is one whose default value is just a Ref to the target parameter.
+    For example, if sw_tox_lv = sw_tox_lv_corner, then sw_tox_lv is an alias for sw_tox_lv_corner.
+    
+    Returns:
+        List of ParamDecl objects that are aliases for the target parameter.
+    """
+    aliases = []
+    for file in program.files:
+        for entry in file.contents:
+            if isinstance(entry, ParamDecls):
+                for param in entry.params:
+                    # Check if this parameter is a simple reference to the target
+                    if param.default is not None:
+                        if isinstance(param.default, Ref):
+                            if param.default.ident.name == target_param_name:
+                                aliases.append(param)
+            elif isinstance(entry, LibSectionDef):
+                for sub_entry in entry.entries:
+                    if isinstance(sub_entry, ParamDecls):
+                        for param in sub_entry.params:
+                            if param.default is not None:
+                                if isinstance(param.default, Ref):
+                                    if param.default.ident.name == target_param_name:
+                                        aliases.append(param)
+    return aliases
 
 
 def collect_statistics_blocks(program: Program) -> List[StatisticsBlock]:
@@ -1452,16 +1736,6 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
             process_variations = []
             for var in stats.process:
                 param_name = var.name.name
-                # Skip if parameter also has mismatch variation (mismatch takes precedence)
-                if is_param_in_process_variations(stats_blocks, param_name):
-                    # Check if it's in mismatch variations
-                    has_mismatch = any(
-                        stats.mismatch and any(mvar.name.name == param_name for mvar in stats.mismatch)
-                        for stats in stats_blocks
-                    )
-                    if has_mismatch:
-                        continue  # Skip - mismatch takes precedence
-                
                 # Check if parameter is in library section or global
                 if is_param_in_library_section(program, param_name):
                     # Library section parameter: use relative expression
@@ -1486,14 +1760,51 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
                     param_decls.append(ParamDecl(name=Ident(process_param_name), default=varied_expr, distr=None))
                 generated_content.append(ParamDecls(params=param_decls))
                 
-                # Update original global parameters to reference the __process__ version
+                # Replace all references to original parameters with __process__ version
+                # Note: Process variations are applied BEFORE mismatch variations (see line 1496),
+                # ensuring we always get __process____mismatch__ and never __mismatch____process__
                 for param_name, _ in process_variations:
+                    # Find alias parameters BEFORE doing replacement (they reference the original param name)
+                    # For example, if sw_tox_lv = sw_tox_lv_corner, then sw_tox_lv is an alias
+                    # When sw_tox_lv_corner is replaced with sw_tox_lv_corner__process__,
+                    # we should also replace all uses of sw_tox_lv with sw_tox_lv_corner__process__
+                    alias_params = find_alias_parameters(program, param_name)
+                    alias_names = [alias.name.name for alias in alias_params]
+                    
+                    # Replace all references to the original parameter with the __process__ version
+                    # This applies to both global and library section parameters
+                    process_param_ref = Ref(ident=Ident(f"{param_name}__process__"))
+                    replace_param_refs_in_program(program, param_name, process_param_ref)
+                    
+                    # Verify replacement was successful
+                    remaining_refs = debug_find_all_param_refs(program, param_name)
+                    if remaining_refs:
+                        warn(f"WARNING: {len(remaining_refs)} references to {param_name} still exist after replacement")
+                        # Log first few locations for debugging
+                        for loc, expr in remaining_refs[:5]:
+                            warn(f"  Unreplaced reference at: {loc}")
+                        if len(remaining_refs) > 5:
+                            warn(f"  ... and {len(remaining_refs) - 5} more locations")
+                    
+                    # Now handle alias parameters: replace all uses of aliases with the __process__ version
+                    for alias_name in alias_names:
+                        # Replace all uses of the alias with the __process__ version
+                        replace_param_refs_in_program(program, alias_name, process_param_ref)
+                        
+                        # Verify alias replacement was successful
+                        remaining_alias_refs = debug_find_all_param_refs(program, alias_name)
+                        if remaining_alias_refs:
+                            warn(f"WARNING: {len(remaining_alias_refs)} references to {alias_name} still exist after replacement")
+                            for loc, expr in remaining_alias_refs[:5]:
+                                warn(f"  Unreplaced alias reference at: {loc}")
+                        
+                        # Remove the alias parameter declaration
+                        remove_param_declaration(program, alias_name)
+                    
+                    # Remove the original parameter declaration only for global parameters
+                    # Library section parameters are kept (they're needed for the relative expressions)
                     if not is_param_in_library_section(program, param_name):
-                        matching_param = find_matching_param(program, param_name)
-                        if matching_param:
-                            # Update original parameter to reference the __process__ version
-                            process_param_ref = Ref(ident=Ident(f"{param_name}__process__"))
-                            matching_param.default = process_param_ref
+                        remove_param_declaration(program, param_name)
 
         # Replace the StatisticsBlock with generated content
         for file in program.files:
@@ -1503,14 +1814,21 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
                     break
 
     # Now apply mismatch variations (creates functions and replaces references)
+    # IMPORTANT: Process variations MUST be applied before mismatch variations.
+    # This ensures we always get __process____mismatch__ suffixes and never __mismatch____process__.
     apply_all_mismatch_variations(program, stats_blocks)
 
 
-def create_mismatch_function(var: Variation, idx: int) -> Optional[ParamDecl]:
+def create_mismatch_function(var: Variation, idx: int, original_expr: Optional[Expr] = None) -> Optional[ParamDecl]:
     """Create a mismatch .param declaration with dummy parameter syntax as requested.
 
-    Creates: mm_z1__mismatch__(dummy_param) with expression 0+enable_mismatch*gauss(0,mismatch_factor)
+    Creates: mm_z1__mismatch__(dummy_param) with expression original_expr+enable_mismatch*gauss(0,mismatch_factor)
     This is placed near the top and called as mm_z1__mismatch__(0).
+    
+    Args:
+        var: The variation definition
+        idx: Index for uniqueness
+        original_expr: The original parameter's default expression (if None, uses Int(0))
     """
     if not var.dist:
         return None
@@ -1518,8 +1836,8 @@ def create_mismatch_function(var: Variation, idx: int) -> Optional[ParamDecl]:
     param_name = f"{var.name.name}__mismatch__(dummy_param)"
     dist_type_lower = var.dist.lower()
 
-    # Create expression: 0 + enable_mismatch * gauss(0,mismatch_factor)
-    zero = Int(0)
+    # Use original expression if provided, otherwise use 0
+    base_expr = original_expr if original_expr is not None else Int(0)
     enable_mismatch_ref = Ref(ident=Ident("enable_mismatch"))
     mismatch_factor_ref = Ref(ident=Ident("mismatch_factor"))
 
@@ -1537,7 +1855,7 @@ def create_mismatch_function(var: Variation, idx: int) -> Optional[ParamDecl]:
         return None
 
     mismatch_term = BinaryOp(tp=BinaryOperator.MUL, left=enable_mismatch_ref, right=dist_call)
-    param_expr = BinaryOp(tp=BinaryOperator.ADD, left=zero, right=mismatch_term)
+    param_expr = BinaryOp(tp=BinaryOperator.ADD, left=base_expr, right=mismatch_term)
 
     return ParamDecl(
         name=Ident(param_name),
@@ -1550,24 +1868,66 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_b
     """Apply a single mismatch variation by creating a function and replacing all references.
     
     This effectively "deletes" the parameter by:
-    1. Creating a mismatch function with the original value
+    1. Creating a mismatch function with the original value (or process variation if it exists)
     2. Replacing ALL references to the parameter with the function call
     3. Removing the parameter declaration
+    
+    If the parameter has a process variation, the mismatch function will reference the __process__ version.
     """
-    matching_param = find_matching_param(program, var.name.name)
-    if not matching_param:
-        # Check if parameter is in process variations - if so, silently skip (it's process-only)
-        if is_param_in_process_variations(stats_blocks, var.name.name):
-            return  # Silently skip - parameter is process-only, not a real error
-        # Otherwise, warn (real error - parameter doesn't exist)
-        warn(f"No matching parameter found for mismatch variation '{var.name.name}'. Skipping.")
-        return
+    param_name = var.name.name
+    
+    # Check if parameter has a process variation - if so, mismatch should reference the __process__ version
+    has_process = is_param_in_process_variations(stats_blocks, param_name)
+    
+    if has_process:
+        # Parameter has process variation - mismatch should reference the __process__ version
+        process_param_name = f"{param_name}__process__"
+        # Find the process variation parameter
+        process_param = None
+        for file in program.files:
+            for entry in file.contents:
+                if isinstance(entry, ParamDecls):
+                    for param in entry.params:
+                        if param.name.name == process_param_name:
+                            process_param = param
+                            break
+                    if process_param:
+                        break
+                if process_param:
+                    break
+            if process_param:
+                break
+        
+        if process_param:
+            # Use the process variation expression as the base for mismatch
+            original_expr = process_param.default
+            # Create mismatch function name with both suffixes
+            mismatch_param_name = f"{param_name}__process____mismatch__(dummy_param)"
+        else:
+            # Process param not found, fall back to original
+            matching_param = find_matching_param(program, param_name)
+            if not matching_param:
+                warn(f"Process variation parameter '{process_param_name}' not found for mismatch variation '{param_name}'. Skipping.")
+                return
+            original_expr = matching_param.default or Int(0)
+            mismatch_param_name = f"{param_name}__mismatch__(dummy_param)"
+    else:
+        # No process variation - use original parameter
+        matching_param = find_matching_param(program, param_name)
+        if not matching_param:
+            warn(f"No matching parameter found for mismatch variation '{param_name}'. Skipping.")
+            return
+        original_expr = matching_param.default or Int(0)
+        mismatch_param_name = f"{param_name}__mismatch__(dummy_param)"
 
-    mismatch_param = create_mismatch_function(var, idx)
+    # Create mismatch function with the correct name
+    mismatch_param = create_mismatch_function(var, idx, original_expr=original_expr)
     if not mismatch_param:
         return
-
-    param_name = mismatch_param.name.name
+    
+    # Update the mismatch parameter name if it has process variation
+    if has_process:
+        mismatch_param.name = Ident(mismatch_param_name)
 
     # Add param as a separate entry at the top of the file
     # Find the file that contains statistics blocks
@@ -1614,14 +1974,25 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_b
 
     # Create param function call to use as replacement (with dummy argument)
     # Extract the base name without (dummy_param)
-    base_name = param_name.split('(')[0]
+    base_name = mismatch_param.name.name.split('(')[0]
     param_call = Call(func=Ref(ident=Ident(base_name)), args=[Int(0)])  # Use 0 as dummy arg
 
     # Replace ALL references to this parameter throughout the program
-    replace_param_refs_in_program(program, var.name.name, param_call)
-
-    # Remove the parameter declaration (effectively "deleting" it)
-    remove_param_declaration(program, var.name.name)
+    # If parameter has process variation, replace references to the __process__ version
+    # Otherwise, replace references to the original parameter
+    if has_process:
+        # Replace references to the __process__ version
+        process_param_name = f"{var.name.name}__process__"
+        replace_param_refs_in_program(program, process_param_name, param_call)
+        # Also remove the __process__ parameter declaration
+        remove_param_declaration(program, process_param_name)
+        # Also remove the original parameter declaration (it was updated to reference __process__)
+        remove_param_declaration(program, var.name.name)
+    else:
+        # Replace references to the original parameter
+        replace_param_refs_in_program(program, var.name.name, param_call)
+        # Remove the parameter declaration (effectively "deleting" it)
+        remove_param_declaration(program, var.name.name)
 
 
 def apply_all_mismatch_variations(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
