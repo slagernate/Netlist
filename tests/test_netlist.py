@@ -810,6 +810,33 @@ def test_nested_subckt_def():
     assert not has_external_refs(scope)
 
 
+def test_subckt_params_not_promoted_from_body():
+    """Test that parameters declared inside subcircuit body are not promoted to subcircuit parameters."""
+    from netlist import parse_str, ParseOptions, NetlistDialects
+    from netlist.data import SubcktDef, ParamDecls
+    
+    txt = dedent("""
+        .subckt test_sub d g s b w=10u
+        + ad='w*5' pd='2*w'
+        parameters global_param=1.0
+        parameters another_global=2.0
+        r1 d g r=1k
+        .ends test_sub
+    """)
+    
+    program = parse_str(txt, options=ParseOptions(dialect=NetlistDialects.SPECTRE))
+    subckt = program.files[0].contents[0]
+    assert isinstance(subckt, SubcktDef)
+    
+    # Only parameters from .subckt line should be in params
+    param_names = [p.name.name for p in subckt.params]
+    assert param_names == ['w', 'ad', 'pd'], f"Expected ['w', 'ad', 'pd'], got {param_names}"
+    
+    # Global params should be in entries, not params
+    param_decls_in_entries = [e for e in subckt.entries if isinstance(e, ParamDecls)]
+    assert len(param_decls_in_entries) == 2, f"Should have 2 ParamDecls entries, got {len(param_decls_in_entries)}"
+
+
 def test_spectre_multiply_starting_continuation():
     """Test the case of a multiply starting a continuation-line
     This can prove confusing to parsing, as the state of whether "*" means "multiply" or "comment"
