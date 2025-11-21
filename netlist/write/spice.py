@@ -665,9 +665,13 @@ class XyceNetlister(SpiceNetlister):
         for arg in pinst.args[:-1]:  # Ports only (exclude the model)
             if isinstance(arg, Ident):
                 self.write(self.format_ident(arg) + " ")
+            elif isinstance(arg, Ref):
+                # Ports are identifiers, not expressions - use format_ident to avoid braces
+                self.write(self.format_ident(arg.ident) + " ")
             elif isinstance(arg, (Int, Float, MetricNum)):
                 self.write(self.format_number(arg) + " ")
             else:
+                # For other expression types, still format as expression (but this shouldn't happen for ports)
                 self.write(self.format_expr(arg) + " ")
         self.write("\n")
         # Write the model (last arg) on another continuation line

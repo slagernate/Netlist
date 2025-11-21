@@ -6,11 +6,11 @@
 + PARAMS: w=60u rdrift=1000 vgdep=0.1 vth=0.7 vbdep={-0.5} hvvsat=1.8 avsat=0.7 vth2=0.1 hvvbdep={-0.02} 
 
 r1 
-+ {d} 
++ d 
 + g 
 + r=1k 
 rldd 
-+ {d} 
++ d 
 + d1 
 + r={abs(1/w*rdrift/(1+vgdep*(v(g,s)-vth-vbdep*v(b,s)))*(1+pwr(abs(v(d,s)+vth2-min(v(d1,s),60))/hvvsat*(1+hvvbdep*v(b,s)),avsat)))} tc1=0 tc2=0 
 

@@ -351,15 +351,11 @@ class HierarchyCollector:
             if isinstance(stmt, EndSubckt):
                 break  # done with this module
 
-            # Parameter statements in subckt scope are "promoted" to be subckt/module-parameters.
-            # We do so by appending them to any existing `start` parameters,
-            # and by *not* repeating the param-declarations in the resultant AST tree.
-            if isinstance(stmt, ParamDecl):
-                params.append(stmt)
-                continue
-            elif isinstance(stmt, ParamDecls):
-                params.extend(stmt.params)
-                continue
+            # Parameter statements in subckt scope should remain as entries, not be promoted
+            # to subckt/module-parameters. Only parameters declared on the .subckt line itself
+            # should be in the subcircuit definition. Parameters declared inside the body
+            # are local/global and should be written as .param statements in the body.
+            # So we just add them as entries, not to params.
 
             if isinstance(stmt, StartSubckt):
                 # Collect nested sub-circuit definitions

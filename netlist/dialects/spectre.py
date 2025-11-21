@@ -347,6 +347,7 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
             module = Ref(ident=Ident(self.cur.val))
             
         else:  # No-parens case
+            from .base import _endargs_startkwargs
             conns = self.parse_node_list(_endargs_startkwargs)
             # If we landed on a key-value param key, rewind it
             if self.nxt and self.nxt.tp == Tokens.EQUALS:
