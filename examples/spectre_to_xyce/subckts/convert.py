@@ -1,6 +1,8 @@
 """Convert Spectre subcircuit file to Xyce format."""
 
 from netlist import parse_files, netlist, NetlistDialects, ParseOptions, WriteOptions
+from netlist.data import write_json
+from netlist.ast_to_cst import ast_to_cst
 from pathlib import Path
 
 # Get the directory where this script is located
@@ -10,6 +12,9 @@ script_dir = Path(__file__).parent
 input_file = script_dir / "in.scs"
 options_parse = ParseOptions(dialect=NetlistDialects.SPECTRE)
 program = parse_files(str(input_file), options=options_parse)
+
+# Write AST Program to JSON (this is what the writer actually uses)
+write_json(program, script_dir / "ir.json")
 
 # Write to Xyce format
 output_file = script_dir / "out.cir"

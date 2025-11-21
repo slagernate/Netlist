@@ -455,7 +455,8 @@ class RefResolver:
         # FIXME: shouldn't these be `ParamVal`?
         # for param_decl in model.params:
         #     self.resolve_param_decl(param_decl)
-        raise NotImplementedError
+        # Temporarily a no-op to allow CST serialization for debugging
+        pass
 
     def resolve_function(self, func: FunctionDef, scope: Scope):
         """Resolve a function definition, particularly any "closure" references to unfree parameters.

@@ -55,8 +55,254 @@ def to_json(arg) -> str:
     """Dump any `pydantic.dataclass` or simple combination thereof to JSON string."""
     import json
     from pydantic.json import pydantic_encoder
+    from .ast_to_cst import Scope
+    
+    # Handle circular references in Scope objects
+    seen_scopes = set()
+    
+    def custom_encoder(obj):
+        # Handle Scope objects with circular parent references
+        if isinstance(obj, Scope):
+            obj_id = id(obj)
+            if obj_id in seen_scopes:
+                # Return a reference marker instead of the full object to break circular reference
+                return {
+                    "$ref": "circular_scope_reference",
+                    "name": getattr(obj, 'name', None),
+                    "sid": str(getattr(obj, 'sid', '')) if hasattr(obj, 'sid') else None
+                }
+            seen_scopes.add(obj_id)
+            
+            # Create a dict representation, replacing parent with just a reference
+            result = {}
+            for key, value in obj.__dict__.items():
+                if key == 'parent' and value is not None:
+                    # Replace parent with just name/sid reference
+                    result[key] = {
+                        "$ref": "parent_scope",
+                        "name": getattr(value, 'name', None),
+                        "sid": str(getattr(value, 'sid', '')) if hasattr(value, 'sid') else None
+                    }
+                else:
+                    result[key] = value
+            return result
+        
+        try:
+            return pydantic_encoder(obj)
+        except (TypeError, ValueError, RecursionError):
+            # Fallback for objects that pydantic can't encode
+            if hasattr(obj, '__dict__'):
+                return {k: v for k, v in obj.__dict__.items() if not k.startswith('_')}
+            return str(obj)
+    
+    return json.dumps(arg, indent=2, default=custom_encoder)
 
-    return json.dumps(arg, indent=2, default=pydantic_encoder)
+
+def write_json(obj: Union["Program", "SourceFile", "Entry", "Scope"], path: Union[str, Path]) -> None:
+    """Write AST/CST object to JSON file.
+    
+    Args:
+        obj: Program, SourceFile, Entry, or Scope to serialize
+        path: Output file path (str or Path)
+    """
+    from pathlib import Path
+    from .ast_to_cst import Scope
+    from .data import Program
+    
+    path = Path(path)
+    # Create parent directories if they don't exist
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # For Scope objects, simplify the output
+    if isinstance(obj, Scope):
+        json_str = _scope_to_json_simplified(obj)
+    elif isinstance(obj, Program):
+        json_str = _program_to_json_simplified(obj)
+    else:
+        json_str = to_json(obj)
+    
+    with open(path, "w") as f:
+        f.write(json_str)
+
+
+def _scope_to_json_simplified(scope: "Scope") -> str:
+    """Convert Scope to clean, simplified JSON showing the syntax tree structure."""
+    import json
+    from .ast_to_cst import NoRedefDict
+    from .data import Ident, ParamVal, Expr
+    
+    seen_scopes = set()
+    
+    def simplify_value(val, depth=0):
+        """Recursively simplify values, keeping only essential structure."""
+        if isinstance(val, NoRedefDict):
+            # Unwrap NoRedefDict - just return the data dict
+            return simplify_value(val.data, depth)
+        elif isinstance(val, dict):
+            # Filter out empty dicts and simplify values
+            result = {}
+            for k, v in val.items():
+                if k in ('__pydantic_initialised__', 'source_info'):
+                    continue
+                simplified = simplify_value(v, depth + 1)
+                # Skip empty dicts and lists
+                if simplified not in ({}, [], None):
+                    result[k] = simplified
+            return result if result else None
+        elif isinstance(val, list):
+            # Simplify list items
+            simplified = [simplify_value(item, depth + 1) for item in val]
+            filtered = [item for item in simplified if item not in ({}, [], None)]
+            return filtered if filtered else None
+        elif hasattr(val, '__class__') and val.__class__.__name__ == 'Scope':
+            # Handle Scope circular references
+            obj_id = id(val)
+            if obj_id in seen_scopes:
+                return {"$ref": "scope", "name": getattr(val, 'name', None)}
+            seen_scopes.add(obj_id)
+            
+            # Recursively simplify scope - only show key structure
+            result = {}
+            if getattr(val, 'name', None):
+                result["name"] = val.name
+            result["type"] = str(getattr(val, 'stype', '')).replace('ScopeType.', '')
+            
+            # Add children if any
+            if hasattr(val, 'children') and val.children:
+                result["children"] = {k: simplify_value(v, depth + 1) for k, v in val.children.items()}
+            
+            # Add key collections (instances, models, etc.)
+            for attr in ['subckt_instances', 'primitive_instances', 'models', 'params', 'subckts', 'functions']:
+                if hasattr(val, attr):
+                    items = simplify_value(getattr(val, attr), depth + 1)
+                    if items:
+                        result[attr] = items
+            
+            return result
+        elif isinstance(val, Ident):
+            # Simplify Ident - just show the name
+            return val.name if hasattr(val, 'name') else str(val)
+        elif isinstance(val, ParamVal):
+            # Simplify ParamVal - show just the value
+            if hasattr(val, 'val'):
+                return simplify_value(val.val, depth + 1)
+            return str(val)
+        elif hasattr(val, '__class__') and hasattr(val, 'val'):
+            # For value objects (MetricNum, Int, Float, etc.), extract the value
+            cls_name = val.__class__.__name__
+            if cls_name in ('MetricNum', 'Int', 'Float', 'String'):
+                return val.val if hasattr(val, 'val') else str(val)
+        elif hasattr(val, 'name') and hasattr(val, '__class__'):
+            # For named objects (like ParamDecl, Instance, etc.), show name and key fields
+            result = {"name": getattr(val, 'name', None)}
+            if hasattr(val, 'name') and isinstance(val.name, Ident):
+                result["name"] = val.name.name if hasattr(val.name, 'name') else str(val.name)
+            
+            # Add key fields based on type
+            cls_name = val.__class__.__name__
+            if cls_name == 'Instance':
+                if hasattr(val, 'module'):
+                    mod = val.module
+                    if hasattr(mod, 'ident') and hasattr(mod.ident, 'name'):
+                        result["module"] = mod.ident.name
+                if hasattr(val, 'conns'):
+                    result["conns"] = [c.name if hasattr(c, 'name') else str(c) for c in val.conns]
+                if hasattr(val, 'params'):
+                    params = simplify_value(val.params, depth + 1)
+                    if params:
+                        result["params"] = params
+            elif cls_name == 'Primitive':
+                if hasattr(val, 'ptype'):
+                    result["type"] = str(val.ptype).replace('PrimitiveType.', '')
+                if hasattr(val, 'conns'):
+                    result["conns"] = [c.name if hasattr(c, 'name') else str(c) for c in val.conns]
+                if hasattr(val, 'params'):
+                    params = simplify_value(val.params, depth + 1)
+                    if params:
+                        result["params"] = params
+            elif cls_name == 'ModelDef':
+                if hasattr(val, 'mtype') and hasattr(val.mtype, 'name'):
+                    result["mtype"] = val.mtype.name
+                if hasattr(val, 'params'):
+                    params = simplify_value(val.params, depth + 1)
+                    if params:
+                        result["params"] = params
+            elif cls_name == 'ParamDecl':
+                if hasattr(val, 'default'):
+                    result["default"] = simplify_value(val.default, depth + 1)
+            
+            return result
+        elif hasattr(val, '__dict__'):
+            # For other objects, try to extract key info
+            d = val.__dict__
+            if 'name' in d:
+                return simplify_value(d['name'], depth + 1)
+            # For expressions, just show a simplified representation
+            if hasattr(val, '__class__'):
+                cls_name = val.__class__.__name__
+                if 'Expr' in cls_name or 'Call' in cls_name:
+                    return f"<{cls_name}>"  # Don't expand expressions deeply
+            return str(val)
+        else:
+            return val
+    
+    simplified = simplify_value(scope)
+    return json.dumps(simplified, indent=2, default=str)
+
+
+def _program_to_json_simplified(program: "Program") -> str:
+    """Convert Program to clean, simplified JSON showing the AST structure used by the writer."""
+    import json
+    from .data import SubcktDef, Instance, Primitive, ModelDef, ParamDecls
+    
+    def simplify_entry(entry, depth=0):
+        """Simplify an AST entry to show its structure."""
+        cls_name = entry.__class__.__name__
+        result = {"type": cls_name}
+        
+        if isinstance(entry, SubcktDef):
+            result["name"] = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            if hasattr(entry, 'ports'):
+                result["ports"] = [p.name if hasattr(p, 'name') else str(p) for p in entry.ports]
+            if hasattr(entry, 'entries'):
+                result["entries"] = [simplify_entry(e, depth + 1) for e in entry.entries]
+        elif isinstance(entry, Instance):
+            result["name"] = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            if hasattr(entry, 'module') and hasattr(entry.module, 'ident'):
+                result["module"] = entry.module.ident.name if hasattr(entry.module.ident, 'name') else str(entry.module.ident)
+            if hasattr(entry, 'conns'):
+                result["conns"] = [c.name if hasattr(c, 'name') else str(c) for c in entry.conns]
+        elif isinstance(entry, Primitive):
+            result["name"] = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            # Primitives store connections in args, params in kwargs
+            if hasattr(entry, 'args'):
+                result["args"] = [simplify_entry(a, depth + 1) if hasattr(a, '__class__') else str(a) for a in entry.args]
+            if hasattr(entry, 'kwargs'):
+                params = [{"name": p.name.name if hasattr(p.name, 'name') else str(p.name), 
+                          "val": str(p.val)[:50]} for p in entry.kwargs] if hasattr(entry, 'kwargs') else []
+                if params:
+                    result["params"] = params
+        elif isinstance(entry, ModelDef):
+            result["name"] = entry.name.name if hasattr(entry.name, 'name') else str(entry.name)
+            if hasattr(entry, 'mtype') and hasattr(entry.mtype, 'name'):
+                result["mtype"] = entry.mtype.name
+        elif isinstance(entry, ParamDecls):
+            if hasattr(entry, 'params'):
+                result["params"] = [p.name.name if hasattr(p.name, 'name') else str(p.name) for p in entry.params]
+        
+        return result
+    
+    result = {
+        "files": [
+            {
+                "path": str(f.path),
+                "entries": [simplify_entry(e) for e in f.contents]
+            }
+            for f in program.files
+        ]
+    }
+    
+    return json.dumps(result, indent=2, default=str)
 
 
 @dataclass
@@ -639,4 +885,5 @@ __all__ = [tp.__name__ for tp in datatypes] + [
     "Model",
     "Statement",
     "to_json",
+    "write_json",
 ]
