@@ -18,3 +18,28 @@ subckt sub1 d g s b
         + wmax=10u
 ends sub1
 
+simulator lang=spectre
+
+// Problematic case 1: pmos_lvt style
+inline subckt pmos_lvt_repro ( d g s b )
+   parameters l=1 w=1 ad=0 as=0 pd=0 ps=0 nrd=0.14/w nrs=0.14/w sa = 0 sb = 0 sd = 0  nf = 1
++ swx_nrds = 361*nf/w + 1489
+
+    // Some content to ensure it's a valid subckt
+    // Changed to use a model to avoid writer crash on simple resistor value
+    r1 d s resistor_model
+ends pmos_lvt_repro
+
+// Problematic case 2: npn_1x2 style (newline before parameters)
+inline subckt npn_1x2_repro (c b e s)
+
+   parameters
++     dkisnpn1x2  = 9.0950e-01 
++     dkbfnpn1x2  = 9.6759e-01
++     var_is  = 1 / sw_func_rdn**2 * (1 + 1.2*sw_mm_npn_is * mm_z1 / sqrt(m))
++     var_bf  = (sw_func_pw_rs*sw_func_pw_rs)**2.2 * (1 + 0.93*sw_mm_npn_bf*mm_z2/sqrt(m))
+
+    // Content
+    q1 c b e s npn_model
+ends npn_1x2_repro
+

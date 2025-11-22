@@ -194,7 +194,7 @@ class DialectParser:
         params = self.parse_param_declarations()
 
         # And create & return our instance
-        return StartSubckt(name=name, ports=ports, params=params)
+        return StartSubckt(name=name, ports=ports, params=params, inline=_inline)
 
     def parse_ident(self) -> Ident:
         """Parse an Identifier"""

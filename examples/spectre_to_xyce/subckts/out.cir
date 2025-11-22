@@ -3,7 +3,17 @@
 
 ; Source File: /home/nates/github/Netlist/examples/spectre_to_xyce/subckts/in.scs
 .SUBCKT sub1 d g s b
-+ PARAMS: w=60u p1=1000 p2=0.1 vth=0.7 p3={-0.5} p4=1.8 p5=0.7 p6=0.1 p7={-0.02} 
++ ; No parameters
+
+.param w=60u
+.param p1=1000
+.param p2=0.1
+.param vth=0.7
+.param p3={-0.5}
+.param p4=1.8
+.param p5=0.7
+.param p6=0.1
+.param p7={-0.02}
 
 r1 
 + d 
@@ -20,5 +30,23 @@ inst1
 + wmin=0.5u
 + wmax=10u
 
+.ENDS
+
+.SUBCKT pmos_lvt_repro d g s b
++ PARAMS: l=1 w=1 ad=0 as=0 pd=0 ps=0 nrd={0.14/w} nrs={0.14/w} sa=0 sb=0 sd=0 nf=1 swx_nrds={361*nf/w+1489} 
+
+r1 
++ d s 
++ resistor_model 
++ 
+.ENDS
+
+.SUBCKT npn_1x2_repro c b e s
++ PARAMS: dkisnpn1x2=0.9095 dkbfnpn1x2=0.96759 var_is={1/(sw_func_rdn^2)*(1+1.2*sw_mm_npn_is*mm_z1/sqrt(m))} var_bf={(sw_func_pw_rs*sw_func_pw_rs^2.2)*(1+0.93*sw_mm_npn_bf*mm_z2/sqrt(m))} 
+
+q1 
++ c b e s 
++ npn_model 
++ 
 .ENDS
 

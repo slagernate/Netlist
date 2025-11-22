@@ -351,6 +351,16 @@ class HierarchyCollector:
             if isinstance(stmt, EndSubckt):
                 break  # done with this module
 
+            # Inline Subckt Parameter Promotion Logic
+            # For Spectre `inline subckt`, parameters defined in the body (via `parameters` keyword)
+            # are formal parameters, even if they have defaults.
+            if start.inline and isinstance(stmt, (ParamDecl, ParamDecls)):
+                if isinstance(stmt, ParamDecl):
+                    params.append(stmt)
+                else:
+                    params.extend(stmt.params)
+                continue
+
             # Parameter statements in subckt scope:
             # - Formal parameters (from "parameters:" statement, no defaults) should be promoted to subcircuit params
             # - Local/global parameters (from ".param" or ".PARAM", with defaults) should remain as entries

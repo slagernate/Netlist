@@ -1929,21 +1929,22 @@ def test_bsim4_model_translation():
     output_str3 = output3.getvalue()
     assert ".model model_with_level pmos" in output_str3 and ("level=14.0" in output_str3 or "level=14" in output_str3) and output_str3.count("level=") == 1, "BSIM4 with existing level=14 should preserve it"
     
-    # Test 4: deltox in model → filtered out
+    # Test 4: deltox in model → mapped to dtox
     with_deltox = ModelDef(name=Ident("model_with_deltox"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("n")), distr=None), ParamDecl(name=Ident("deltox"), default=Float(1e-9), distr=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)])
     output4 = StringIO()
     write_netlist(src=Program(files=[SourceFile(path="test4.cir", contents=[with_deltox])]), dest=output4, options=WriteOptions(fmt=NetlistDialects.XYCE))
     output_str4 = output4.getvalue()
-    assert ".model model_with_deltox nmos" in output_str4 and "deltox=" not in output_str4 and ("level=54.0" in output_str4 or "level=54" in output_str4), "BSIM4 deltox should be filtered, level=54 added"
+    assert ".model model_with_deltox nmos" in output_str4 and "deltox=" not in output_str4 and "dtox=" in output_str4 and ("level=54.0" in output_str4 or "level=54" in output_str4), "BSIM4 deltox should be mapped to dtox, level=54 added"
     
     # Test 5: deltox in instance params → filtered when referencing ModelFamily BSIM4
+    # (dtox is only valid in model definitions, not instance parameters)
     model_family = ModelFamily(name=Ident("plowvt_model"), mtype=Ident("bsim4"), variants=[ModelVariant(model=Ident("plowvt_model"), variant=Ident("1"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)])])
     subckt = SubcktDef(name=Ident("pmos_lvt"), ports=[Ident("d"), Ident("g"), Ident("s"), Ident("b")], params=[], entries=[Instance(name=Ident("Mpmos_lvt"), module=Ref(ident=Ident("plowvt_model")), conns=[Ident("d"), Ident("g"), Ident("s"), Ident("b")], params=[ParamVal(name=Ident("l"), val=Float(1.0)), ParamVal(name=Ident("w"), val=Float(2.0)), ParamVal(name=Ident("deltox"), val=Ref(ident=Ident("expr")))])])
     output5 = StringIO()
     write_netlist(src=Program(files=[SourceFile(path="test5.cir", contents=[model_family, subckt])]), dest=output5, options=WriteOptions(fmt=NetlistDialects.XYCE))
     output_str5 = output5.getvalue()
     instance_section = output_str5.split("Mpmos_lvt")[1].split("\n\n")[0]
-    assert "deltox=" not in instance_section and "l=" in instance_section and "w=" in instance_section, "deltox should be filtered from instance params when referencing BSIM4 ModelFamily"
+    assert "deltox=" not in instance_section and "dtox=" not in instance_section and "l=" in instance_section and "w=" in instance_section, "deltox should be filtered from instance params when referencing BSIM4 ModelFamily (dtox only valid in model definitions)"
 
 
 def test_bsim4_deltox_filtering_in_subckt():
@@ -1973,7 +1974,7 @@ def test_bsim4_deltox_filtering_in_subckt():
                  options=WriteOptions(fmt=NetlistDialects.XYCE))
     output_str = output.getvalue()
     instance_section = output_str.split("Mtest_pmos")[1].split("\n\n")[0]
-    assert "deltox=" not in instance_section, "deltox should be filtered from instance in subcircuit"
+    assert "deltox=" not in instance_section and "dtox=" not in instance_section, "deltox should be filtered from instance in subcircuit (dtox only valid in model definitions)"
     assert "l=" in instance_section and "w=" in instance_section, "other params should remain"
     assert "delvto=" in instance_section, "delvto should remain (not deltox)"
 

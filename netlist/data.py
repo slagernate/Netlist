@@ -450,6 +450,7 @@ class StartSubckt:
     name: Ident  # Module/ Subcircuit Name
     ports: List[Ident]  # Port List
     params: List[ParamDecl]  # Parameter Declarations
+    inline: bool = False  # Inline Subcircuit Flag
 
 
 @datatype

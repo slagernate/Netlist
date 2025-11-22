@@ -627,6 +627,7 @@ class XyceNetlister(SpiceNetlister):
             return self.write_comment("No parameters")
 
         # Filter deltox from instance parameters if this instance references a BSIM4 model
+        # (dtox is only valid in model definitions, not instance parameters)
         params_to_write = pvals
         if module_ref:
             is_bsim4 = self._is_bsim4_model_ref(module_ref)
@@ -635,7 +636,7 @@ class XyceNetlister(SpiceNetlister):
                 has_deltox = any(pval.name.name == "deltox" for pval in pvals)
                 if has_deltox:
                     warn(f"Filtering 'deltox' parameter from instance parameters for BSIM4 model '{module_ref.ident.name}'. "
-                         f"Xyce does not support deltox for BSIM4 models.")
+                         f"Xyce does not support deltox/dtox in instance parameters, only in model definitions.")
                 params_to_write = [pval for pval in pvals if pval.name.name != "deltox"]
 
         # MOS primitive instances should NOT have PARAMS: keyword
@@ -748,13 +749,14 @@ class XyceNetlister(SpiceNetlister):
             module_ref = pinst.args[-1]
         
         # Filter deltox if referencing BSIM4 model
+        # (dtox is only valid in model definitions, not instance parameters)
         kwargs_to_write = pinst.kwargs
         if module_ref and self._is_bsim4_model_ref(module_ref):
             # Check if deltox is present before filtering
             has_deltox = any(kw.name.name == "deltox" for kw in pinst.kwargs)
             if has_deltox:
                 warn(f"Filtering 'deltox' parameter from instance parameters for BSIM4 model '{module_ref.ident.name}'. "
-                     f"Xyce does not support deltox for BSIM4 models.")
+                     f"Xyce does not support deltox/dtox in instance parameters, only in model definitions.")
             kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name != "deltox"]
         
         self.write("+ ")
@@ -1068,7 +1070,7 @@ class XyceNetlister(SpiceNetlister):
         # Use local variable for params to avoid mutating the model object
         params_to_write = list(model.params)  # Create a copy
         
-        # Handle BSIM4: replace with pmos/nmos, add level, omit deltox
+        # Handle BSIM4: replace with pmos/nmos, add level, map deltox to dtox
         if mtype == "bsim4":
             # Determine pmos/nmos from type parameter
             type_param = next((p for p in model.params if p.name.name == "type"), None)
@@ -1083,8 +1085,15 @@ class XyceNetlister(SpiceNetlister):
             # Check if level parameter already exists
             has_level = any(p.name.name == "level" for p in params_to_write)
             
-            # Filter out deltox parameter
-            params_to_write = [p for p in params_to_write if p.name.name != "deltox"]
+            # Map deltox to dtox instead of filtering
+            mapped_params = []
+            for p in params_to_write:
+                if p.name.name == "deltox":
+                    # Create new ParamDecl with name "dtox" and same value
+                    mapped_params.append(ParamDecl(name=Ident("dtox"), default=p.default, distr=p.distr))
+                else:
+                    mapped_params.append(p)
+            params_to_write = mapped_params
             
             # Add level=54 at the beginning if not already present
             if not has_level:
