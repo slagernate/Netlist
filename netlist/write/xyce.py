@@ -33,7 +33,7 @@ from ..data import (
     NetlistDialects,
 )
 from .base import Netlister, ErrorMode
-from .spice import SpiceNetlister, apply_statistics_variations, debug_find_all_param_refs, replace_param_refs_in_program, expr_references_param
+from .spice import SpiceNetlister, apply_statistics_variations, debug_find_all_param_refs, replace_param_refs_in_program, expr_references_param, count_param_refs_in_entry
 
 
 class XyceNetlister(SpiceNetlister):
@@ -184,11 +184,20 @@ class XyceNetlister(SpiceNetlister):
                 self.write(f"R_pd_{node} {node} 0 1M\n")
                 node_count += 1
             
-            # Instantiate subcircuit with m=1 parameter (needed for mismatch variations)
+            # Instantiate subcircuit with only m=1 parameter (skip all other defaults)
             full_inst_name = f"{prefix}_{inst_name}"
             self.write(f"{full_inst_name} {' '.join(nodes)} {name}\n")
-            # Add m=1 parameter for mismatch variation support (no PARAMS: keyword for instantiations)
-            self.write(f"+ m=1\n")
+            
+            # Collect parameters to write - only m=1 for test files
+            inst_params = []
+            
+            # Only add m=1 parameter, skip all other default parameters
+            inst_params.append("m=1")
+            
+            # Write parameters
+            if inst_params:
+                self.write(f"+ {' '.join(inst_params)}\n")
+            
             self.write("\n")
             
         self.write("* Simulation Commands\n")
@@ -274,6 +283,92 @@ class XyceNetlister(SpiceNetlister):
                         if mtype: return mtype
         return None
 
+    def _get_module_definition(self, ref: Ref) -> Optional[Union[SubcktDef, ModelDef, ModelFamily, ModelVariant]]:
+        """Get the subcircuit or model definition from a Ref."""
+        if not isinstance(ref, Ref):
+            return None
+        
+        # Check resolved first
+        if ref.resolved:
+            from ..data import SubcktDef, ModelDef, ModelFamily, ModelVariant
+            if isinstance(ref.resolved, (SubcktDef, ModelDef, ModelFamily, ModelVariant)):
+                return ref.resolved
+        
+        # Search program
+        from ..data import ModelDef, ModelFamily, ModelVariant, LibSectionDef, SubcktDef
+        module_name = ref.ident.name
+        
+        def find_entry(entry):
+            if isinstance(entry, (SubcktDef, ModelDef, ModelFamily)) and entry.name.name.lower() == module_name.lower():
+                return entry
+            if isinstance(entry, ModelVariant):
+                if f"{entry.model.name}.{entry.variant.name}".lower() == module_name.lower() or entry.model.name.lower() == module_name.lower():
+                    return entry
+            return None
+
+        for file in self.src.files:
+            for entry in file.contents:
+                result = find_entry(entry)
+                if result: return result
+                
+                if isinstance(entry, LibSectionDef):
+                    for e in entry.entries:
+                        result = find_entry(e)
+                        if result: return result
+                
+                if isinstance(entry, SubcktDef):
+                    for e in entry.entries:
+                        result = find_entry(e)
+                        if result: return result
+        return None
+
+    def _is_default_param_value(self, pval: ParamVal, module_def: Optional[Union[SubcktDef, ModelDef, ModelFamily, ModelVariant]]) -> bool:
+        """Check if a parameter value equals its default value in the module definition."""
+        if module_def is None:
+            return False
+        
+        from ..data import ModelFamily, ModelVariant
+        
+        # Get parameter list from module definition
+        params = []
+        if isinstance(module_def, SubcktDef):
+            params = module_def.params
+        elif isinstance(module_def, ModelDef):
+            params = module_def.params
+        elif isinstance(module_def, ModelFamily):
+            # For ModelFamily, check the first variant (or all variants if needed)
+            if module_def.variants:
+                params = module_def.variants[0].params
+        elif isinstance(module_def, ModelVariant):
+            params = module_def.params
+        
+        # Find the default value for this parameter
+        param_name = pval.name.name
+        default_param = None
+        for param in params:
+            if param.name.name == param_name:
+                default_param = param
+                break
+        
+        if default_param is None or default_param.default is None:
+            # No default defined, so this is not a default value
+            return False
+        
+        # Compare the instance value with the default
+        # For simple literals, compare directly
+        from ..data import Int, Float, MetricNum
+        if isinstance(pval.val, (Int, Float, MetricNum)) and isinstance(default_param.default, (Int, Float, MetricNum)):
+            # Compare numeric values
+            pval_num = float(pval.val.val) if hasattr(pval.val, 'val') else float(pval.val)
+            default_num = float(default_param.default.val) if hasattr(default_param.default, 'val') else float(default_param.default)
+            return abs(pval_num - default_num) < 1e-10
+        
+        # For expressions, compare formatted strings (simple approach)
+        # This is not perfect but should work for most cases
+        pval_str = self.format_expr(pval.val)
+        default_str = self.format_expr(default_param.default)
+        return pval_str == default_str
+
     def write_instance_params(self, pvals: List[ParamVal], is_mos_like: bool = False, module_ref: Optional[Ref] = None) -> None:
         """Write the parameter-values for Instance `pinst`.
 
@@ -306,6 +401,39 @@ class XyceNetlister(SpiceNetlister):
                 # We handle moving them to the model in write_subckt_def, so here we just ensure they are gone.
                 params_to_write = [pval for pval in pvals if pval.name.name not in ("deltox", "dtox")]
 
+        # Filter out default parameters (except m=1 which should always be written)
+        # Only do this for test file type
+        if self.file_type == "test" and module_ref:
+            module_def = self._get_module_definition(module_ref)
+            if module_def:
+                filtered_params = []
+                for pval in params_to_write:
+                    param_name = pval.name.name
+                    # Always include m=1
+                    if param_name == "m":
+                        from ..data import Int, Float
+                        # Check if it's m=1
+                        is_m_one = False
+                        if isinstance(pval.val, (Int, Float)):
+                            val = float(pval.val.val) if hasattr(pval.val, 'val') else float(pval.val)
+                            is_m_one = abs(val - 1.0) < 1e-10
+                        elif isinstance(pval.val, Ref) and pval.val.ident.name == "m":
+                            # m={m} reference - always include
+                            is_m_one = True
+                        
+                        if is_m_one:
+                            # Always include m=1
+                            filtered_params.append(pval)
+                        else:
+                            # For m != 1, skip if it matches default
+                            if not self._is_default_param_value(pval, module_def):
+                                filtered_params.append(pval)
+                    else:
+                        # For other parameters, skip if they match defaults
+                        if not self._is_default_param_value(pval, module_def):
+                            filtered_params.append(pval)
+                params_to_write = filtered_params
+
         # Models (primitives) instances should NOT have PARAMS: keyword
         if not is_mos_like:
             self.write("PARAMS: ")  # <= Xyce-specific for subcircuits
@@ -323,6 +451,16 @@ class XyceNetlister(SpiceNetlister):
         mtype = None
         if isinstance(pinst.module, Ref):
             mtype = self._get_model_type(pinst.module)
+            
+            # Fallback: Check for resistor/capacitor/inductor by name if model definition not found
+            if mtype is None:
+                mod_name = pinst.module.ident.name.lower()
+                if mod_name in ('resistor', 'res'):
+                    mtype = 'r'
+                elif mod_name in ('capacitor', 'cap'):
+                    mtype = 'c'
+                elif mod_name in ('inductor', 'ind'):
+                    mtype = 'l'
         
         is_model = mtype is not None
         
@@ -332,6 +470,7 @@ class XyceNetlister(SpiceNetlister):
             if "mos" in mtype or mtype == "bsim4": prefix = "M"
             elif "res" in mtype or mtype == "r": prefix = "R"
             elif "cap" in mtype or mtype == "c": prefix = "C"
+            elif "ind" in mtype or mtype == "l": prefix = "L"
             elif "dio" in mtype or mtype == "d": prefix = "D"
             elif "pnp" in mtype or "npn" in mtype or mtype == "q": prefix = "Q"
             # Add more types as needed
@@ -349,9 +488,52 @@ class XyceNetlister(SpiceNetlister):
                 prefix = "M"
                 is_model = True # Treat as model for params formatting
 
+        # Check if model is resistor, capacitor, or inductor and handle accordingly
+        skip_model_name = False
+        if isinstance(pinst.module, Ref):
+            mod_name = pinst.module.ident.name.lower()
+            inst_name_base = self.format_ident(pinst.name)
+            
+            # For resistor, capacitor, and inductor, Xyce doesn't need the model name
+            # (it's inferred from the prefix)
+            if mod_name in ("resistor", "res", "r"):
+                if not inst_name_base.upper().startswith("R"):
+                    prefix = "R"
+                    warn(f"Instance {pinst.name.name} uses resistor model but lacks R prefix. Prepending R_")
+                else:
+                    prefix = "R"  # Ensure prefix is set
+                    # If name starts with lowercase 'r', we still want to ensure it's uppercase R
+                    if inst_name_base.startswith("r") and not inst_name_base.startswith("R"):
+                        inst_name_base = "R" + inst_name_base[1:]
+                skip_model_name = True
+            elif mod_name in ("capacitor", "cap", "c"):
+                if not inst_name_base.upper().startswith("C"):
+                    prefix = "C"
+                    warn(f"Instance {pinst.name.name} uses capacitor model but lacks C prefix. Prepending C_")
+                else:
+                    prefix = "C"  # Ensure prefix is set
+                    # If name starts with lowercase 'c', we still want to ensure it's uppercase C
+                    if inst_name_base.startswith("c") and not inst_name_base.startswith("C"):
+                        inst_name_base = "C" + inst_name_base[1:]
+                skip_model_name = True
+            elif mod_name in ("inductor", "ind", "l"):
+                if not inst_name_base.upper().startswith("L"):
+                    prefix = "L"
+                    warn(f"Instance {pinst.name.name} uses inductor model but lacks L prefix. Prepending L_")
+                else:
+                    prefix = "L"  # Ensure prefix is set
+                    # If name starts with lowercase 'l', we still want to ensure it's uppercase L
+                    if inst_name_base.startswith("l") and not inst_name_base.startswith("L"):
+                        inst_name_base = "L" + inst_name_base[1:]
+                skip_model_name = True
+
         inst_name = self.format_ident(pinst.name)
         if prefix and not inst_name.upper().startswith(prefix):
-            inst_name = f"{prefix}{inst_name}"
+            # If we're skipping model name (resistor/capacitor/inductor), use underscore separator
+            if skip_model_name:
+                inst_name = f"{prefix}_{inst_name}"
+            else:
+                inst_name = f"{prefix}{inst_name}"
 
         # Write the instance name
         self.write(inst_name + " \n")
@@ -359,8 +541,9 @@ class XyceNetlister(SpiceNetlister):
         # Write its port-connections
         self.write_instance_conns(pinst)
 
-        # Write the sub-circuit name
-        self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
+        # Write the sub-circuit/model name (skip for resistor/capacitor/inductor)
+        if not skip_model_name:
+            self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
 
         # Check if instance parameter expressions reference 'm' and add m={m} if needed
         has_m_in_params = any(p.name.name == "m" for p in pinst.params)
@@ -417,6 +600,7 @@ class XyceNetlister(SpiceNetlister):
             if "mos" in mtype or mtype == "bsim4": prefix = "M"
             elif "res" in mtype or mtype == "r": prefix = "R"
             elif "cap" in mtype or mtype == "c": prefix = "C"
+            elif "ind" in mtype or mtype == "l": prefix = "L"
             elif "dio" in mtype or mtype == "d": prefix = "D"
             elif "pnp" in mtype or "npn" in mtype or mtype == "q": prefix = "Q"
         
@@ -431,9 +615,47 @@ class XyceNetlister(SpiceNetlister):
             if is_mos_like:
                 prefix = "M"
 
-        inst_name = self.format_ident(pinst.name)
+        # Get base instance name for prefix checking
+        inst_name_base = self.format_ident(pinst.name)
+        
+        # Check if model is resistor, capacitor, or inductor and handle accordingly
+        model_name = None
+        skip_model_name = False
+        if pinst.args and isinstance(pinst.args[-1], Ref):
+            model_name = pinst.args[-1].ident.name.lower()
+            
+            # For resistor, capacitor, and inductor, Xyce doesn't need the model name
+            # (it's inferred from the prefix)
+            if model_name in ("resistor", "res", "r"):
+                if not inst_name_base.upper().startswith("R"):
+                    prefix = "R"
+                    warn(f"Instance {pinst.name.name} uses resistor model but lacks R prefix. Prepending R_")
+                else:
+                    prefix = "R"  # Ensure prefix is set even if name already has it
+                skip_model_name = True
+            elif model_name in ("capacitor", "cap", "c"):
+                if not inst_name_base.upper().startswith("C"):
+                    prefix = "C"
+                    warn(f"Instance {pinst.name.name} uses capacitor model but lacks C prefix. Prepending C_")
+                else:
+                    prefix = "C"  # Ensure prefix is set even if name already has it
+                skip_model_name = True
+            elif model_name in ("inductor", "ind", "l"):
+                if not inst_name_base.upper().startswith("L"):
+                    prefix = "L"
+                    warn(f"Instance {pinst.name.name} uses inductor model but lacks L prefix. Prepending L_")
+                else:
+                    prefix = "L"  # Ensure prefix is set even if name already has it
+                skip_model_name = True
+
+        inst_name = inst_name_base
+        
         if prefix and not inst_name.upper().startswith(prefix):
-            inst_name = f"{prefix}{inst_name}"
+            # If we're skipping model name (resistor/capacitor/inductor), use underscore separator
+            if skip_model_name:
+                inst_name = f"{prefix}_{inst_name}"
+            else:
+                inst_name = f"{prefix}{inst_name}"
         self.write(inst_name + " \n")
 
         # Write ports (excluding last (model)) on a separate continuation line
@@ -451,7 +673,9 @@ class XyceNetlister(SpiceNetlister):
                 self.write(self.format_expr(arg) + " ")
         self.write("\n")
         # Write the model (last arg) on another continuation line
-        self.write("+ " + self.format_ident(pinst.args[-1]) + " \n")
+        # Skip model name for resistor, capacitor, and inductor (Xyce infers from prefix)
+        if not skip_model_name and pinst.args:
+            self.write("+ " + self.format_ident(pinst.args[-1]) + " \n")
 
         # Filter deltox if referencing BSIM4 model
         # (dtox is only valid in model definitions, not instance parameters)
@@ -663,6 +887,15 @@ class XyceNetlister(SpiceNetlister):
                             break
                 if needs_m_param:
                     break
+            elif isinstance(entry, ModelDef):
+                # Check if any model parameter references 'm'
+                for param in entry.params:
+                    if param.default is not None and isinstance(param.default, Expr):
+                        if expr_references_param(param.default, "m"):
+                            needs_m_param = True
+                            break
+                if needs_m_param:
+                    break
         
         # Add m=1 parameter if needed but not present
         if needs_m_param and not has_m_param:
@@ -851,6 +1084,20 @@ class XyceNetlister(SpiceNetlister):
         mname = self.format_ident(model.name)
         mtype = self.format_ident(model.mtype).lower()
         
+        # Map model types to Xyce equivalents
+        xyce_mtype_map = {
+            "diode": "D",
+            "npn": "NPN",
+            "pnp": "PNP",
+            "r": "R",
+            "res": "R",
+            "resistor": "R",
+            "c": "C",
+            "cap": "C",
+            "capacitor": "C",
+            "d": "D",
+        }
+        
         # Use local variable for params to avoid mutating the model object
         params_to_write = list(model.params)  # Create a copy
         
@@ -884,12 +1131,15 @@ class XyceNetlister(SpiceNetlister):
                 level_param = ParamDecl(name=Ident("level"), default=Float(54.0), distr=None)
                 params_to_write.insert(0, level_param)
         
+        # Map to Xyce model type equivalent
+        xyce_mtype = xyce_mtype_map.get(mtype, mtype)
+        
         # Write model header
         if mtype.lower() == "bsim4":
             # Should not happen after conversion, but handle just in case
             self.writeln(f".model {mname}")
         else:
-            self.writeln(f".model {mname} {mtype}")
+            self.writeln(f".model {mname} {xyce_mtype}")
         
         # Write arguments if any
         if model.args:

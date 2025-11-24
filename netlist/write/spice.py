@@ -519,7 +519,7 @@ def expr_references_param(expr: Expr, param_name: str) -> bool:
     """Check if an expression references a parameter by name.
     
     Recursively searches through the expression tree for Ref nodes
-    that match the parameter name.
+    that match the parameter name. Case-insensitive matching.
     
     Args:
         expr: The expression to check
@@ -528,9 +528,9 @@ def expr_references_param(expr: Expr, param_name: str) -> bool:
     Returns:
         True if the expression references the parameter, False otherwise
     """
-    # Handle Ref nodes - check if name matches
+    # Handle Ref nodes - check if name matches (case-insensitive)
     if isinstance(expr, Ref):
-        return expr.ident.name == param_name
+        return expr.ident.name.lower() == param_name.lower()
     
     # Handle Call nodes - recurse into arguments
     if isinstance(expr, Call):
