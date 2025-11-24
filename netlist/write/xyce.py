@@ -182,12 +182,10 @@ class XyceNetlister(SpiceNetlister):
         if module_ref:
             is_bsim4 = self._is_bsim4_model_ref(module_ref)
             if is_bsim4:
-                # Check if deltox is present before filtering
-                has_deltox = any(pval.name.name == "deltox" for pval in pvals)
-                if has_deltox:
-                    warn(f"Filtering 'deltox' parameter from instance parameters for BSIM4 model '{module_ref.ident.name}'. "
-                         f"Xyce does not support deltox/dtox in instance parameters, only in model definitions.")
-                params_to_write = [pval for pval in pvals if pval.name.name != "deltox"]
+                # Filter deltox AND dtox from instance parameters
+                # Xyce does not support them on instance, they must be on the model.
+                # We handle moving them to the model in write_subckt_def, so here we just ensure they are gone.
+                params_to_write = [pval for pval in pvals if pval.name.name not in ("deltox", "dtox")]
 
         # MOS primitive instances should NOT have PARAMS: keyword
         if not is_mos_like:
@@ -302,12 +300,8 @@ class XyceNetlister(SpiceNetlister):
         # (dtox is only valid in model definitions, not instance parameters)
         kwargs_to_write = pinst.kwargs
         if module_ref and self._is_bsim4_model_ref(module_ref):
-            # Check if deltox is present before filtering
-            has_deltox = any(kw.name.name == "deltox" for kw in pinst.kwargs)
-            if has_deltox:
-                warn(f"Filtering 'deltox' parameter from instance parameters for BSIM4 model '{module_ref.ident.name}'. "
-                     f"Xyce does not support deltox/dtox in instance parameters, only in model definitions.")
-            kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name != "deltox"]
+            # Filter deltox AND dtox from instance parameters
+            kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name not in ("deltox", "dtox")]
         
         self.write("+ ")
         for kwarg in kwargs_to_write:
@@ -423,6 +417,56 @@ class XyceNetlister(SpiceNetlister):
 
     def write_subckt_def(self, module: SubcktDef) -> None:
         """Write the `SUBCKT` definition for `Module` `module` in Xyce format."""
+        
+        # Pre-process: Move deltox/dtox from instances to local BSIM4 models
+        # Xyce requires dtox to be on the model card, not the instance.
+        
+        # 1. Find local BSIM4 models
+        local_models = {}
+        for entry in module.entries:
+            if isinstance(entry, ModelDef):
+                if entry.mtype.name.lower() == "bsim4":
+                    local_models[entry.name.name] = entry
+            elif isinstance(entry, ModelFamily):
+                if entry.mtype.name.lower() == "bsim4":
+                    local_models[entry.name.name] = entry
+                    
+        # 2. Find instances using these models and extract deltox
+        for entry in module.entries:
+            if isinstance(entry, Instance) and isinstance(entry.module, Ref):
+                model_name = entry.module.ident.name
+                if model_name in local_models:
+                    # Found instance of local BSIM4 model
+                    dtox_val = None
+                    params_to_keep = []
+                    # Check params for deltox or dtox
+                    for pval in entry.params:
+                        if pval.name.name in ("deltox", "dtox"):
+                            dtox_val = pval.val
+                        else:
+                            params_to_keep.append(pval)
+                    
+                    if dtox_val is not None:
+                        # Remove from instance (modify in place)
+                        entry.params = params_to_keep
+                        
+                        # Add to model (modify in place)
+                        model = local_models[model_name]
+                        
+                        # Helper to add dtox to a param list
+                        def add_dtox(params_list, val):
+                            # Remove existing dtox/deltox
+                            new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
+                            # Add new dtox
+                            new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
+                            return new_params
+
+                        if isinstance(model, ModelDef):
+                            model.params = add_dtox(model.params, dtox_val)
+                        elif isinstance(model, ModelFamily):
+                            for variant in model.variants:
+                                variant.params = add_dtox(variant.params, dtox_val)
+
         # Reset instance flag at start of subcircuit
         self._last_entry_was_instance = False
         # Store current subcircuit context for use in write_subckt_instance

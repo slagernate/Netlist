@@ -800,3 +800,76 @@ def test_xyce_parameter_reference_braces():
     # Verify that parameters are wrapped in braces
     assert "m={m}" in output_str
     assert "l={l}" in output_str
+
+
+
+
+
+def test_xyce_bsim4_dtox_move():
+    """
+    Test that 'deltox' parameter is moved from instance to model for BSIM4 in Xyce.
+    """
+    # Define a BSIM4 model
+    model = ModelDef(
+        name=Ident("bsim4_model_move"),
+        mtype=Ident("bsim4"),
+        args=[],
+        params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("n")), distr=None)]
+    )
+    
+    # Create an instance using that model with deltox parameter
+    instance = Instance(
+        name=Ident("M1"),
+        module=Ref(ident=Ident("bsim4_model_move")),
+        conns=[Ident("d"), Ident("g"), Ident("s"), Ident("b")],
+        params=[
+            ParamVal(name=Ident("w"), val=Float(1e-6)),
+            ParamVal(name=Ident("l"), val=Float(1e-6)),
+            ParamVal(name=Ident("deltox"), val=Float(3e-9))
+        ]
+    )
+    
+    # Wrap in a subcircuit because the fixup happens at subcircuit level
+    subckt = SubcktDef(
+        name=Ident("test_subckt"),
+        ports=[],
+        params=[],
+        entries=[model, instance]
+    )
+    
+    program = Program(files=[
+        SourceFile(path="test.cir", contents=[subckt])
+    ])
+    
+    output = StringIO()
+    write_netlist(src=program, dest=output, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output_str = output.getvalue()
+    
+    # Verify that dtox is NOT in instance line
+    instance_line = next((line for line in output_str.split('\n') if line.startswith("M1")), "")
+    # Check subsequent lines for params
+    instance_params = ""
+    capture = False
+    for line in output_str.split('\n'):
+        if line.startswith("M1"):
+            capture = True
+        elif capture and line.startswith(".model"):
+            capture = False
+        elif capture:
+            instance_params += line
+            
+    assert "dtox=" not in instance_params
+    assert "deltox=" not in instance_params
+    
+    # Verify that dtox IS in model line
+    model_params = ""
+    capture = False
+    for line in output_str.split('\n'):
+        if line.startswith(".model bsim4_model_move"):
+            capture = True
+        elif capture and (line.startswith(".ENDS") or line.startswith("M")):
+            capture = False
+        elif capture:
+            model_params += line
+            
+    assert "dtox=" in model_params
