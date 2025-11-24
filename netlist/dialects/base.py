@@ -82,6 +82,8 @@ class DialectParser:
             return SpectreSpiceDialectParser
         if dialect == NetlistDialects.NGSPICE:
             return NgSpiceDialectParser
+        if dialect == NetlistDialects.XYCE:
+            return NgSpiceDialectParser
         raise ValueError
 
     def eat_blanks(self):
