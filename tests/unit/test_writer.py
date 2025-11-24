@@ -758,3 +758,45 @@ def test_bsim4_deltox_filtering_in_subckt():
     assert "deltox=" not in instance_section and "dtox=" not in instance_section
     assert "l=" in instance_section and "w=" in instance_section
     assert "delvto=" in instance_section
+
+
+def test_xyce_parameter_reference_braces():
+    """
+    Test that Xyce parameters that are references are wrapped in braces.
+    Expected: m={m}
+    """
+    
+    # Create a subcircuit that has a parameter 'm'
+    # and an instance that passes 'm' to its model/subckt
+    
+    subckt = SubcktDef(
+        name=Ident("parent_subckt"),
+        ports=[],
+        params=[
+            ParamDecl(name=Ident("m"), default=Float(1.0), distr=None),
+            ParamDecl(name=Ident("l"), default=Float(1.0), distr=None)
+        ],
+        entries=[
+            Instance(
+                name=Ident("Mpmos_lvt"),
+                module=Ref(ident=Ident("plowvt_model")),
+                conns=[Ident("d"), Ident("g"), Ident("s"), Ident("b")],
+                params=[
+                    ParamVal(name=Ident("m"), val=Ref(ident=Ident("m"))),
+                    ParamVal(name=Ident("l"), val=Ref(ident=Ident("l"))),
+                ]
+            )
+        ]
+    )
+
+    program = Program(files=[
+        SourceFile(path="test.cir", contents=[subckt])
+    ])
+
+    output = StringIO()
+    write_netlist(src=program, dest=output, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output_str = output.getvalue()
+    
+    # Verify that parameters are wrapped in braces
+    assert "m={m}" in output_str
+    assert "l={l}" in output_str

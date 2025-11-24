@@ -351,6 +351,23 @@ class XyceNetlister(SpiceNetlister):
         """Return the starting and closing delimiters for expressions."""
         return ("{", "}")
 
+    def format_expr(self, expr: Expr) -> str:
+        """Format an expression for Xyce.
+        
+        Overrides base implementation to ensure Ref objects (parameters) 
+        are wrapped in curly braces, e.g. {m} instead of just m.
+        """
+        # Base cases that don't need braces
+        if isinstance(expr, (Int, Float, MetricNum)):
+            return self.format_number(expr)
+        if isinstance(expr, QuotedString):
+            return f"'{expr.val}'"
+
+        # Everything else (Ref, BinaryOp, Call, etc.) gets wrapped in braces
+        start, end = self.expression_delimiters()
+        inner = self._format_expr_inner(expr)
+        return f"{start}{inner}{end}"
+
     def write_options(self, options: Options) -> None:
         """Write Options `options`
 
