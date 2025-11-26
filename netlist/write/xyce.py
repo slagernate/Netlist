@@ -39,7 +39,7 @@ from .spice import SpiceNetlister, apply_statistics_variations, debug_find_all_p
 class XyceNetlister(SpiceNetlister):
     """Xyce-Format Netlister"""
 
-    def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "", includes: List[Tuple[str, str]] = None, model_file: str = None) -> None:
+    def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "", includes: List[Tuple[str, str]] = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None) -> None:
         super().__init__(src, dest, errormode=errormode, file_type=file_type)
         self.includes = includes or []
         self.model_file = model_file
@@ -50,6 +50,11 @@ class XyceNetlister(SpiceNetlister):
         self._reserved_names = {'vt', 'temp', 'time', 'freq', 'omega', 'pi', 'e'}
         # Collect all parameter names from the AST to only rename actual parameters
         self._param_names = self._collect_param_names(src)
+        # Process model_level_mapping: convert lists to dicts for efficient lookup
+        self._model_level_mapping: Dict[str, Dict[int, int]] = {}
+        if model_level_mapping:
+            for key, mappings in model_level_mapping.items():
+                self._model_level_mapping[key.lower()] = {in_level: out_level for in_level, out_level in mappings}
 
     @property
     def enum(self):
@@ -1074,8 +1079,258 @@ class XyceNetlister(SpiceNetlister):
         
         return False
 
+    def _map_bjt_level1_to_mextram_params(self, params: List[ParamDecl]) -> List[Tuple[ParamDecl, Optional[str], bool]]:
+        """Map BJT level 1 (Gummel-Poon) parameters to MEXTRAM (level 504) parameters.
+        
+        Args:
+            params: List of ParamDecl objects with level 1 parameter names
+            
+        Returns:
+            List of (ParamDecl, comment, commented_out) tuples
+        """
+        # Mapping table: (level1_param_name, mextram_param_name_or_action)
+        # Actions can be:
+        # - 'PARAM': Direct mapping to new name
+        # - None: Drop parameter (comment out)
+        # - (None, 'Warning'): Drop with custom warning/comment
+        # - ('PARAM', 'Warning'): Map with warning/comment
+        # - 'SPECIAL_...': Special handling required
+        
+        level1_to_mextram_mapping = [
+            # === Core transport parameters ===
+            ('IS',   'IS'),     # saturation current – direct
+            ('BF',   'BF'),     # forward beta – direct
+            ('BR',   'IBR'),    # reverse beta → MEXTRAM uses IBR
+            ('NF',   'SPECIAL_NF'),  # forward emission coeff -> PE + MLF
+            ('NR',   'PC'),     # reverse emission coeff -> PC
+            ('VAF',  'VEF'),    # forward Early voltage -> VEF
+            ('VAR',  'VER'),    # reverse Early voltage -> VER
+            ('IKF',  'SPECIAL_IK'),  # forward knee -> IK (conflict with IKR)
+            ('IKR',  'SPECIAL_IK'),  # reverse knee -> IK (conflict with IKF)
+            ('ISE',  'IBF'),    # B-E leakage sat current -> IBF
+            ('ISC',  'ICSS'),   # B-C leakage sat current -> ICSS
+            ('NE',   'MLF'),    # B-E leakage emission coeff -> MLF
+            ('NC',   'PS'),     # B-C leakage emission coeff -> PS (conflict with NS)
+            
+            # === Resistances ===
+            ('RB',   'RBV'),    # parasitic base resistance -> RBV (variable part)
+            ('RBM',  'RBC'),    # minimum intrinsic base resistance -> RBC (constant part)
+            ('RBI',  'SPECIAL_RBI'), # distribute to RBV + RBC
+            ('IRB',  (None, "Unsupported; no direct IRB equivalent")),
+            ('RE',   'RE'),     # emitter resistance
+            ('RC',   'RCC'),    # collector resistance -> RCC
+            
+            # === Capacitances & junction parameters ===
+            ('CJE',  'CJE'),    # B-E capacitance
+            ('VJE',  'VDE'),    # B-E potential -> VDE
+            ('MJE',  'PE'),     # B-E grading -> PE
+            ('CJC',  'CJC'),    # B-C capacitance
+            ('VJC',  'VDC'),    # B-C potential -> VDC
+            ('MJC',  'PC'),     # B-C grading -> PC
+            ('XCJC', 'XEXT'),   # fraction of CJC external
+            ('FC',   'MC'),     # forward-bias coeff -> MC
+            ('CJS',  'CJS'),    # substrate capacitance
+            ('VJS',  'VDS'),    # substrate potential -> VDS
+            ('MJS',  'PS'),     # substrate grading -> PS
+            ('ISS',  'ISS'),    # substrate saturation current
+            ('NS',   'PS'),     # substrate emission coeff -> PS (conflict with NC)
+            
+            # === Transit times ===
+            ('TF',   'TAUB'),   # forward transit time -> TAUB
+            ('TR',   'TAUR'),   # reverse transit time -> TAUR
+            ('ITF',  (None, "Unsupported; IK handles high-injection knee")),
+            ('VTF',  (None, "Unsupported; no VTF threshold in MEXTRAM")),
+            ('XTF',  (None, "Unsupported; no exponential TF bias in MEXTRAM")),
+            ('PTF',  (None, "Unsupported; no quadratic TF scaling in MEXTRAM")),
+            
+            # === Temperature coefficients ===
+            ('XTI',  (None, "XIS not supported in Xyce MEXTRAM")),
+            ('XTB',  (None, "TEF not supported in Xyce MEXTRAM")),
+            ('TREF', 'TREF'),   # reference temp
+            
+            # === Noise ===
+            ('KF',   'KF'),     # flicker noise coeff
+            ('AF',   'AF'),     # flicker noise exponent
+            
+            # === Unsupported / Spectre-only ===
+            ('EG',   (None, "Bandgap voltage - MEXTRAM uses fixed 1.11 eV Si")),
+            ('GAP1', (None, "Spectre-only parameter")),
+            ('GAP2', (None, "Spectre-only parameter")),
+            ('DCAP', (None, "Spectre overlap cap model - no equivalent")),
+            ('SUBS', (None, "Substrate connection parameter - not in MEXTRAM")),
+            ('IBC',  (None, "Base-collector leakage current - not directly supported")),
+            ('NKF',  (None, "High-injection parameter - not in MEXTRAM")),
+            
+            # === Temperature params (unsupported) ===
+            ('CTC',  None), ('CTE',  None), ('CTS',  None),
+            ('TLEV', None), ('TLEVC', None),
+            ('TVJC', None), ('TVJE', None), ('TVJS', None),
+            
+            # === Spectre temp coefficients (order 1 & 2) ===
+            ('TIS1', None), ('TISE1', None), ('TISC1', None), ('TNF1', None), ('TNR1', None),
+            ('TNE1', None), ('TNC1', None), ('TBF1', None), ('TBR1', None), ('TISS1', None),
+            ('TVAF1', None), ('TVAR1', None), ('TIKF1', None), ('TIKR1', None), ('TNS1', None),
+            ('TRB1', None), ('TRC1', None), ('TRE1', None), ('TIRB1', None), ('TRM1', None),
+            ('TMJC1', None), ('TMJE1', None), ('TMJS1', None), ('TTF1', None), ('TITF1', None), ('TTR1', None),
+            ('TIS2', None), ('TISE2', None), ('TISC2', None), ('TNF2', None), ('TNR2', None),
+            ('TNE2', None), ('TNC2', None), ('TBF2', None), ('TBR2', None), ('TISS2', None),
+            ('TVAF2', None), ('TVAR2', None), ('TIKF2', None), ('TIKR2', None), ('TNS2', None),
+            ('TRB2', None), ('TRC2', None), ('TRE2', None), ('TIRB2', None), ('TRM2', None),
+            ('TMJC2', None), ('TMJE2', None), ('TMJS2', None), ('TTF2', None), ('TITF2', None), ('TTR2', None),
+        ]
+        
+        # Convert to dictionary for efficient lookup
+        param_map = {}
+        for level1_name, action in level1_to_mextram_mapping:
+            param_map[level1_name.upper()] = action
+            
+        # Pre-scan params to handle conflicts/merges (IK, NF, RBI)
+        params_dict = {p.name.name.upper(): p for p in params}
+        
+        # Special handling values
+        ikf_val = params_dict.get('IKF')
+        ikr_val = params_dict.get('IKR')
+        nf_val = params_dict.get('NF')
+        rbi_val = params_dict.get('RBI')
+        ns_val = params_dict.get('NS')
+        nc_val = params_dict.get('NC')
+        
+        mapped_params = [] # List of (ParamDecl, comment, commented_out)
+        processed_names = set()
+        
+        # Helper to add param if not already added
+        def add_param(name, default, distr=None, comment=None, commented_out=False):
+            if name.upper() not in processed_names:
+                mapped_params.append((
+                    ParamDecl(name=Ident(name), default=default, distr=distr),
+                    comment,
+                    commented_out
+                ))
+                processed_names.add(name.upper())
+        
+        # 1. Handle SPECIAL_IK (IKF/IKR merge)
+        if ikf_val or ikr_val:
+            # If both present, use average (simple heuristic) or prefer IKF
+            val_to_use = None
+            src_name = ""
+            if ikf_val and ikr_val:
+                val_to_use = ikf_val.default
+                src_name = "IKF/IKR"
+            elif ikf_val:
+                val_to_use = ikf_val.default
+                src_name = "IKF"
+            elif ikr_val:
+                val_to_use = ikr_val.default
+                src_name = "IKR"
+            
+            if val_to_use:
+                add_param('IK', val_to_use, comment=f"{src_name} -> IK (lvl 1 -> lvl 504)")
+                
+        # 2. Handle SPECIAL_NF (NF -> PE + MLF)
+        if nf_val:
+            # Check value if possible
+            nf_num = None
+            if isinstance(nf_val.default, (Int, Float)):
+                nf_num = float(nf_val.default.val) if hasattr(nf_val.default, 'val') else float(nf_val.default)
+            elif isinstance(nf_val.default, MetricNum):
+                nf_num = float(nf_val.default.val)
+                
+            # Always map to MLF
+            add_param('MLF', nf_val.default, comment="NF -> MLF (lvl 1 -> lvl 504)")
+            
+            # Map to PE only if < 0.5 (approximate grading)
+            if nf_num is not None and nf_num < 0.5:
+                add_param('PE', nf_val.default, comment="NF -> PE (lvl 1 -> lvl 504, NF < 0.5)")
+                
+        # 3. Handle SPECIAL_RBI (RBI -> RBV + RBC)
+        if rbi_val:
+            # Set RBV = RBI, RBC = 0 (or leave RBC if defined elsewhere)
+            add_param('RBV', rbi_val.default, comment="RBI -> RBV (lvl 1 -> lvl 504)")
+            
+        # 4. Handle NS vs NC for PS (conflict)
+        if ns_val or nc_val:
+            # Prefer NS for PS if both present
+            val_to_use = ns_val.default if ns_val else nc_val.default
+            src_name = "NS" if ns_val else "NC"
+            add_param('PS', val_to_use, comment=f"{src_name} -> PS (lvl 1 -> lvl 504)")
+
+        # Process all parameters
+        for param in params:
+            name_upper = param.name.name.upper()
+            
+            # Skip if special handled and consumed
+            if name_upper in ('IKF', 'IKR', 'NF', 'RBI', 'NS', 'NC'):
+                # These are now effectively "commented out" in the new scheme by not being added directly?
+                # No, we want to keep them in the list but commented out if they weren't mapped?
+                # Actually, the SPECIAL handlers added the new parameters. 
+                # We should perhaps add the original ones as commented out?
+                # For now, let's assume consumed means replaced.
+                continue
+                
+            if name_upper in param_map:
+                action = param_map[name_upper]
+                
+                if action is None:
+                    # Drop (comment out)
+                    mapped_params.append((param, "Dropped: No MEXTRAM equivalent", True))
+                    continue
+                    
+                if isinstance(action, tuple):
+                    new_name, warning_msg = action
+                    if new_name is None:
+                        # Comment out with custom message
+                        mapped_params.append((param, f"Dropped: {warning_msg}", True))
+                        continue
+                    else:
+                        # Map with warning/comment
+                        add_param(new_name, param.default, param.distr, comment=f"{param.name.name} -> {new_name} (lvl 1 -> lvl 504). {warning_msg}")
+                        
+                elif isinstance(action, str):
+                    if action.startswith('SPECIAL_'):
+                        continue # Already handled
+                    new_name = action
+                    
+                    # Suppress comment if rename is only capitalization change
+                    comment = f"{param.name.name} -> {new_name} (lvl 1 -> lvl 504)"
+                    if param.name.name.lower() == new_name.lower():
+                        comment = None
+                        
+                    add_param(new_name, param.default, param.distr, comment=comment)
+                else:
+                    # Fallback
+                    mapped_params.append((param, "Dropped: Unknown mapping action", True))
+            else:
+                # Not in mapping, keep as-is
+                add_param(param.name.name, param.default, param.distr)
+        
+        return mapped_params
+
+    def _get_param_name(self, item: Union[ParamDecl, Tuple[ParamDecl, Optional[str], bool]]) -> str:
+        """Helper to get param name safely whether it's a ParamDecl or (ParamDecl, ...) tuple."""
+        if isinstance(item, tuple):
+            return item[0].name.name
+        return item.name.name
+        
+    def _get_param_default(self, item: Union[ParamDecl, Tuple[ParamDecl, Optional[str], bool]]) -> Optional[Expr]:
+        """Helper to get param default value safely."""
+        if isinstance(item, tuple):
+            return item[0].default
+        return item.default
+
     def write_model_def(self, model: ModelDef) -> None:
         """Write a model definition in Xyce format, handling BSIM4 conversions."""
+        # Helper to get param name safely whether it's a ParamDecl or (ParamDecl, ...) tuple
+        def get_param_name(item):
+            if isinstance(item, tuple):
+                return item[0].name.name
+            return item.name.name
+            
+        # Helper to get param default value safely
+        def get_param_default(item):
+            if isinstance(item, tuple):
+                return item[0].default
+            return item.default
+
         # Add blank line before model if last entry was an instance
         if self._last_entry_was_instance:
             self.write("\n")
@@ -1101,6 +1356,60 @@ class XyceNetlister(SpiceNetlister):
         # Use local variable for params to avoid mutating the model object
         params_to_write = list(model.params)  # Create a copy
         
+        # Check for model level mapping (specific model name or device type)
+        level_mapping_applied = False
+        output_level = None
+        if self._model_level_mapping:
+            model_name_lower = model.name.name.lower()
+            mtype_lower = mtype.lower()
+            
+            # First check for specific model name mapping, then device type mapping
+            mapping_dict = None
+            if model_name_lower in self._model_level_mapping:
+                mapping_dict = self._model_level_mapping[model_name_lower]
+            elif mtype_lower in self._model_level_mapping:
+                mapping_dict = self._model_level_mapping[mtype_lower]
+            
+            if mapping_dict:
+                # Extract current level (default to 1 if not specified)
+                current_level = 1
+                has_level = False
+                for p in params_to_write:
+                    if p.name.name.lower() == "level":
+                        has_level = True
+                        if isinstance(p.default, (Int, Float)):
+                            current_level = int(float(p.default.val) if hasattr(p.default, 'val') else float(p.default))
+                        elif isinstance(p.default, MetricNum):
+                            current_level = int(float(p.default.val))
+                        break
+                
+                # Check if current level has a mapping
+                if current_level in mapping_dict:
+                    output_level = mapping_dict[current_level]
+                    level_mapping_applied = True
+                    
+                    # Apply parameter mapping based on device type and level transition
+                    if mtype_lower in ("npn", "pnp") and current_level == 1 and output_level == 504:
+                        # Map level 1 BJT parameters to MEXTRAM (level 504)
+                        params_to_write = self._map_bjt_level1_to_mextram_params(params_to_write)
+                    
+                    # Update or add level parameter
+                    if has_level:
+                        # Replace existing level parameter
+                        for i, p in enumerate(params_to_write):
+                            if self._get_param_name(p).lower() == "level":
+                                new_level_param = ParamDecl(name=Ident("level"), default=Int(output_level), distr=None)
+                                if isinstance(p, tuple):
+                                    # Preserve comment if present, but ensure not commented out
+                                    params_to_write[i] = (new_level_param, p[1], False)
+                                else:
+                                    params_to_write[i] = new_level_param
+                                break
+                    else:
+                        # Add level parameter at the beginning
+                        level_param = ParamDecl(name=Ident("level"), default=Int(output_level), distr=None)
+                        params_to_write.insert(0, level_param)
+        
         # Handle BSIM4: replace with pmos/nmos, add level, map deltox to dtox
         if mtype == "bsim4":
             # Determine pmos/nmos from type parameter
@@ -1114,14 +1423,16 @@ class XyceNetlister(SpiceNetlister):
                 mtype = "nmos"
             
             # Check if level parameter already exists
-            has_level = any(p.name.name == "level" for p in params_to_write)
+            has_level = any(self._get_param_name(p) == "level" for p in params_to_write)
             
             # Map deltox to dtox instead of filtering
             mapped_params = []
             for p in params_to_write:
-                if p.name.name == "deltox":
+                if self._get_param_name(p) == "deltox":
                     # Create new ParamDecl with name "dtox" and same value
-                    mapped_params.append(ParamDecl(name=Ident("dtox"), default=p.default, distr=p.distr))
+                    p_default = self._get_param_default(p)
+                    p_distr = p[0].distr if isinstance(p, tuple) else p.distr
+                    mapped_params.append(ParamDecl(name=Ident("dtox"), default=p_default, distr=p_distr))
                 else:
                     mapped_params.append(p)
             params_to_write = mapped_params
@@ -1130,6 +1441,44 @@ class XyceNetlister(SpiceNetlister):
             if not has_level:
                 level_param = ParamDecl(name=Ident("level"), default=Float(54.0), distr=None)
                 params_to_write.insert(0, level_param)
+        
+        # Handle BJT models (NPN and PNP): add level=504 (Mextram) if not already present
+        # Only apply default behavior if level mapping was not already applied
+        bjt_uses_level_504 = False
+        if mtype in ("npn", "pnp") and not level_mapping_applied:
+            # Check if level parameter already exists
+            has_level = any(self._get_param_name(p) == "level" for p in params_to_write)
+            
+            # Add level=504 at the beginning if not already present
+            if not has_level:
+                level_param = ParamDecl(name=Ident("level"), default=Int(504), distr=None)
+                params_to_write.insert(0, level_param)
+                bjt_uses_level_504 = True
+            else:
+                # If level exists, check its value
+                for i, p in enumerate(params_to_write):
+                    if self._get_param_name(p) == "level":
+                        # Check if current level value is less than 504
+                        current_level = None
+                        default_val = self._get_param_default(p)
+                        if isinstance(default_val, (Int, Float)):
+                            current_level = float(default_val.val) if hasattr(default_val, 'val') else float(default_val)
+                        elif isinstance(default_val, MetricNum):
+                            current_level = float(default_val.val)
+                        
+                        if current_level is not None:
+                            if current_level < 504.0:
+                                # Update to level=504
+                                params_to_write[i] = ParamDecl(name=Ident("level"), default=Int(504), distr=None)
+                                bjt_uses_level_504 = True
+                            elif abs(current_level - 504.0) < 0.1:  # Close to 504
+                                # Already level 504, but ensure it's Int not Float
+                                params_to_write[i] = ParamDecl(name=Ident("level"), default=Int(504), distr=None)
+                                bjt_uses_level_504 = True
+                        break
+        elif mtype in ("npn", "pnp") and level_mapping_applied and output_level == 504:
+            # Level mapping was applied and resulted in level 504
+            bjt_uses_level_504 = True
         
         # Map to Xyce model type equivalent
         xyce_mtype = xyce_mtype_map.get(mtype, mtype)
@@ -1149,9 +1498,37 @@ class XyceNetlister(SpiceNetlister):
             self.write("\n")
         
         # Write parameters using the filtered list
-        for param in params_to_write:
-            self.write("+ ")
-            self.write_param_decl(param)
+        for item in params_to_write:
+            # Handle new format (tuple) from _map_bjt_level1_to_mextram_params
+            if isinstance(item, tuple) and len(item) == 3:
+                param, comment, commented_out = item
+            else:
+                # Standard ParamDecl from other paths
+                param = item
+                comment = None
+                commented_out = False
+            
+            if commented_out:
+                self.write("; ") # Comment out line with semicolon (preferred in Xyce)
+            else:
+                self.write("+ ")
+            
+            # For BJT models with level=504, uppercase parameter names
+            # Note: Parameters from _map_bjt_level1_to_mextram_params are already uppercase
+            if bjt_uses_level_504 and param.name.name != "level":
+                # Create a temporary param with uppercase name for writing
+                param_upper = ParamDecl(
+                    name=Ident(param.name.name.upper()),
+                    default=param.default,
+                    distr=param.distr
+                )
+                self.write_param_decl(param_upper)
+            else:
+                self.write_param_decl(param)
+                
+            if comment:
+                self.write(f" ; {comment}")
+                
             self.write("\n")
         
         self.write("\n")  # Ending blank-line
