@@ -2,6 +2,7 @@
 Xyce Dialect Netlister
 """
 
+import re
 import sys
 from enum import Enum
 from typing import IO, List, Dict, Optional, Tuple, Union
@@ -963,6 +964,152 @@ class XyceNetlister(SpiceNetlister):
 
         self.write(" }\n")
 
+    def _resolve_ref_to_definition(self, ref: Ref) -> Optional[Union[ModelDef, ModelFamily, SubcktDef]]:
+        """Resolve a reference to its definition (Model, Subckt, etc.)."""
+        from ..data import ModelDef, ModelFamily, SubcktDef, LibSectionDef
+
+        # Check if already resolved
+        if ref.resolved is not None:
+            if isinstance(ref.resolved, (ModelDef, ModelFamily, SubcktDef)):
+                return ref.resolved
+
+        target_name = ref.ident.name
+        found = None
+
+        def check_entry(entry) -> bool:
+            nonlocal found
+            if isinstance(entry, (ModelDef, ModelFamily, SubcktDef)):
+                if entry.name.name == target_name:
+                    found = entry
+                    return True
+            return False
+
+        # Search through all files in the program
+        for file in self.src.files:
+            for entry in file.contents:
+                if check_entry(entry):
+                    return found
+                if isinstance(entry, LibSectionDef):
+                    for sub in entry.entries:
+                        if check_entry(sub):
+                            return found
+                elif isinstance(entry, SubcktDef):
+                    # Subckts can contain models
+                    if check_entry(entry):
+                        return found
+                    for sub in entry.entries:
+                        if check_entry(sub):
+                            return found
+
+        return None
+
+    def _get_param_default_from_definition(self, definition: Union[ModelDef, ModelFamily, SubcktDef], param_name: str) -> Optional[Expr]:
+        """Get the default value for a parameter from a definition."""
+        from ..data import ModelDef, ModelFamily, SubcktDef
+        
+        # DEBUG: Uncomment to enable debug output
+        # def_type = type(definition).__name__
+        # def_name = definition.name.name if hasattr(definition, 'name') else 'unknown'
+        # print(f"[DEBUG] _get_param_default_from_definition: {def_name} (type: {def_type}), param={param_name}")
+        
+        params = []
+        if isinstance(definition, (ModelDef, SubcktDef)):
+            params = definition.params
+        elif isinstance(definition, ModelFamily):
+            # Check all variants, not just the first
+            for variant in definition.variants:
+                for p in variant.params:
+                    if p.name.name == param_name:
+                        return p.default
+            return None
+        
+        for p in params:
+            if p.name.name == param_name:
+                # DEBUG: Uncomment to enable debug output
+                # print(f"[DEBUG]   Found param {param_name}: default={p.default}")
+                # if p.default is not None:
+                #     is_numeric = self._is_number(p.default)
+                #     print(f"[DEBUG]     Default is numeric: {is_numeric}")
+                return p.default
+        
+        # DEBUG: Uncomment to enable debug output
+        # print(f"[DEBUG]   Param {param_name} not found in definition")
+        return None
+
+    def _is_number(self, val: Expr) -> bool:
+        """Check if an expression is a numeric literal."""
+        from ..data import Int, Float, MetricNum
+        return isinstance(val, (Int, Float, MetricNum))
+
+    def _get_scale_factor(self) -> float:
+        """Get the scale factor from Options in the program.
+        
+        Returns the scale factor as a float (e.g., 1e-6 for '1.0u').
+        Defaults to 1e-6 (microns) if not found.
+        """
+        from ..data import Options, MetricNum, Float, Int
+
+        # Metric suffix to multiplier mapping
+        suffix_map = {
+            'T': 1e12, 'G': 1e9, 'MEG': 1e6, 'X': 1e6, 'K': 1e3,
+            'M': 1e-3, 'MIL': 2.54e-5, 'U': 1e-6, 'u': 1e-6,
+            'N': 1e-9, 'n': 1e-9, 'P': 1e-12, 'p': 1e-12,
+            'F': 1e-15, 'f': 1e-15, 'A': 1e-18, 'a': 1e-18
+        }
+
+        # Search through all files for Options entries
+        for file in self.src.files:
+            for entry in file.contents:
+                if isinstance(entry, Options):
+                    for option in entry.vals:
+                        if option.name.name.lower() == "scale":
+                            scale_val = option.val
+                            if isinstance(scale_val, MetricNum):
+                                # Parse metric suffix (e.g., "1.0u" -> 1e-6)
+                                val_str = scale_val.val
+                                match = re.match(r'([\d.]+)([a-zA-Z]+)?', val_str)
+                                if match:
+                                    num = float(match.group(1))
+                                    suffix = match.group(2) or ''
+                                    multiplier = suffix_map.get(suffix.upper(), 1.0)
+                                    return num * multiplier
+                                return float(val_str) if val_str else 1e-6
+                            elif isinstance(scale_val, (Float, Int)):
+                                return float(scale_val.val) if hasattr(scale_val, 'val') else float(scale_val)
+
+        # Default to microns (1e-6) if scale not found
+        return 1e-6
+
+    def _find_param_default_from_usage(self, param_name: str, subckt: SubcktDef) -> Optional[Expr]:
+        """Try to find a default value for a parameter by looking at how it's used in the subcircuit."""
+        from ..data import Instance, Ref
+        
+        # DEBUG: Uncomment to enable debug output
+        # print(f"[DEBUG] _find_param_default_from_usage: subckt={subckt.name.name}, param={param_name}")
+        
+        for entry in subckt.entries:
+            if isinstance(entry, Instance):
+                # Check if this instance uses the parameter
+                target_param_name = None
+                if entry.params:
+                    for pval in entry.params:
+                        # Check if value is a reference to our param_name
+                        if isinstance(pval.val, Ref) and pval.val.ident.name == param_name:
+                             target_param_name = pval.name.name
+                             break
+                
+                if target_param_name:
+                    # Found usage. Now resolve model.
+                    model = self._resolve_ref_to_definition(entry.module)
+                    if model:
+                        # Look for default in model
+                        default = self._get_param_default_from_definition(model, target_param_name)
+                        if default and self._is_number(default):
+                            return default
+        # DEBUG: Uncomment to enable debug output
+        # print(f"[DEBUG]   No default recovered for param {param_name}")
+        return None
+
     def write_param_decl(self, param: ParamDecl) -> str:
         """Format a parameter declaration, with special handling for param functions in Xyce."""
         if param.distr is not None:
@@ -999,10 +1146,35 @@ class XyceNetlister(SpiceNetlister):
 
         # Normal parameter declaration
         if param.default is None:
-            msg = f"Required (non-default) parameter {param.name} is not supported by {self.__class__.__name__}. "
-            msg += "Setting to maximum floating-point value {sys.float_info.max}, which almost certainly will not work if instantiated."
-            warn(msg)
-            default = str(sys.float_info.max)
+            # Try to recover default from usage in current subcircuit
+            recovered_default = None
+            if getattr(self, '_current_subckt', None):
+                recovered_default = self._find_param_default_from_usage(param.name.name, self._current_subckt)
+
+            if recovered_default:
+                default = self.format_expr(recovered_default)
+            else:
+                # Safety net: Use common defaults for geometric parameters
+                # Adjust based on scale factor (defaults assume microns, i.e., scale=1e-6)
+                scale_factor = self._get_scale_factor()
+                # Default values in microns: l=1u, w=1u, perim=4u, area=1u^2
+                # Convert to the actual scale units
+                micron_to_scale = 1e-6 / scale_factor
+
+                common_defaults = {
+                    'l': Float(1.0 * micron_to_scale),  # length
+                    'w': Float(1.0 * micron_to_scale),  # width
+                    'perim': Float(4.0 * micron_to_scale),  # perimeter (typical for square)
+                    'area': Float(1.0 * micron_to_scale * micron_to_scale),  # area (scale^2)
+                }
+
+                if param.name.name.lower() in common_defaults:
+                    default = self.format_expr(common_defaults[param.name.name.lower()])
+                else:
+                    msg = f"Required (non-default) parameter {param.name} is not supported by {self.__class__.__name__}. "
+                    msg += f"Setting to maximum floating-point value {sys.float_info.max}, which almost certainly will not work if instantiated."
+                    warn(msg)
+                    default = str(sys.float_info.max)
         else:
             default = self.format_expr(param.default)
 

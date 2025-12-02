@@ -873,3 +873,85 @@ def test_xyce_bsim4_dtox_move():
             model_params += line
             
     assert "dtox=" in model_params
+
+
+def test_xyce_param_default_recovery_from_model():
+    """
+    Test that subcircuit parameters without defaults can recover defaults from model usage.
+    This tests the fix for parameters like w, l, area, perim that are required but may
+    have defaults in the model definition.
+    """
+    # Create a model with default parameter values
+    model = ModelDef(
+        name=Ident("test_model"),
+        mtype=Ident("nmos"),
+        args=[],
+        params=[
+            ParamDecl(name=Ident("w"), default=Float(1e-6), distr=None),
+            ParamDecl(name=Ident("l"), default=Float(0.5e-6), distr=None),
+            ParamDecl(name=Ident("area"), default=Float(1e-12), distr=None),
+            ParamDecl(name=Ident("perim"), default=Float(2e-6), distr=None),
+        ]
+    )
+    
+    # Create an instance using that model
+    instance = Instance(
+        name=Ident("M1"),
+        module=Ref(ident=Ident("test_model")),
+        conns=[Ident("d"), Ident("g"), Ident("s"), Ident("b")],
+        params=[
+            # Pass parameters by reference to subcircuit params
+            ParamVal(name=Ident("w"), val=Ref(ident=Ident("w"))),
+            ParamVal(name=Ident("l"), val=Ref(ident=Ident("l"))),
+            ParamVal(name=Ident("area"), val=Ref(ident=Ident("area"))),
+            ParamVal(name=Ident("perim"), val=Ref(ident=Ident("perim"))),
+        ]
+    )
+    
+    # Create a subcircuit that uses the model but doesn't have defaults for w, l, area, perim
+    subckt = SubcktDef(
+        name=Ident("test_subckt"),
+        ports=[Ident("d"), Ident("g"), Ident("s"), Ident("b")],
+        params=[
+            # These params have no defaults - should recover from model
+            ParamDecl(name=Ident("w"), default=None, distr=None),
+            ParamDecl(name=Ident("l"), default=None, distr=None),
+            ParamDecl(name=Ident("area"), default=None, distr=None),
+            ParamDecl(name=Ident("perim"), default=None, distr=None),
+        ],
+        entries=[model, instance]
+    )
+    
+    program = Program(files=[
+        SourceFile(path="test.cir", contents=[subckt])
+    ])
+    
+    output = StringIO()
+    write_netlist(src=program, dest=output, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output_str = output.getvalue()
+    
+    # Verify that the subcircuit parameters have recovered defaults (not max float)
+    # Check the PARAMS line in the subcircuit definition
+    lines = output_str.split('\n')
+    params_line = None
+    for i, line in enumerate(lines):
+        if line.startswith(".SUBCKT test_subckt"):
+            # Look for the PARAMS line (should be next continuation line)
+            for j in range(i+1, min(i+5, len(lines))):
+                if "PARAMS:" in lines[j]:
+                    params_line = lines[j]
+                    break
+            break
+    
+    assert params_line is not None, "PARAMS line not found in subcircuit definition"
+    
+    # Verify that defaults were recovered (should have numeric values, not max float)
+    # The recovered defaults should be: w=1e-6, l=0.5e-6, area=1e-12, perim=2e-6
+    assert "w=1e-06" in params_line or "w=1.0e-06" in params_line or "w=1e-6" in params_line
+    assert "l=5e-07" in params_line or "l=0.5e-06" in params_line or "l=5.0e-07" in params_line
+    assert "area=1e-12" in params_line or "area=1.0e-12" in params_line
+    assert "perim=2e-06" in params_line or "perim=2.0e-06" in params_line or "perim=2e-6" in params_line
+    
+    # Verify that we did NOT use max float (which would be something like 1.7976931348623157e+308)
+    assert "1.7976931348623157e+308" not in params_line
+    assert "1.7976931348623157e+308" not in output_str
