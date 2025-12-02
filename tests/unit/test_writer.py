@@ -210,9 +210,9 @@ def test_apply_statistics_vary_mismatch():
     
     # Create a program with multiple parameters and statistics blocks
     params = [
-        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None),
-        ParamDecl(name=Ident("length"), default=Float(0.5), distr=None),
-        ParamDecl(name=Ident("tox"), default=Float(2.0e-9), distr=None),
+        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None, comment=None),
+        ParamDecl(name=Ident("length"), default=Float(0.5), distr=None, comment=None),
+        ParamDecl(name=Ident("tox"), default=Float(2.0e-9), distr=None, comment=None),
     ]
     
     stats = StatisticsBlock(
@@ -281,11 +281,11 @@ def test_apply_statistics_vary_process():
     """Test process variations are applied to corresponding parameters."""
     
     params = [
-        ParamDecl(name=Ident("vth"), default=Float(0.4), distr=None),
-        ParamDecl(name=Ident("mobility"), default=Float(300.0), distr=None),
-        ParamDecl(name=Ident("junction_depth"), default=Float(0.1e-6), distr=None),
-        ParamDecl(name=Ident("alias_vth"), default=Ref(ident=Ident("vth")), distr=None),  # Alias for vth
-        ParamDecl(name=Ident("uses_alias"), default=Ref(ident=Ident("alias_vth")), distr=None),  # Uses the alias
+        ParamDecl(name=Ident("vth"), default=Float(0.4), distr=None, comment=None),
+        ParamDecl(name=Ident("mobility"), default=Float(300.0), distr=None, comment=None),
+        ParamDecl(name=Ident("junction_depth"), default=Float(0.1e-6), distr=None, comment=None),
+        ParamDecl(name=Ident("alias_vth"), default=Ref(ident=Ident("vth")), distr=None, comment=None),  # Alias for vth
+        ParamDecl(name=Ident("uses_alias"), default=Ref(ident=Ident("alias_vth")), distr=None, comment=None),  # Uses the alias
     ]
     
     stats = StatisticsBlock(
@@ -324,8 +324,8 @@ def test_apply_statistics_vary_no_match():
     """Test that variations are ignored if no corresponding parameter exists."""
     
     params = [
-        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None),
-        ParamDecl(name=Ident("length"), default=Float(0.5), distr=None),
+        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None, comment=None),
+        ParamDecl(name=Ident("length"), default=Float(0.5), distr=None, comment=None),
     ]
     
     stats = StatisticsBlock(
@@ -356,8 +356,8 @@ def test_apply_statistics_vary_spectre_no_xyce_transformations():
     """Test that Xyce-specific transformations are NOT applied when output format is Spectre."""
     
     params = [
-        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None),
-        ParamDecl(name=Ident("tox"), default=Float(2.0e-9), distr=None),
+        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None, comment=None),
+        ParamDecl(name=Ident("tox"), default=Float(2.0e-9), distr=None, comment=None),
     ]
     
     stats = StatisticsBlock(
@@ -395,7 +395,7 @@ def test_param_process_and_mismatch():
     """Test that parameters with both process and mismatch variations are handled correctly."""
     
     params = [
-        ParamDecl(name=Ident("vth0"), default=Ref(ident=Ident("vth0_nom")), distr=None),
+        ParamDecl(name=Ident("vth0"), default=Ref(ident=Ident("vth0_nom")), distr=None, comment=None),
     ]
     
     stats = StatisticsBlock(
@@ -436,7 +436,7 @@ def test_param_mismatch_and_corner():
     """Test that parameters with both process corner and mismatch variations are handled correctly."""
     
     params = [
-        ParamDecl(name=Ident("vth"), default=Float(0.4), distr=None),
+        ParamDecl(name=Ident("vth"), default=Float(0.4), distr=None, comment=None),
     ]
     
     stats = StatisticsBlock(
@@ -475,8 +475,8 @@ def test_param_mismatch_and_corner():
 def test_mismatch_parameter_reference_replacement():
     """Test that mismatch variations replace ALL parameter references and remove the declaration."""
 
-    mismatch_var_a_param = ParamDecl(name=Ident("mismatch_var_a"), default=Int(0), distr=None)
-    other_param = ParamDecl(name=Ident("other_param"), default=Float(1.0), distr=None)
+    mismatch_var_a_param = ParamDecl(name=Ident("mismatch_var_a"), default=Int(0), distr=None, comment=None)
+    other_param = ParamDecl(name=Ident("other_param"), default=Float(1.0), distr=None, comment=None)
     
     instance = Instance(
         name=Ident("X1"),
@@ -496,20 +496,18 @@ def test_mismatch_parameter_reference_replacement():
                 tp=BinaryOperator.ADD,
                 left=Ref(ident=Ident("mismatch_var_a")),  # Reference to mismatch_var_a in expression
                 right=Float(1.0)
-            ), distr=None),
+            ), distr=None, comment=None),
         ],
         entries=[]
     )
     
-    param_with_ref = ParamDecl(
-        name=Ident("param_ref"),
+    param_with_ref = ParamDecl(name=Ident("param_ref"),
         default=BinaryOp(
             tp=BinaryOperator.MUL,
             left=Ref(ident=Ident("mismatch_var_a")),  # Reference to mismatch_var_a
             right=Float(2.0)
         ),
-        distr=None
-    )
+        distr=None, comment=None)
     
     stats = StatisticsBlock(
         process=None,
@@ -549,12 +547,12 @@ def test_mismatch_parameter_reference_replacement():
 def test_parameter_replacement_coverage_and_verification():
     """Test that parameter replacement covers all entry types and verification catches unreplaced refs."""
     
-    params = [ParamDecl(name=Ident("test_param"), default=Float(1.0), distr=None)]
+    params = [ParamDecl(name=Ident("test_param"), default=Float(1.0), distr=None, comment=None)]
     model = ModelDef(name=Ident("test_model"), mtype=Ident("nmos"), args=[], params=[
-        ParamDecl(name=Ident("rsh"), default=Ref(ident=Ident("test_param")), distr=None)
+        ParamDecl(name=Ident("rsh"), default=Ref(ident=Ident("test_param")), distr=None, comment=None)
     ])
     lib_section = LibSectionDef(name=Ident("test_section"), entries=[
-        ParamDecls(params=[ParamDecl(name=Ident("lib_param"), default=Ref(ident=Ident("test_param")), distr=None)])
+        ParamDecls(params=[ParamDecl(name=Ident("lib_param"), default=Ref(ident=Ident("test_param")), distr=None, comment=None)], comment=None)
     ])
     library = Library(name=Ident("test_lib"), sections=[lib_section])
     
@@ -571,7 +569,7 @@ def test_parameter_replacement_coverage_and_verification():
 def test_process_variation_finds_param_in_library_section():
     """Test that process variations can find and apply to parameters in library sections."""
 
-    lib_param = ParamDecl(name=Ident("process_var_a"), default=Float(4.148e-09), distr=None)
+    lib_param = ParamDecl(name=Ident("process_var_a"), default=Float(4.148e-09), distr=None, comment=None)
     lib_section = LibSectionDef(
         name=Ident("fet_tt"),
         entries=[
@@ -579,7 +577,7 @@ def test_process_variation_finds_param_in_library_section():
         ]
     )
     
-    global_param = ParamDecl(name=Ident("other_param"), default=Float(1.0), distr=None)
+    global_param = ParamDecl(name=Ident("other_param"), default=Float(1.0), distr=None, comment=None)
     
     stats = StatisticsBlock(
         process=[
@@ -627,10 +625,10 @@ def test_spectre_statistics_param_generation():
     )
 
     param_decls = ParamDecls(params=[
-        ParamDecl(name=Ident("param_a"), default=Float(1.0), distr=None),
-        ParamDecl(name=Ident("param_b"), default=Float(2.0), distr=None),
-        ParamDecl(name=Ident("param_c"), default=Float(3.0), distr=None),
-        ParamDecl(name=Ident("param_d"), default=Float(4.0), distr=None),
+        ParamDecl(name=Ident("param_a"), default=Float(1.0), distr=None, comment=None),
+        ParamDecl(name=Ident("param_b"), default=Float(2.0), distr=None, comment=None),
+        ParamDecl(name=Ident("param_c"), default=Float(3.0), distr=None, comment=None),
+        ParamDecl(name=Ident("param_d"), default=Float(4.0), distr=None, comment=None),
     ])
 
     program = Program(files=[
@@ -719,14 +717,14 @@ def test_bsim4_model_translation():
     """Test that Spectre BSIM4 model cards get translated properly to Xyce format."""
     
     # Test 1: type={p} → pmos with level=54
-    pmos = ModelDef(name=Ident("pmos_model"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)])
+    pmos = ModelDef(name=Ident("pmos_model"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None, comment=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None, comment=None)], comment=None)
     output = StringIO()
     write_netlist(src=Program(files=[SourceFile(path="test.cir", contents=[pmos])]), dest=output, options=WriteOptions(fmt=NetlistDialects.XYCE))
     output_str = output.getvalue()
     assert ".model pmos_model pmos" in output_str and ("level=54.0" in output_str or "level=54" in output_str)
     
     # Test 4: deltox in model → mapped to dtox
-    with_deltox = ModelDef(name=Ident("model_with_deltox"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("n")), distr=None), ParamDecl(name=Ident("deltox"), default=Float(1e-9), distr=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)])
+    with_deltox = ModelDef(name=Ident("model_with_deltox"), mtype=Ident("bsim4"), args=[], params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("n")), distr=None, comment=None), ParamDecl(name=Ident("deltox"), default=Float(1e-9), distr=None, comment=None), ParamDecl(name=Ident("version"), default=Float(4.5), distr=None, comment=None)], comment=None)
     output4 = StringIO()
     write_netlist(src=Program(files=[SourceFile(path="test4.cir", contents=[with_deltox])]), dest=output4, options=WriteOptions(fmt=NetlistDialects.XYCE))
     output_str4 = output4.getvalue()
@@ -738,9 +736,9 @@ def test_bsim4_deltox_filtering_in_subckt():
     
     model_family = ModelFamily(name=Ident("test_model"), mtype=Ident("bsim4"), variants=[
         ModelVariant(model=Ident("test_model"), variant=Ident("1"), mtype=Ident("bsim4"), args=[], 
-                   params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None)]),
+                   params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None, comment=None)]),
         ModelVariant(model=Ident("test_model"), variant=Ident("2"), mtype=Ident("bsim4"), args=[], 
-                   params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None)])
+                   params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("p")), distr=None, comment=None)], comment=None)
     ])
     subckt = SubcktDef(name=Ident("test_pmos"), ports=[Ident("d"), Ident("g"), Ident("s"), Ident("b")], 
                       params=[], entries=[
@@ -773,8 +771,8 @@ def test_xyce_parameter_reference_braces():
         name=Ident("parent_subckt"),
         ports=[],
         params=[
-            ParamDecl(name=Ident("m"), default=Float(1.0), distr=None),
-            ParamDecl(name=Ident("l"), default=Float(1.0), distr=None)
+            ParamDecl(name=Ident("m"), default=Float(1.0), distr=None, comment=None),
+            ParamDecl(name=Ident("l"), default=Float(1.0), distr=None, comment=None)
         ],
         entries=[
             Instance(
@@ -814,7 +812,7 @@ def test_xyce_bsim4_dtox_move():
         name=Ident("bsim4_model_move"),
         mtype=Ident("bsim4"),
         args=[],
-        params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("n")), distr=None)]
+        params=[ParamDecl(name=Ident("type"), default=Ref(ident=Ident("n")), distr=None, comment=None)]
     )
     
     # Create an instance using that model with deltox parameter

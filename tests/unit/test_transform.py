@@ -20,9 +20,9 @@ def test_map_bsim4_params():
         mtype=Ident("bsim4"),
         args=[],
         params=[
-            ParamDecl(name=Ident("type"), default=Ref(ident=Ident("n")), distr=None),
-            ParamDecl(name=Ident("deltox"), default=Float(1e-9), distr=None),
-            ParamDecl(name=Ident("version"), default=Float(4.5), distr=None)
+            ParamDecl(comment=None, name=Ident("type"), default=Ref(ident=Ident("n")), distr=None),
+            ParamDecl(comment=None, name=Ident("deltox"), default=Float(1e-9), distr=None),
+            ParamDecl(comment=None, name=Ident("version"), default=Float(4.5), distr=None)
         ]
     )
     
@@ -32,7 +32,7 @@ def test_map_bsim4_params():
         mtype=Ident("other"),
         args=[],
         params=[
-            ParamDecl(name=Ident("deltox"), default=Float(1e-9), distr=None),
+            ParamDecl(comment=None, name=Ident("deltox"), default=Float(1e-9), distr=None),
         ]
     )
     

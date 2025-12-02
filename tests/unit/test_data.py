@@ -14,18 +14,16 @@ def test_version():
 
 def test_param_values():
     # Basic test to ensure ParamDecl can be instantiated with complex values
-    p = ParamDecl(Ident("a"), Float(5))
+    p = ParamDecl(Ident("a"), Float(5), comment=None)
     assert p.name.name == "a"
     assert p.default.val == 5.0
 
-    p = ParamDecl(
-        Ident("b"),
+    p = ParamDecl(Ident("b"),
         BinaryOp(
             BinaryOperator.ADD,
             Float(1e-3),
             BinaryOp(BinaryOperator.MUL, Float(2.0), Float(0.3)),
-        ),
-    )
+        ), comment=None)
     assert p.name.name == "b"
     assert isinstance(p.default, BinaryOp)
 

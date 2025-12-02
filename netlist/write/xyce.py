@@ -32,6 +32,7 @@ from ..data import (
     QuotedString,
     StatisticsBlock,
     NetlistDialects,
+    Comment,
 )
 from .base import Netlister, ErrorMode
 from .spice import SpiceNetlister, apply_statistics_variations, debug_find_all_param_refs, replace_param_refs_in_program, expr_references_param, count_param_refs_in_entry
@@ -217,10 +218,10 @@ class XyceNetlister(SpiceNetlister):
         for source_file in self.src.files:
             for entry in source_file.contents:
                 if self.file_type == "library":
-                    # Library files should ONLY contain LibSectionDef (no subcircuits, no loose parameters)
-                    if not isinstance(entry, LibSectionDef):
+                    # Library files should ONLY contain LibSectionDef and Comments (no subcircuits, no loose parameters)
+                    if not isinstance(entry, (LibSectionDef, Comment)):
                         raise ValueError(f"Library file contains non-library content: {type(entry).__name__}. "
-                                       "Library files should only contain library sections.")
+                                       "Library files should only contain library sections and comments.")
                 # For models files, allow anything (SubcktDef, ParamDecls, FunctionDef, FlatStatement, etc.)
                 # No validation needed for models files
 
@@ -1179,6 +1180,10 @@ class XyceNetlister(SpiceNetlister):
             default = self.format_expr(param.default)
 
         self.write(f"{param_name}={default}")
+        
+        # Write inline comment if present
+        if param.comment:
+            self.write(f" ; {param.comment}")
 
     def _is_bsim4_model_ref(self, ref: Ref) -> bool:
         """Check if a Ref points to a BSIM4 model definition.

@@ -100,10 +100,23 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
         Dispatches to type-specific parsers based on prioritized set of matching rules.
         Returns `None` at end."""
 
-        self.eat_blanks()
+        # Collect any comments before this statement
+        before_comments = self.collect_before_comments()
+        
+        # Track blank lines before eating them
+        blank_count = self.eat_blanks()
+        # Store blank line count for later use (we'll add BlankLine entries in FileParser)
+        if not hasattr(self, '_blank_lines_before_statement'):
+            self._blank_lines_before_statement = []
+        self._blank_lines_before_statement.append(blank_count)
+        
         pk = self.peek()
 
         if pk is None:  # End-of-input case
+            # If we had before comments, return them as standalone comments
+            if before_comments:
+                # Store for later association - for now, we'll handle in FileParser
+                pass
             return None
 
         if self.match(Tokens.DOT):
@@ -115,7 +128,20 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
         if pk.tp not in rules:
             return self.fail(f"Unexpected token to begin statement: {pk}")
         type_parser = rules[pk.tp]
-        return type_parser(self)
+        stmt = type_parser(self)
+        
+        # Collect comments after the statement
+        after_comments = self.collect_after_comments()
+        
+        # Store comments for later association
+        # We'll attach them in FileParser since we need to handle standalone vs associated
+        if before_comments or after_comments:
+            # Store in a temporary location - we'll handle this in FileParser
+            if not hasattr(self, '_pending_comments'):
+                self._pending_comments = []
+            self._pending_comments.append((stmt, before_comments, after_comments))
+        
+        return stmt
 
     def parse_named(self):
         """Parse an identifier-named statement.

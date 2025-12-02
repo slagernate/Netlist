@@ -397,6 +397,7 @@ class ParamDecl:
     name: Ident
     default: Optional["Expr"]
     distr: Optional[str] = None
+    comment: Optional[str] = None  # Inline comment (// style) on the same line as the parameter
 
 
 @datatype
@@ -655,10 +656,29 @@ class Unknown:
 
 
 @datatype
+class Comment:
+    """Comment Statement
+    
+    Represents a comment in the netlist, with position information
+    indicating whether it's inline, before, or after a statement.
+    """
+    text: str  # Comment text (without comment markers)
+    position: str  # "inline", "before", "after", or "standalone"
+    # Optional: reference to the statement this comment is associated with
+    associated_stmt: Optional["Statement"] = None
+
+
+@datatype
 class DialectChange:
     """Netlist Dialect Changes, e.g. `simulator lang=xyz`"""
 
     dialect: str
+
+
+@datatype
+class BlankLine:
+    """Represents a blank/empty line in the netlist, to preserve formatting."""
+    pass
 
 
 # Union of "flat" statements lacking (substantial) hierarchy
@@ -672,6 +692,8 @@ FlatStatement = Union[
     DialectChange,
     "FunctionDef",
     Unknown,
+    Comment,
+    BlankLine,
     Options,
     Include,
     AhdlInclude,
@@ -695,7 +717,7 @@ Statement = Union[FlatStatement, DelimStatement]
 
 # Entries - the union of types which serve as "high-level" AST nodes,
 # i.e. those which can be the direct children of a `SourceFile`.
-Entry = Union[FlatStatement, SubcktDef, Library, LibSectionDef, End]
+Entry = Union[FlatStatement, SubcktDef, Library, LibSectionDef, End, Comment, BlankLine]
 
 
 @datatype

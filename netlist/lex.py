@@ -4,7 +4,7 @@
 
 # Std-Lib Imports
 import re
-from typing import Iterable, Optional
+from typing import Iterable, Optional, List, Tuple
 
 # PyPi Imports
 from pydantic.dataclasses import dataclass
@@ -138,6 +138,10 @@ class Lexer:
         self.lexed_nonwhite_on_this_line = False
         self.toks = iter(pat.scanner(self.line).match, None)
         self.recent_lines = []
+        # Track comments found on the current line
+        self.current_line_comments: List[Tuple[str, str]] = []  # (comment_text, comment_type)
+        # Persistent queue of comments that haven't been retrieved yet
+        self.comment_queue: List[Tuple[str, str, int]] = []  # (comment_text, comment_type, line_num)
 
     def nxt(self) -> Optional[Token]:
         """Get our next Token, pulling a new line if necessary."""
@@ -165,9 +169,61 @@ class Lexer:
         while token and token.tp == Tokens.WHITE:
             token = self.nxt()
         if token and self.parser.is_comment(token):
+            # Determine comment type
+            if token.tp == Tokens.DUBSLASH:
+                comment_type = "//"
+            elif token.tp == Tokens.DOLLAR:
+                comment_type = "$"
+            elif token.tp == Tokens.STAR:
+                comment_type = "*"
+            else:
+                comment_type = "*"  # Default fallback
+            
+            # Collect comment text - start with the comment marker
+            comment_text = token.val
+            token = self.nxt()
+            # Collect all tokens until newline
             while token and token.tp != Tokens.NEWLINE:
+                comment_text += token.val
                 token = self.nxt()
+            
+            # Store the comment (strip the comment markers and whitespace)
+            if comment_text:
+                # Remove leading comment markers and any whitespace
+                cleaned_text = comment_text
+                if comment_type == "//":
+                    cleaned_text = comment_text[2:].strip() if len(comment_text) >= 2 else ""
+                elif comment_type == "$":
+                    cleaned_text = comment_text[1:].strip() if len(comment_text) >= 1 else ""
+                elif comment_type == "*":
+                    cleaned_text = comment_text[1:].strip() if len(comment_text) >= 1 else ""
+                
+                if cleaned_text:  # Only store non-empty comments
+                    self.current_line_comments.append((cleaned_text, comment_type))
+                    # Also add to persistent queue
+                    self.comment_queue.append((cleaned_text, comment_type, self.line_num))
         return token
+    
+    def get_line_comments(self) -> List[Tuple[str, str]]:
+        """Get comments found on the current line and clear the list.
+        Returns list of (comment_text, comment_type) tuples."""
+        comments = self.current_line_comments.copy()
+        self.current_line_comments.clear()
+        return comments
+    
+    def get_queued_comments(self, up_to_line: Optional[int] = None) -> List[Tuple[str, str, int]]:
+        """Get comments from the queue, optionally up to a specific line number.
+        Comments are removed from the queue after retrieval."""
+        if up_to_line is None:
+            # Return all queued comments
+            comments = self.comment_queue.copy()
+            self.comment_queue.clear()
+            return comments
+        else:
+            # Return comments up to and including the specified line
+            comments = [c for c in self.comment_queue if c[2] <= up_to_line]
+            self.comment_queue = [c for c in self.comment_queue if c[2] > up_to_line]
+            return comments
 
     def lex(self):
         """Create an iterator over pattern-matches"""
@@ -180,6 +236,9 @@ class Lexer:
             # Handle continuation-lines
             if token and token.tp == Tokens.NEWLINE:
                 self.lexed_nonwhite_on_this_line = False
+                # Comments have been captured to current_line_comments and comment_queue
+                # Clear current_line_comments for next line, but keep in queue
+                self.current_line_comments.clear()
 
                 # Loop until a non-blank-line, non-comment, non-continuation token
                 token = self.eat_idle(self.nxt())

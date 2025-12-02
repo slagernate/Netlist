@@ -155,7 +155,14 @@ class Parser:
         self.done.add(p)
 
         # Filter out a few things
-        stmts = [e for e in stmts if not isinstance(e, DialectChange)]
+        # Before filtering DialectChange, preserve any comments that were associated with them
+        # by ensuring they're already in the stmts list as separate entries
+        # (they should already be there from the parsing logic, but we'll verify)
+        filtered_stmts = []
+        for e in stmts:
+            if not isinstance(e, DialectChange):
+                filtered_stmts.append(e)
+        stmts = filtered_stmts
 
         # Recursively descend into files it depends upon
         if self.options.recurse:
@@ -246,11 +253,25 @@ class FileParser:
 
         stmts = []
         s = True
+        pending_comments = []  # Track comments that need to be associated
+        
         while s:  # Main loop over statements
             si = SourceInfo(
                 line=self.dialect_parser.line_num,
                 dialect=self.dialect_parser.enum,
             )
+            
+            # Check for blank lines before this statement
+            # The parser tracks blank lines consumed by eat_blanks()
+            if hasattr(self.dialect_parser, '_blank_lines_before_statement') and self.dialect_parser._blank_lines_before_statement:
+                blank_count = self.dialect_parser._blank_lines_before_statement.pop(0)
+                if blank_count > 0:
+                    # Add BlankLine entries for each blank line
+                    # BlankLine is already imported via "from .data import *"
+                    for i in range(blank_count):
+                        blank_line = BlankLine()
+                        blank_line.source_info = SourceInfo(line=si.line - blank_count + i, dialect=si.dialect)
+                        stmts.append(blank_line)
 
             try:  # Catch errors in primary parsing routines
                 s = self.dialect_parser.parse_statement()
@@ -265,9 +286,93 @@ class FileParser:
 
             if s is not None:  # None-value indicates EOF
                 s.source_info = si
+                
+                # Check for pending comments from parser
+                if hasattr(self.dialect_parser, '_pending_comments') and self.dialect_parser._pending_comments:
+                    # Find comments for this statement
+                    for i, (stmt, before_comments, after_comments) in enumerate(self.dialect_parser._pending_comments):
+                        if stmt is s:
+                            # Add before comments as separate entries (they'll be written before the statement)
+                            for j, comment in enumerate(before_comments):
+                                comment.source_info = SourceInfo(line=si.line - len(before_comments) + j, dialect=si.dialect)
+                                stmts.append(comment)
+                            # Store after comments to add after the statement
+                            if after_comments:
+                                pending_comments.append((s, after_comments))
+                            # Remove from pending
+                            self.dialect_parser._pending_comments.pop(i)
+                            break
+                
                 stmts.append(s)
+                
+                # Add any after comments for this statement
+                for stmt, after_comments in pending_comments[:]:
+                    if stmt is s:  # Comments for current statement
+                        for comment in after_comments:
+                            comment.source_info = si
+                            stmts.append(comment)
+                        pending_comments.remove((stmt, after_comments))
 
-        return stmts
+        # Add any remaining standalone comments from the comment queue
+        # But first, collect all comments that were already added as "before" or "after" comments
+        # to avoid duplicates. Use text content as the key since line numbers might differ
+        # due to how comments are associated with statements
+        already_added_comment_texts = set()
+        for stmt in stmts:
+            if isinstance(stmt, Comment):
+                # Use just the text as the key to catch duplicates even if line numbers differ
+                already_added_comment_texts.add(stmt.text)
+        
+        remaining_comments = self.dialect_parser.lex.get_queued_comments()
+        for comment_text, comment_type, line_num in remaining_comments:
+            # Skip if this comment text was already added (regardless of line number)
+            if comment_text not in already_added_comment_texts:
+                comment = Comment(text=comment_text, position="standalone")
+                comment.source_info = SourceInfo(line=line_num, dialect=self.dialect_parser.enum)
+                stmts.append(comment)
+                already_added_comment_texts.add(comment_text)  # Mark as added
+
+        # Deduplicate comments in stmts list (remove consecutive duplicate comment sequences)
+        # This handles cases where the same comments were collected as "before" for multiple statements
+        # We look for sequences of consecutive comments and remove duplicate sequences
+        deduplicated_stmts = []
+        i = 0
+        while i < len(stmts):
+            stmt = stmts[i]
+            if isinstance(stmt, Comment):
+                # Check if this starts a sequence of comments that we've seen before
+                # Look ahead to find the end of this comment sequence
+                comment_seq = []
+                j = i
+                while j < len(stmts) and isinstance(stmts[j], Comment):
+                    comment_seq.append(stmts[j].text)
+                    j += 1
+                
+                # Check if we've seen this exact sequence before (as consecutive comments)
+                if len(comment_seq) > 0:
+                    # Check previous entries for the same sequence
+                    found_duplicate = False
+                    if len(deduplicated_stmts) >= len(comment_seq):
+                        # Check if the last len(comment_seq) entries are comments matching this sequence
+                        prev_seq = [s.text for s in deduplicated_stmts[-len(comment_seq):] 
+                                   if isinstance(s, Comment)]
+                        if len(prev_seq) == len(comment_seq) and prev_seq == comment_seq:
+                            found_duplicate = True
+                    
+                    if found_duplicate:
+                        # Skip this duplicate sequence
+                        i = j
+                        continue
+                
+                # Add this comment (or sequence)
+                deduplicated_stmts.append(stmt)
+                i += 1
+            else:
+                # Always add non-comment statements
+                deduplicated_stmts.append(stmt)
+                i += 1
+
+        return deduplicated_stmts
 
     def parse(self, path: Path) -> Tuple[Path, List[Statement]]:
         """Parse the netlist `SourceFile` at `path`."""

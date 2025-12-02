@@ -59,6 +59,7 @@ from ..data import (
     ModelVariant,
     ModelDef,
     LibSectionDef,
+    Comment,
     Include,
     UseLibSection,
     Entry,
@@ -336,6 +337,10 @@ class SpiceNetlister(Netlister):
             default = self.format_expr(param.default)
 
         self.write(f"{self.format_ident(param.name)}={default}")
+        
+        # Write inline comment if present
+        if param.comment:
+            self.write(f" ; {param.comment}")
 
     def write_param_val(self, param: ParamVal) -> None:
         """Write a parameter value"""
@@ -381,8 +386,35 @@ class SpiceNetlister(Netlister):
         for p in params.params:
             self.write(".param ")
             self.write_param_decl(p)
+            # Note: write_param_decl already writes inline comments if present
             self.write("\n")
-        self.write("\n")
+        # Don't add extra newline - let BlankLine entries handle spacing
+        # Note: Comments that appear within parameter blocks are handled
+        # by the netlist() method in base.py, which writes entries in order
+    
+    def write_param_decls_with_inline_comments(self, params: ParamDecls, inline_comments) -> None:
+        """Write parameter declarations with inline comments.
+        
+        If parameters already have inline comments stored in ParamDecl.comment,
+        those are written by write_param_decl. This method handles any additional
+        inline comments from the inline_comments list that weren't captured as ParamDecl.comment.
+        """
+        from ..data import Comment
+        
+        # Collect comments that are already stored inline in params
+        param_comments = {p.comment for p in params.params if p.comment}
+        
+        # Write parameters - write_param_decl already writes inline comments from ParamDecl.comment
+        for p in params.params:
+            self.write(".param ")
+            self.write_param_decl(p)
+            self.write("\n")
+        
+        # Write any remaining inline_comments that don't match param comments
+        # (these would be comments that weren't captured as inline comments during parsing)
+        for comment in inline_comments:
+            if isinstance(comment, Comment) and comment.text not in param_comments:
+                self.write_comment(comment.text)
 
     def write_model_family(self, mfam: ModelFamily) -> None:
         """Write a model family"""
@@ -1149,12 +1181,34 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
                 process_variations.append((param_name, varied_expr))
 
             if process_variations:
-                # Create a ParamDecls with the process variations
-                param_decls = []
+                # Create ParamDecls blocks with blank lines between logical groups
+                # Group parameters by category to create natural breaks
+                from collections import defaultdict
+                grouped_params = defaultdict(list)
                 for param_name, varied_expr in process_variations:
                     process_param_name = f"{param_name}__process__"
-                    param_decls.append(ParamDecl(name=Ident(process_param_name), default=varied_expr, distr=None))
-                generated_content.append(ParamDecls(params=param_decls))
+                    param_decl = ParamDecl(name=Ident(process_param_name), default=varied_expr, distr=None)
+                    # Group by parameter category (e.g., sw_tox, sw_vth0, sw_rpoly, sw_rm, sw_m, sw_rc, sw_cap, etc.)
+                    # Use first two underscore-separated parts as the category
+                    parts = param_name.split('_')
+                    if len(parts) >= 2:
+                        category = '_'.join(parts[:2])  # e.g., 'sw_tox', 'sw_vth0', 'sw_rpoly'
+                    else:
+                        category = parts[0]
+                    grouped_params[category].append(param_decl)
+                
+                # Create ParamDecls blocks with BlankLine entries between groups
+                # Sort groups by category name for consistent ordering
+                sorted_groups = sorted(grouped_params.items())
+                first_group = True
+                for category, params in sorted_groups:
+                    if not first_group:
+                        # Add blank line between groups
+                        from ..data import BlankLine
+                        blank_line = BlankLine()
+                        generated_content.append(blank_line)
+                    generated_content.append(ParamDecls(params=params))
+                    first_group = False
                 
                 # Replace all references to original parameters with __process__ version
                 # Note: Process variations are applied BEFORE mismatch variations (see line 1496),
@@ -1203,16 +1257,109 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
                         remove_param_declaration(program, param_name)
 
         # Replace the StatisticsBlock with generated content
+        # First, collect any comments that appear before and after the StatisticsBlock
+        # so they can be written in the correct positions
         for file in program.files:
             for i, entry in enumerate(file.contents):
                 if isinstance(entry, StatisticsBlock) and entry is stats:
-                    file.contents[i:i+1] = generated_content
+                    # Collect comments that appear before this StatisticsBlock
+                    # (they should be written before the generated content)
+                    before_comments = []
+                    j = i - 1
+                    while j >= 0 and isinstance(file.contents[j], Comment):
+                        before_comments.insert(0, file.contents[j])
+                        j -= 1
+                    
+                    # Collect comments that appear after this StatisticsBlock
+                    # (they should be written after the generated content)
+                    after_comments = []
+                    k = i + 1
+                    while k < len(file.contents) and isinstance(file.contents[k], Comment):
+                        after_comments.append(file.contents[k])
+                        k += 1
+                    
+                    # Remove the StatisticsBlock and comments from their original positions
+                    # and replace with before_comments + generated_content + after_comments
+                    start_idx = j + 1  # Start of comments (or StatisticsBlock if no comments)
+                    end_idx = k  # End after StatisticsBlock and after-comments
+                    file.contents[start_idx:end_idx] = before_comments + generated_content + after_comments
                     break
 
     # Now apply mismatch variations (creates functions and replaces references)
     # IMPORTANT: Process variations MUST be applied before mismatch variations.
     # This ensures we always get __process____mismatch__ suffixes and never __mismatch____process__.
     apply_all_mismatch_variations(program, stats_blocks)
+
+
+def move_header_comments_to_top(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
+    """Move header comments (those that were before the first StatisticsBlock) to the top of the file.
+    
+    These comments should appear before all generated content (lnorm functions, mismatch params, etc.)
+    """
+    if not stats_blocks:
+        return
+    
+    # Find the first StatisticsBlock to identify header comments
+    first_stats = stats_blocks[0]
+    
+    for file in program.files:
+        # Find where the first StatisticsBlock's comments ended up
+        # They should be right before the process variation params
+        header_comments = []
+        header_start_idx = None
+        header_end_idx = None
+        
+        # Look for a sequence of comments that match the header pattern
+        # (comments before process variation params, which start with sw_*__process__)
+        for i, entry in enumerate(file.contents):
+            if isinstance(entry, Comment):
+                # Check if this is part of a header comment block
+                # Header comments typically appear before process variation params
+                # Look ahead to see if we're before process params
+                is_header = False
+                for j in range(i + 1, min(i + 10, len(file.contents))):
+                    next_entry = file.contents[j]
+                    if isinstance(next_entry, ParamDecls):
+                        # Check if this contains process variation params
+                        if next_entry.params and any('__process__' in param.name.name for param in next_entry.params):
+                            is_header = True
+                            break
+                    elif not isinstance(next_entry, Comment):
+                        # Non-comment, non-param entry - not a header
+                        break
+                
+                if is_header:
+                    if header_start_idx is None:
+                        header_start_idx = i
+                    header_comments.append(entry)
+                    header_end_idx = i + 1
+                elif header_start_idx is not None:
+                    # We've passed the header comments
+                    break
+        
+        # If we found header comments, move them to the top
+        if header_comments and header_start_idx is not None:
+            # Remove comments from their current position
+            del file.contents[header_start_idx:header_end_idx]
+            
+            # Find the insertion point (after any existing top comments, before generated params)
+            insert_idx = 0
+            for i, entry in enumerate(file.contents):
+                if isinstance(entry, Comment):
+                    # Keep existing top comments
+                    insert_idx = i + 1
+                elif isinstance(entry, ParamDecls):
+                    # Insert before first ParamDecls (generated content)
+                    insert_idx = i
+                    break
+                else:
+                    # Insert before first non-comment, non-param entry
+                    insert_idx = i
+                    break
+            
+            # Insert header comments at the top
+            file.contents[insert_idx:insert_idx] = header_comments
+            break
 
 
 def create_mismatch_function(var: Variation, idx: int, original_expr: Optional[Expr] = None) -> Optional[ParamDecl]:
@@ -1426,6 +1573,9 @@ def apply_statistics_variations(program: Program, output_format: Optional["Netli
 
         # For Xyce: replace StatisticsBlocks in AST with generated content
         replace_statistics_blocks_with_generated_content(program, stats_blocks)
+        
+        # Move header comments (those that were before the first StatisticsBlock) to the top
+        move_header_comments_to_top(program, stats_blocks)
     else:
         # Legacy behavior: apply directly to parameters (for non-Xyce formats)
         apply_all_process_variations_legacy(program, stats_blocks)

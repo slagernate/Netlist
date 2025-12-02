@@ -87,9 +87,13 @@ class DialectParser:
         raise ValueError
 
     def eat_blanks(self):
-        """Pass over blank-lines, generally created by full-line comments."""
+        """Pass over blank-lines, generally created by full-line comments.
+        Returns the number of blank lines consumed."""
+        blank_count = 0
         while self.nxt and self.nxt.tp == Tokens.NEWLINE:
+            blank_count += 1
             self.advance()
+        return blank_count
 
     def eat_rest_of_statement(self):
         """Ignore Tokens from `self.cur` to the end of the current statement.
@@ -302,10 +306,29 @@ class DialectParser:
         return self.parse_param_values()
 
     def parse_param_val(self) -> ParamVal:
+        """Parse a parameter value (name = expression) and capture any inline comments."""
         self.expect(Tokens.IDENT)
         name = Ident(self.cur.val)
         self.expect(Tokens.EQUALS)
+        
+        # Store the current line number and comment queue state before parsing expression
+        # This ensures we only capture comments that are truly on the same line
+        param_line = self.lex.line_num
+        comments_before = list(self.lex.comment_queue) if hasattr(self.lex, 'comment_queue') else []
+        
         e = self.parse_expr()
+        
+        # After parsing expression, check comment queue for new comments on THIS line only
+        comments_after = list(self.lex.comment_queue) if hasattr(self.lex, 'comment_queue') else []
+        new_comments = [c for c in comments_after if c not in comments_before and c[2] == param_line]
+        
+        # Store inline comments for later retrieval in parse_param_declaration
+        if not hasattr(self, '_param_inline_comments'):
+            self._param_inline_comments = []
+        for comment_text, comment_type, line_num in new_comments:
+            if comment_type == "//":
+                self._param_inline_comments.append(comment_text)
+        
         return ParamVal(name, e)
 
     def parse_param_declaration(self):
@@ -314,7 +337,60 @@ class DialectParser:
         if self.match(Tokens.DEV_GAUSS):
             self.expect(Tokens.EQUALS)
             _e = self.parse_expr()
-        return ParamDecl(val.name, val.val)
+        
+        # Check for inline comment (// style) on the same line
+        # We stored any inline comments found during parameter value parsing in _param_inline_comments
+        inline_comment = None
+        
+        # Check if we stored any inline comments during parameter value parsing
+        if hasattr(self, '_param_inline_comments') and self._param_inline_comments:
+            inline_comment = self._param_inline_comments.pop(0)  # Take the first one
+            # Clean up if empty
+            if not self._param_inline_comments:
+                delattr(self, '_param_inline_comments')
+        
+        # If no comment was found, also check comment_queue for comments on the current line
+        if inline_comment is None:
+            current_line = self.lex.line_num
+            if hasattr(self.lex, 'comment_queue'):
+                # Look for comments on the current line
+                for comment_text, comment_type, line_num in self.lex.comment_queue:
+                    if comment_type == "//" and line_num == current_line:
+                        inline_comment = comment_text
+                        # Remove this comment from the queue since we're using it
+                        self.lex.comment_queue = [(t, ct, ln) for t, ct, ln in self.lex.comment_queue 
+                                                 if not (t == comment_text and ct == comment_type and ln == line_num)]
+                        break  # Take the first inline comment on this line
+        
+        # Also check current_line_comments (in case it hasn't been cleared yet)
+        if inline_comment is None and hasattr(self.lex, 'current_line_comments'):
+            for comment_text, comment_type in self.lex.current_line_comments:
+                if comment_type == "//":
+                    inline_comment = comment_text
+                    break  # Take the first inline comment
+        
+        # If still no comment, check if the next token is a comment
+        if inline_comment is None:
+            # Skip whitespace to see if there's a comment coming
+            while self.nxt and self.nxt.tp == Tokens.WHITE:
+                self.advance()
+            
+            # Check if the next token is a comment (// style)
+            if self.nxt and self.is_comment(self.nxt) and self.nxt.tp == Tokens.DUBSLASH:
+                # There's an inline comment - manually process it
+                comment_token = self.nxt
+                # Call eat_idle to process the comment - this will collect it
+                next_token = self.lex.eat_idle(comment_token)
+                # The comment should now be in current_line_comments
+                if hasattr(self.lex, 'current_line_comments'):
+                    for comment_text, comment_type in self.lex.current_line_comments:
+                        if comment_type == "//":
+                            inline_comment = comment_text
+                            break  # Take the first inline comment
+                # Update nxt to the token after the comment
+                self.nxt = next_token
+        
+        return ParamDecl(val.name, val.val, comment=inline_comment)
 
     def parse_param_declarations(self) -> List[ParamDecl]:
         """Parse a set of parameter declarations"""
@@ -475,6 +551,47 @@ class DialectParser:
             Tokens.DUBSLASH,
             Tokens.DOLLAR,
         ) or (self.are_stars_comments_now() and tok.tp in (Tokens.DUBSTAR, Tokens.STAR))
+
+    def collect_before_comments(self) -> List["Comment"]:
+        """Collect any line-starting comments before current statement.
+        Checks the lexer for comments that were captured on previous lines."""
+        comments = []
+        # Get comments from queue up to current line
+        queued_comments = self.lex.get_queued_comments(up_to_line=self.lex.line_num - 1)
+        for comment_text, comment_type, line_num in queued_comments:
+            # Line-starting comments can be "*" or "//" type
+            if comment_type in ("*", "//"):
+                comments.append(Comment(text=comment_text, position="before"))
+        # Also check current line comments
+        line_comments = self.lex.get_line_comments()
+        for comment_text, comment_type in line_comments:
+            if comment_type in ("*", "//"):
+                comments.append(Comment(text=comment_text, position="before"))
+        return comments
+
+    def collect_inline_comment(self) -> Optional["Comment"]:
+        """Check for inline comment (//) and return if found.
+        This should be called after parsing a token but before advancing."""
+        # Check current token for inline comment
+        if self.cur and self.is_comment(self.cur):
+            # Get comments from lexer
+            line_comments = self.lex.get_line_comments()
+            for comment_text, comment_type in line_comments:
+                if comment_type == "//":
+                    return Comment(text=comment_text, position="inline")
+        return None
+
+    def collect_after_comments(self) -> List["Comment"]:
+        """Collect comments after current statement.
+        This should be called after a statement is complete."""
+        comments = []
+        # Check lexer for any remaining comments on the current line
+        line_comments = self.lex.get_line_comments()
+        for comment_text, comment_type in line_comments:
+            # Inline comments (//) are typically "after" the statement content
+            if comment_type == "//":
+                comments.append(Comment(text=comment_text, position="after"))
+        return comments
 
     def parse_quote_string(self) -> str:
         """Parse a quoted string, ignoring internal token-types,

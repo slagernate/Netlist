@@ -23,6 +23,7 @@ from ..data import (
     ModelFamily,
     ModelVariant,
     FunctionDef,
+    Comment,
 )
 
 class ErrorMode(Enum):
@@ -70,9 +71,96 @@ class Netlister:
             self._validate_content()
             
         for file in self.src.files:
-            for entry in file.contents:
+            entries = file.contents
+            i = 0
+            while i < len(entries):
+                entry = entries[i]
+                
+                # Special handling for ParamDecls: collect all "after" comments that follow
+                # and write them inline with the parameters
+                from ..data import ParamDecls, Comment
+                if isinstance(entry, ParamDecls):
+                    # Collect consecutive "after" comments that follow this ParamDecls
+                    # Skip comments that are already stored inline in ParamDecl.comment to avoid duplicates
+                    inline_comments = []
+                    j = i + 1
+                    while j < len(entries):
+                        next_entry = entries[j]
+                        if isinstance(next_entry, Comment) and next_entry.position == "after":
+                            # Skip if this comment text matches any inline comment already stored in params
+                            comment_text = next_entry.text
+                            is_duplicate = any(param.comment == comment_text for param in entry.params)
+                            
+                            if not is_duplicate:
+                                inline_comments.append(next_entry)
+                            j += 1
+                        else:
+                            break
+                    
+                    # Write ParamDecls with inline comments
+                    if inline_comments:
+                        self.write_param_decls_with_inline_comments(entry, inline_comments)
+                        i = j  # Skip ParamDecls and all inline comments
+                        continue
+                    else:
+                        # No additional inline comments, but params might have comments stored
+                        # Write normally (write_param_decls will handle inline comments from ParamDecl.comment)
+                        self.write_entry(entry)
+                        i += 1
+                        continue
+                
+                # Skip comments that match inline comments already stored in ParamDecl.comment fields
+                # This prevents duplicate comments from appearing both inline and as standalone entries
+                if isinstance(entry, Comment):
+                    comment_text = entry.text
+                    # Check all ParamDecls entries to see if any param has this as an inline comment
+                    is_duplicate = any(
+                        param.comment == comment_text
+                        for check_entry in entries
+                        if isinstance(check_entry, ParamDecls)
+                        for param in check_entry.params
+                    )
+                    
+                    if is_duplicate:
+                        # Skip this duplicate comment (it's already written inline with its parameter)
+                        i += 1
+                        continue
+                
+                # Check if next entry is a comment that should be inline
+                if i + 1 < len(entries):
+                    next_entry = entries[i + 1]
+                    if isinstance(next_entry, Comment) and next_entry.position == "after":
+                        # Check if it's on the same line (inline comment)
+                        if (hasattr(entry, 'source_info') and hasattr(next_entry, 'source_info') and
+                            entry.source_info and next_entry.source_info and
+                            entry.source_info.line == next_entry.source_info.line):
+                            # Write entry with inline comment
+                            self.write_entry_with_inline_comment(entry, next_entry)
+                            i += 2  # Skip both entry and comment
+                            continue
+                
+                # Normal entry writing
                 self.write_entry(entry)
+                i += 1
         self.dest.flush()
+    
+    def write_entry_with_inline_comment(self, entry, comment: "Comment") -> None:
+        """Write an entry with an inline comment. Default implementation writes entry then comment.
+        Subclasses can override to append comment inline."""
+        self.write_entry(entry)
+        # For now, write comment on separate line - subclasses can override for true inline
+        self.write_comment(comment.text)
+    
+    def write_param_decls_with_inline_comments(self, params, inline_comments) -> None:
+        """Write parameter declarations with inline comments.
+        Default implementation just writes params normally and ignores inline comments.
+        Subclasses should override to handle inline comments properly."""
+        self.write_entry(params)
+        # Write any remaining comments as separate entries
+        from ..data import Comment
+        for comment in inline_comments:
+            if isinstance(comment, Comment):
+                self.write_comment(comment.text)
 
     def _validate_content(self) -> None:
         """Validate that the program content matches the expected file_type.
@@ -98,8 +186,14 @@ class Netlister:
             FunctionDef,
             StartProtectedSection,
             EndProtectedSection,
+            Comment,
+            BlankLine,
         )
 
+        if isinstance(entry, BlankLine):
+            return self.write_blank_line()
+        if isinstance(entry, Comment):
+            return self.write_comment_entry(entry)
         if isinstance(entry, SubcktDef):
             return self.write_subckt_def(entry)
         if isinstance(entry, ModelDef):
@@ -131,6 +225,20 @@ class Netlister:
             return
 
         self.handle_error(entry, f"Unknown Entry Type {entry}")
+    
+    def write_blank_line(self) -> None:
+        """Write a blank line to preserve formatting."""
+        self.write("\n")
+    
+    def write_comment_entry(self, comment: "Comment") -> None:
+        """Write a standalone comment entry"""
+        if comment.position in ("standalone", "before", "after"):
+            self.write_comment(comment.text)
+    
+    def write_comment(self, comment: str) -> None:
+        """Write a comment. Default implementation uses * for line-starting comments.
+        Subclasses should override to use appropriate comment syntax."""
+        self.write(f"* {comment}\n")
 
     def write(self, s: str) -> None:
         """Write string `s` to the destination stream"""

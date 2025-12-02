@@ -286,11 +286,11 @@ def test_subckt_def():
         name=Ident(name="mymos"),
         ports=[Ident(name="d"), Ident(name="g"), Ident(name="s"), Ident(name="b")],
         params=[
-            ParamDecl(name=Ident(name="l"), default=Int(val=11), distr=None),
-            ParamDecl(
-                name=Ident(name="w"),
+            ParamDecl(name=Ident(name="l"), default=Int(val=11), distr=None, comment=None),
+            ParamDecl(name=Ident(name="w"),
                 default=Ref(ident=Ident(name="global_w")),
                 distr=None,
+                comment=None,
             ),
         ],
     )
@@ -330,40 +330,40 @@ def test_model_family():
                 mtype=Ident(name="bsim3"),
                 args=[],
                 params=[
-                    ParamDecl(
-                        name=Ident(name="type"),
+                    ParamDecl(name=Ident(name="type"),
                         default=Ref(ident=Ident(name="n")),
                         distr=None,
+                        comment=None,
                     ),
-                    ParamDecl(
-                        name=Ident(name="lmin"),
+                    ParamDecl(name=Ident(name="lmin"),
                         default=Float(val=1.0),
                         distr=None,
+                        comment=None,
                     ),
-                    ParamDecl(
-                        name=Ident(name="lmax"),
+                    ParamDecl(name=Ident(name="lmax"),
                         default=Float(val=2.0),
                         distr=None,
+                        comment=None,
                     ),
-                    ParamDecl(
-                        name=Ident(name="wmin"),
+                    ParamDecl(name=Ident(name="wmin"),
                         default=Float(val=1.2),
                         distr=None,
+                        comment=None,
                     ),
-                    ParamDecl(
-                        name=Ident(name="wmax"),
+                    ParamDecl(name=Ident(name="wmax"),
                         default=Float(val=1.4),
                         distr=None,
+                        comment=None,
                     ),
-                    ParamDecl(
-                        name=Ident(name="level"),
+                    ParamDecl(name=Ident(name="level"),
                         default=Int(val=999),
                         distr=None,
+                        comment="plus some blank lines",  # Comment on continuation line gets associated
                     ),
-                    ParamDecl(
-                        name=Ident(name="tnom"),
+                    ParamDecl(name=Ident(name="tnom"),
                         default=Int(val=30),
                         distr=None,
+                        comment=None,
                     ),
                 ],
             ),
@@ -373,33 +373,33 @@ def test_model_family():
                 mtype=Ident(name="bsim3"),
                 args=[],
                 params=[
-                    ParamDecl(
-                        name=Ident(name="type"),
-                        default=Ref(
-                            ident=Ident(name="n")
-                        ),  # FIXME: this is a "ref", but to a kinda behind-the-scenes "thing" `n`
-                        distr=None,
-                    ),
-                    ParamDecl(
-                        name=Ident(name="version"),
-                        default=Float(val=3.2),
-                        distr=None,
-                    ),
-                    ParamDecl(
-                        name=Ident(name="xj"),
-                        default=Float(val=1.2e-07),
-                        distr=None,
-                    ),
-                    ParamDecl(
-                        name=Ident(name="lln"),
-                        default=Int(val=1),
-                        distr=None,
-                    ),
-                    ParamDecl(
-                        name=Ident(name="lwn"),
-                        default=Int(val=1),
-                        distr=None,
-                    ),
+                        ParamDecl(name=Ident(name="type"),
+                            default=Ref(
+                                ident=Ident(name="n")
+                            ),  # FIXME: this is a "ref", but to a kinda behind-the-scenes "thing" `n`
+                            distr=None,
+                            comment=None,
+                        ),
+                        ParamDecl(name=Ident(name="version"),
+                            default=Float(val=3.2),
+                            distr=None,
+                            comment=None,
+                        ),
+                        ParamDecl(name=Ident(name="xj"),
+                            default=Float(val=1.2e-07),
+                            distr=None,
+                            comment=None,
+                        ),
+                        ParamDecl(name=Ident(name="lln"),
+                            default=Int(val=1),
+                            distr=None,
+                            comment="Plus More Commentary",  # Comment on continuation line gets associated
+                        ),
+                        ParamDecl(name=Ident(name="lwn"),
+                            default=Int(val=1),
+                            distr=None,
+                            comment=None,
+                        ),
                 ],
             ),
         ],
@@ -429,8 +429,8 @@ def test_spectre_midstream_comment():
         mtype=Ident(name="diode"),
         args=[],
         params=[
-            ParamDecl(name=Ident(name="level"), default=Int(val=3), distr=None),
-            ParamDecl(name=Ident(name="area"), default=Float(val=1.1e11), distr=None),
+            ParamDecl(name=Ident(name="level"), default=Int(val=3), distr=None, comment=None),
+            ParamDecl(name=Ident(name="area"), default=Float(val=1.1e11), distr=None, comment=None),
         ],
     )
 
@@ -441,7 +441,7 @@ def test_parse_capital_param():
     i = p.parse(p.parse_statement)
 
     assert i == ParamDecls(
-        params=[ParamDecl(name=Ident(name="a"), default=Int(val=3), distr=None)]
+        params=[ParamDecl(name=Ident(name="a"), default=Int(val=3), distr=None, comment=None)]
     )
 
 
@@ -505,11 +505,9 @@ def test_names_including_keywords():
 
     assert i == ParamDecls(
         params=[
-            ParamDecl(
-                name=Ident(name="my_favorite_model"),
+            ParamDecl(name=Ident(name="my_favorite_model"),
                 default=Ref(ident=Ident(name="model_that_works_best")),
-                distr=None,
-            )
+                distr=None, comment=None)
         ],
     )
 
@@ -528,13 +526,11 @@ def test_model_with_parens():
             Ident(name="arg3"),
         ],
         params=[
-            ParamDecl(
-                name=Ident(name="key1"),
+            ParamDecl(name=Ident(name="key1"),
                 default=Ref(ident=Ident(name="val1")),
                 distr=None,
             ),
-            ParamDecl(
-                name=Ident(name="key2"),
+            ParamDecl(name=Ident(name="key2"),
                 default=Ref(ident=Ident(name="val2")),
                 distr=None,
             ),
