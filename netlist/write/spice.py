@@ -860,10 +860,10 @@ def replace_param_refs_in_entry(entry: Entry, param_name: str, replacement: Expr
     # Catch-all for unhandled entry types
     else:
         # Entry types that don't contain parameter references: Include, AhdlInclude, UseLibSection,
-        # DialectChange, Unknown, End, StatisticsBlock (already processed)
+        # DialectChange, Unknown, End, StatisticsBlock, Comment, BlankLine (already processed or no params)
         # Log a warning for any unexpected types
         entry_type_name = type(entry).__name__
-        if entry_type_name not in ('Include', 'AhdlInclude', 'UseLibSection', 'DialectChange', 'Unknown', 'End', 'StatisticsBlock'):
+        if entry_type_name not in ('Include', 'AhdlInclude', 'UseLibSection', 'DialectChange', 'Unknown', 'End', 'StatisticsBlock', 'Comment', 'BlankLine'):
             warn(f"replace_param_refs_in_entry: Unhandled entry type {entry_type_name} for param {param_name}")
 
 

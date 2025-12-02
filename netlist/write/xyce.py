@@ -32,6 +32,7 @@ from ..data import (
     QuotedString,
     StatisticsBlock,
     NetlistDialects,
+    Call,
     Comment,
 )
 from .base import Netlister, ErrorMode
@@ -1256,6 +1257,85 @@ class XyceNetlister(SpiceNetlister):
         
         return False
 
+    def _clamp_param_value(self, expr: Expr, min_val: Optional[float], max_val: Optional[float], 
+                          min_exclusive: bool = False, max_exclusive: bool = False) -> Expr:
+        """Clamp a parameter value expression to valid range.
+        
+        Args:
+            expr: The expression to clamp (Int, Float, or MetricNum)
+            min_val: Minimum value (None for unbounded)
+            max_val: Maximum value (None for unbounded)
+            min_exclusive: If True, min is exclusive (use min + epsilon)
+            max_exclusive: If True, max is exclusive (use max - epsilon)
+            
+        Returns:
+            Clamped Expr (preserves original type), or original if not a numeric literal
+        """
+        from ..data import Int, Float, MetricNum
+        
+        # Only clamp numeric literals, not expressions
+        if not isinstance(expr, (Int, Float, MetricNum)):
+            return expr
+        
+        # Extract numeric value
+        if isinstance(expr, Int):
+            val = float(expr.val)
+        elif isinstance(expr, Float):
+            val = expr.val
+        elif isinstance(expr, MetricNum):
+            # Parse metric suffix
+            val_str = expr.val
+            match = re.match(r'([\d.]+)([a-zA-Z]+)?', val_str)
+            if match:
+                num = float(match.group(1))
+                suffix = match.group(2) or ''
+                suffix_map = {
+                    'T': 1e12, 'G': 1e9, 'MEG': 1e6, 'X': 1e6, 'K': 1e3,
+                    'M': 1e-3, 'MIL': 2.54e-5, 'U': 1e-6, 'u': 1e-6,
+                    'N': 1e-9, 'n': 1e-9, 'P': 1e-12, 'p': 1e-12,
+                    'F': 1e-15, 'f': 1e-15, 'A': 1e-18, 'a': 1e-18
+                }
+                multiplier = suffix_map.get(suffix.upper(), 1.0)
+                val = num * multiplier
+            else:
+                val = float(val_str) if val_str else 0.0
+        else:
+            return expr
+        
+        # Clamp to range
+        # Small epsilon for exclusive bounds (consistent with expression wrapping)
+        EPSILON = 1e-12
+        clamped_val = val
+        
+        if min_val is not None:
+            if min_exclusive:
+                if val <= min_val:
+                    clamped_val = min_val + EPSILON
+            else:
+                if val < min_val:
+                    clamped_val = min_val
+        
+        if max_val is not None:
+            if max_exclusive:
+                if val >= max_val:
+                    clamped_val = max_val - EPSILON
+            else:
+                if val > max_val:
+                    clamped_val = max_val
+        
+        # Return new Expr with clamped value
+        # If value changed (even slightly), use Float to preserve precision
+        # This is especially important for exclusive bounds where we add epsilon
+        if abs(clamped_val - val) >= 1e-12:
+            # Value changed, use Float to preserve precision
+            return Float(clamped_val)
+        elif isinstance(expr, Int):
+            return Int(int(clamped_val))
+        elif isinstance(expr, Float):
+            return Float(clamped_val)
+        else:  # MetricNum - convert to Float since we can't preserve suffix easily
+            return Float(clamped_val)
+
     def _map_bjt_level1_to_mextram_params(self, params: List[ParamDecl]) -> List[Tuple[ParamDecl, Optional[str], bool]]:
         """Map BJT level 1 (Gummel-Poon) parameters to MEXTRAM (level 504) parameters.
         
@@ -1265,33 +1345,35 @@ class XyceNetlister(SpiceNetlister):
         Returns:
             List of (ParamDecl, comment, commented_out) tuples
         """
-        # Mapping table: (level1_param_name, mextram_param_name_or_action)
+        # Mapping table: (level1_param_name, mextram_param_name_or_action, optional_range_tuple)
         # Actions can be:
         # - 'PARAM': Direct mapping to new name
         # - None: Drop parameter (comment out)
         # - (None, 'Warning'): Drop with custom warning/comment
         # - ('PARAM', 'Warning'): Map with warning/comment
         # - 'SPECIAL_...': Special handling required
+        # Range tuple format: (min_val, max_val, min_exclusive=False, max_exclusive=False)
+        # Use None for unbounded ends
         
         level1_to_mextram_mapping = [
             # === Core transport parameters ===
             ('IS',   'IS'),     # saturation current – direct
-            ('BF',   'BF'),     # forward beta – direct
+            ('BF',   'BF', (0.0001, None)),  # forward beta – direct, range: [0.0001, +inf)
             ('BR',   'IBR'),    # reverse beta → MEXTRAM uses IBR
             ('NF',   'SPECIAL_NF'),  # forward emission coeff -> PE + MLF
             ('NR',   'PC'),     # reverse emission coeff -> PC
-            ('VAF',  'VEF'),    # forward Early voltage -> VEF
-            ('VAR',  'VER'),    # reverse Early voltage -> VER
+            ('VAF',  'VEF', (0.01, None)),  # forward Early voltage -> VEF, range: [0.01, +inf)
+            ('VAR',  'VER', (0.01, None)),  # reverse Early voltage -> VER, range: [0.01, +inf)
             ('IKF',  'SPECIAL_IK'),  # forward knee -> IK (conflict with IKR)
             ('IKR',  'SPECIAL_IK'),  # reverse knee -> IK (conflict with IKF)
             ('ISE',  'IBF'),    # B-E leakage sat current -> IBF
             ('ISC',  'ICSS'),   # B-C leakage sat current -> ICSS
             ('NE',   'MLF'),    # B-E leakage emission coeff -> MLF
-            ('NC',   'PS'),     # B-C leakage emission coeff -> PS (conflict with NS)
+            ('NC',   'PS', (0.01, 0.99, True, True)),  # B-C leakage emission coeff -> PS, range: ]0.01, 0.99[ (conflict with NS)
             
             # === Resistances ===
             ('RB',   'RBV'),    # parasitic base resistance -> RBV (variable part)
-            ('RBM',  'RBC'),    # minimum intrinsic base resistance -> RBC (constant part)
+            ('RBM',  'RBC', (0.001, None)),  # minimum intrinsic base resistance -> RBC, range: [0.001, +inf)
             ('RBI',  'SPECIAL_RBI'), # distribute to RBV + RBC
             ('IRB',  (None, "Unsupported; no direct IRB equivalent")),
             ('RE',   'RE'),     # emitter resistance
@@ -1308,12 +1390,12 @@ class XyceNetlister(SpiceNetlister):
             ('FC',   'MC'),     # forward-bias coeff -> MC
             ('CJS',  'CJS'),    # substrate capacitance
             ('VJS',  'VDS'),    # substrate potential -> VDS
-            ('MJS',  'PS'),     # substrate grading -> PS
+            ('MJS',  'PS', (0.01, 0.99, True, True)),  # substrate grading -> PS, range: ]0.01, 0.99[
             ('ISS',  'ISS'),    # substrate saturation current
-            ('NS',   'PS'),     # substrate emission coeff -> PS (conflict with NC)
+            ('NS',   'PS', (0.01, 0.99, True, True)),  # substrate emission coeff -> PS, range: ]0.01, 0.99[ (conflict with NC)
             
             # === Transit times ===
-            ('TF',   'TAUB'),   # forward transit time -> TAUB
+            ('TF',   'TAUB', (0.0, None, True, False)),  # forward transit time -> TAUB, range: ]0.0, +inf)
             ('TR',   'TAUR'),   # reverse transit time -> TAUR
             ('ITF',  (None, "Unsupported; IK handles high-injection knee")),
             ('VTF',  (None, "Unsupported; no VTF threshold in MEXTRAM")),
@@ -1357,9 +1439,16 @@ class XyceNetlister(SpiceNetlister):
         ]
         
         # Convert to dictionary for efficient lookup
+        # Format: (level1_name, action, optional_range_tuple)
         param_map = {}
-        for level1_name, action in level1_to_mextram_mapping:
+        range_map = {}  # Store range info separately
+        for mapping_entry in level1_to_mextram_mapping:
+            level1_name = mapping_entry[0]
+            action = mapping_entry[1]
             param_map[level1_name.upper()] = action
+            # Check if there's a range tuple (3rd element)
+            if len(mapping_entry) >= 3:
+                range_map[level1_name.upper()] = mapping_entry[2]
             
         # Pre-scan params to handle conflicts/merges (IK, NF, RBI)
         params_dict = {p.name.name.upper(): p for p in params}
@@ -1429,7 +1518,18 @@ class XyceNetlister(SpiceNetlister):
             # Prefer NS for PS if both present
             val_to_use = ns_val.default if ns_val else nc_val.default
             src_name = "NS" if ns_val else "NC"
-            add_param('PS', val_to_use, comment=f"{src_name} -> PS (lvl 1 -> lvl 504)")
+            # Apply range clamping/wrapping for PS: ]0.01, 0.99[
+            if self._is_number(val_to_use):
+                clamped_val = self._clamp_param_value(val_to_use, 0.01, 0.99, min_exclusive=True, max_exclusive=True)
+            else:
+                # Expression - wrap in max()/min() to enforce bounds
+                EPSILON = 1e-12
+                min_expr = Float(0.01 + EPSILON)  # Exclusive min
+                max_expr = Float(0.99 - EPSILON)  # Exclusive max
+                # Wrap: min(max(expr, min_val), max_val)
+                max_call = Call(func=Ref(ident=Ident("max")), args=[val_to_use, min_expr])
+                clamped_val = Call(func=Ref(ident=Ident("min")), args=[max_call, max_expr])
+            add_param('PS', clamped_val, comment=f"{src_name} -> PS (lvl 1 -> lvl 504)")
 
         # Process all parameters
         for param in params:
@@ -1460,19 +1560,98 @@ class XyceNetlister(SpiceNetlister):
                         continue
                     else:
                         # Map with warning/comment
-                        add_param(new_name, param.default, param.distr, comment=f"{param.name.name} -> {new_name} (lvl 1 -> lvl 504). {warning_msg}")
+                        # Check for range clamping
+                        default_val = param.default
+                        if name_upper in range_map:
+                            range_info = range_map[name_upper]
+                            if len(range_info) >= 2:
+                                min_val = range_info[0]
+                                max_val = range_info[1]
+                                min_exclusive = range_info[2] if len(range_info) > 2 else False
+                                max_exclusive = range_info[3] if len(range_info) > 3 else False
+                                
+                                # Clamp numeric literals or wrap expressions
+                                if default_val is None:
+                                    clamped_default = min_val + (1e-12 if min_exclusive else 0)
+                                    default_val = Float(clamped_default)
+                                elif self._is_number(default_val):
+                                    clamped = self._clamp_param_value(default_val, min_val, max_val, min_exclusive, max_exclusive)
+                                    if self._is_number(clamped):
+                                        if isinstance(default_val, (Int, Float)) and isinstance(clamped, (Int, Float)):
+                                            old_val = default_val.val if hasattr(default_val, 'val') else default_val
+                                            new_val = clamped.val if hasattr(clamped, 'val') else clamped
+                                            if abs(old_val - new_val) >= 1e-12:
+                                                default_val = clamped
+                                        else:
+                                            default_val = clamped
+                                else:
+                                    # Expression - wrap in max()/min() to enforce bounds
+                                    EPSILON = 1e-12
+                                    if min_val is not None:
+                                        min_expr = Float(min_val + (EPSILON if min_exclusive else 0))
+                                        default_val = Call(func=Ref(ident=Ident("max")), args=[default_val, min_expr])
+                                    if max_val is not None:
+                                        max_expr = Float(max_val - (EPSILON if max_exclusive else 0))
+                                        default_val = Call(func=Ref(ident=Ident("min")), args=[default_val, max_expr])
+                        add_param(new_name, default_val, param.distr, comment=f"{param.name.name} -> {new_name} (lvl 1 -> lvl 504). {warning_msg}")
                         
                 elif isinstance(action, str):
                     if action.startswith('SPECIAL_'):
                         continue # Already handled
                     new_name = action
                     
+                    # Apply range clamping if range info exists
+                    default_val = param.default
+                    if name_upper in range_map:
+                        range_info = range_map[name_upper]
+                        if len(range_info) >= 2:
+                            min_val = range_info[0]
+                            max_val = range_info[1]
+                            min_exclusive = range_info[2] if len(range_info) > 2 else False
+                            max_exclusive = range_info[3] if len(range_info) > 3 else False
+                            
+                            # If default is None, provide a clamped default value
+                            if default_val is None:
+                                # Use minimum value as default (with epsilon for exclusive)
+                                clamped_default = min_val + (1e-12 if min_exclusive else 0)
+                                default_val = Float(clamped_default)
+                            else:
+                                clamped = self._clamp_param_value(default_val, min_val, max_val, min_exclusive, max_exclusive)
+                                # Only use clamped value if it's a numeric literal (clamping worked)
+                                if self._is_number(clamped):
+                                    # Check if value actually changed (use >= to catch epsilon changes)
+                                    if isinstance(default_val, (Int, Float)) and isinstance(clamped, (Int, Float)):
+                                        old_val = default_val.val if hasattr(default_val, 'val') else default_val
+                                        new_val = clamped.val if hasattr(clamped, 'val') else clamped
+                                        if abs(old_val - new_val) >= 1e-12:
+                                            default_val = clamped
+                                    else:
+                                        default_val = clamped
+                                elif self._is_number(default_val):
+                                    # If clamping didn't produce a number but original was, keep original
+                                    pass
+                                else:
+                                    # Neither is a number, but we have a range constraint
+                                    # Wrap expression in max()/min() to ensure it stays within bounds
+                                    if not self._is_number(default_val):
+                                        EPSILON = 1e-12  # Consistent with _clamp_param_value
+                                        if min_val is not None:
+                                            # Create max(expr, min_val) to ensure minimum value
+                                            min_expr = Float(min_val + (EPSILON if min_exclusive else 0))
+                                            default_val = Call(func=Ref(ident=Ident("max")), args=[default_val, min_expr])
+                                        if max_val is not None:
+                                            # Create min(expr, max_val) to ensure maximum value
+                                            max_expr = Float(max_val - (EPSILON if max_exclusive else 0))
+                                            default_val = Call(func=Ref(ident=Ident("min")), args=[default_val, max_expr])
+                                    else:
+                                        default_val = clamped
+                    
                     # Suppress comment if rename is only capitalization change
                     comment = f"{param.name.name} -> {new_name} (lvl 1 -> lvl 504)"
                     if param.name.name.lower() == new_name.lower():
                         comment = None
                         
-                    add_param(new_name, param.default, param.distr, comment=comment)
+                    add_param(new_name, default_val, param.distr, comment=comment)
                 else:
                     # Fallback
                     mapped_params.append((param, "Dropped: Unknown mapping action", True))

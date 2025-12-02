@@ -953,3 +953,259 @@ def test_xyce_param_default_recovery_from_model():
     # Verify that we did NOT use max float (which would be something like 1.7976931348623157e+308)
     assert "1.7976931348623157e+308" not in params_line
     assert "1.7976931348623157e+308" not in output_str
+
+
+def test_xyce_bjt_parameter_clamping_numeric():
+    """
+    Test that BJT Level 1 to MEXTRAM parameter mapping clamps numeric values to valid ranges.
+    """
+    from netlist.write.xyce import XyceNetlister
+    
+    # Create a BJT model with parameters that are out of range
+    # Note: The mapping requires model_level_mapping to be set to map level 1 -> 504
+    model = ModelDef(
+        name=Ident("test_bjt"),
+        mtype=Ident("npn"),
+        args=[],
+        params=[
+            ParamDecl(name=Ident("level"), default=Int(1), distr=None),
+            # VAR=0 should be clamped to VER=0.01 (min is 0.01)
+            ParamDecl(name=Ident("var"), default=Int(0), distr=None),
+            # RBM=0 should be clamped to RBC=0.001 (min is 0.001)
+            ParamDecl(name=Ident("rbm"), default=Int(0), distr=None),
+            # BF=0 should be clamped to BF=0.0001 (min is 0.0001)
+            ParamDecl(name=Ident("bf"), default=Int(0), distr=None),
+            # VAF=0 should be clamped to VEF=0.01 (min is 0.01)
+            ParamDecl(name=Ident("vaf"), default=Int(0), distr=None),
+            # TF=0 should be clamped to TAUB=1e-12 (exclusive min 0.0)
+            ParamDecl(name=Ident("tf"), default=Int(0), distr=None),
+        ]
+    )
+    
+    program = Program(files=[
+        SourceFile(path="test.cir", contents=[model])
+    ])
+    
+    # Use model_level_mapping to trigger the level 1 -> 504 mapping
+    from netlist.write import WriteOptions
+    options = WriteOptions(
+        fmt=NetlistDialects.XYCE,
+        model_level_mapping={"npn": [(1, 504)], "pnp": [(1, 504)]}
+    )
+    
+    output = StringIO()
+    write_netlist(src=program, dest=output, options=options)
+    output_str = output.getvalue()
+    
+    # Verify that parameters were mapped and clamped to valid ranges
+    assert "VER=0.01" in output_str or "VER=0.01 " in output_str
+    assert "RBC=0.001" in output_str or "RBC=0.001 " in output_str
+    assert "BF=0.0001" in output_str or "BF=0.0001 " in output_str
+    assert "VEF=0.01" in output_str or "VEF=0.01 " in output_str
+    # TAUB should be clamped to 1e-12 (exclusive minimum)
+    assert "TAUB=1e-12" in output_str or "TAUB=1e-12 " in output_str
+    
+    # Verify that original parameter names are NOT present (they should be mapped)
+    assert "VAR=" not in output_str
+    assert "RBM=" not in output_str
+    assert "VAF=" not in output_str
+    assert "TF=" not in output_str
+    
+    # Verify that original out-of-range values are NOT present
+    assert "VER=0" not in output_str.replace("VER=0.01", "")
+    assert "RBC=0" not in output_str.replace("RBC=0.001", "")
+    assert "BF=0" not in output_str.replace("BF=0.0001", "")
+    assert "VEF=0" not in output_str.replace("VEF=0.01", "")
+    assert "TAUB=0" not in output_str.replace("TAUB=1e-12", "")
+
+
+def test_xyce_bjt_parameter_expression_wrapping_max():
+    """
+    Test that BJT Level 1 to MEXTRAM parameter mapping wraps expressions in max() for minimum bounds.
+    """
+    from netlist.write.xyce import XyceNetlister
+    
+    # Create a BJT model with expression parameters that might evaluate to 0
+    # BF expression that could evaluate to 0
+    bf_expr = BinaryOp(
+        tp=BinaryOperator.MUL,
+        left=Float(39.28),
+        right=Ref(ident=Ident("var_bf"))
+    )
+    
+    # VAF expression that could evaluate to 0
+    vaf_expr = BinaryOp(
+        tp=BinaryOperator.DIV,
+        left=Float(100.0),
+        right=Ref(ident=Ident("var_bf"))
+    )
+    
+    model = ModelDef(
+        name=Ident("test_bjt_expr"),
+        mtype=Ident("npn"),
+        args=[],
+        params=[
+            ParamDecl(name=Ident("level"), default=Int(1), distr=None),
+            ParamDecl(name=Ident("bf"), default=bf_expr, distr=None),
+            ParamDecl(name=Ident("vaf"), default=vaf_expr, distr=None),
+        ]
+    )
+    
+    program = Program(files=[
+        SourceFile(path="test.cir", contents=[model])
+    ])
+    
+    # Use model_level_mapping to trigger the level 1 -> 504 mapping
+    options = WriteOptions(
+        fmt=NetlistDialects.XYCE,
+        model_level_mapping={"npn": [(1, 504)], "pnp": [(1, 504)]}
+    )
+    
+    output = StringIO()
+    write_netlist(src=program, dest=output, options=options)
+    output_str = output.getvalue()
+    
+    # Verify that expressions are wrapped in max() to enforce minimum bounds
+    # BF should be wrapped: max(39.28*var_bf, 0.0001)
+    assert "max(" in output_str
+    assert "BF=" in output_str
+    # Check that the BF line contains max() call
+    bf_line = next((line for line in output_str.split('\n') if 'BF=' in line), None)
+    assert bf_line is not None
+    assert "max(" in bf_line
+    
+    # VEF should be wrapped: max(100/var_bf, 0.01)
+    vef_line = next((line for line in output_str.split('\n') if 'VEF=' in line), None)
+    assert vef_line is not None
+    assert "max(" in vef_line
+
+
+def test_xyce_bjt_parameter_expression_wrapping_min():
+    """
+    Test that BJT Level 1 to MEXTRAM parameter mapping wraps expressions in min() for maximum bounds.
+    """
+    from netlist.write.xyce import XyceNetlister
+    
+    # Create a parameter with an expression that might exceed maximum bound
+    # PS parameter with range ]0.01, 0.99[ - should wrap in both max() and min()
+    ps_expr = BinaryOp(
+        tp=BinaryOperator.ADD,
+        left=Float(0.5),
+        right=Ref(ident=Ident("offset"))
+    )
+    
+    model = ModelDef(
+        name=Ident("test_bjt_ps"),
+        mtype=Ident("npn"),
+        args=[],
+        params=[
+            ParamDecl(name=Ident("level"), default=Int(1), distr=None),
+            # NS maps to PS with range ]0.01, 0.99[
+            ParamDecl(name=Ident("ns"), default=ps_expr, distr=None),
+        ]
+    )
+    
+    program = Program(files=[
+        SourceFile(path="test.cir", contents=[model])
+    ])
+    
+    # Use model_level_mapping to trigger the level 1 -> 504 mapping
+    options = WriteOptions(
+        fmt=NetlistDialects.XYCE,
+        model_level_mapping={"npn": [(1, 504)], "pnp": [(1, 504)]}
+    )
+    
+    output = StringIO()
+    write_netlist(src=program, dest=output, options=options)
+    output_str = output.getvalue()
+    
+    # Verify that expressions with both min and max bounds are wrapped appropriately
+    # PS should be wrapped: min(max(0.5+offset, 0.01+epsilon), 0.99-epsilon)
+    ps_line = next((line for line in output_str.split('\n') if 'PS=' in line), None)
+    assert ps_line is not None
+    # Should have both max and min wrapping
+    assert "max(" in ps_line or "min(" in ps_line
+
+
+def test_xyce_bjt_parameter_clamping_float_values():
+    """
+    Test that Float values are properly clamped (not just Int).
+    """
+    from netlist.write.xyce import XyceNetlister
+    
+    model = ModelDef(
+        name=Ident("test_bjt_float"),
+        mtype=Ident("npn"),
+        args=[],
+        params=[
+            ParamDecl(name=Ident("level"), default=Int(1), distr=None),
+            # Use Float(0.0) instead of Int(0)
+            ParamDecl(name=Ident("var"), default=Float(0.0), distr=None),
+            ParamDecl(name=Ident("rbm"), default=Float(0.0), distr=None),
+        ]
+    )
+    
+    program = Program(files=[
+        SourceFile(path="test.cir", contents=[model])
+    ])
+    
+    # Use model_level_mapping to trigger the level 1 -> 504 mapping
+    options = WriteOptions(
+        fmt=NetlistDialects.XYCE,
+        model_level_mapping={"npn": [(1, 504)], "pnp": [(1, 504)]}
+    )
+    
+    output = StringIO()
+    write_netlist(src=program, dest=output, options=options)
+    output_str = output.getvalue()
+    
+    # Verify Float values are clamped correctly
+    assert "VER=0.01" in output_str
+    assert "RBC=0.001" in output_str
+
+
+def test_xyce_bjt_parameter_clamping_exclusive_bounds():
+    """
+    Test that exclusive bounds (]min, max[) are handled correctly with epsilon.
+    """
+    from netlist.write.xyce import XyceNetlister
+    
+    model = ModelDef(
+        name=Ident("test_bjt_exclusive"),
+        mtype=Ident("npn"),
+        args=[],
+        params=[
+            ParamDecl(name=Ident("level"), default=Int(1), distr=None),
+            # TF=0 with exclusive minimum ]0.0, +inf) should become TAUB=1e-12
+            ParamDecl(name=Ident("tf"), default=Int(0), distr=None),
+            # NS=1.0 with exclusive range ]0.01, 0.99[ should be clamped
+            ParamDecl(name=Ident("ns"), default=Float(1.0), distr=None),
+        ]
+    )
+    
+    program = Program(files=[
+        SourceFile(path="test.cir", contents=[model])
+    ])
+    
+    # Use model_level_mapping to trigger the level 1 -> 504 mapping
+    options = WriteOptions(
+        fmt=NetlistDialects.XYCE,
+        model_level_mapping={"npn": [(1, 504)], "pnp": [(1, 504)]}
+    )
+    
+    output = StringIO()
+    write_netlist(src=program, dest=output, options=options)
+    output_str = output.getvalue()
+    
+    # Verify exclusive bounds are handled
+    # TAUB should be 1e-12 (exclusive min 0.0)
+    assert "TAUB=1e-12" in output_str or "TAUB=1e-12 " in output_str
+    # PS should be clamped to less than 0.99 (exclusive max)
+    ps_line = next((line for line in output_str.split('\n') if 'PS=' in line), None)
+    assert ps_line is not None
+    # Should be clamped to something less than 0.99
+    import re
+    ps_match = re.search(r'PS=([\d.e+-]+)', ps_line)
+    if ps_match:
+        ps_val = float(ps_match.group(1))
+        assert ps_val < 0.99, f"PS value {ps_val} should be less than 0.99 (exclusive max)"
