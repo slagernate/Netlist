@@ -1209,3 +1209,21 @@ def test_xyce_bjt_parameter_clamping_exclusive_bounds():
     if ps_match:
         ps_val = float(ps_match.group(1))
         assert ps_val < 0.99, f"PS value {ps_val} should be less than 0.99 (exclusive max)"
+
+
+def test_inline_comment_preservation():
+    """Test that inline comments on instance parameters are preserved"""
+    from netlist.data import ModelDef, Instance, Ref
+    src = Program(files=[SourceFile(path=Path("test"), contents=[
+        ModelDef(name=Ident("m1"), mtype=Ident("nmos"), args=[], params=[]),
+        Instance(name=Ident("x1"), module=Ref(ident=Ident("m1")), 
+                conns=[Ident("d"), Ident("g"), Ident("s"), Ident("b")],
+                params=[ParamVal(name=Ident("l"), val=Float(1.0), comment="test comment")])
+    ])])
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    output = dest.getvalue()
+    assert "test comment" in output
+    assert "l=" in output
+    # Comment should be on same line as parameter
+    assert any("l=" in line and "test comment" in line for line in output.split('\n'))

@@ -322,14 +322,61 @@ class DialectParser:
         comments_after = list(self.lex.comment_queue) if hasattr(self.lex, 'comment_queue') else []
         new_comments = [c for c in comments_after if c not in comments_before and c[2] == param_line]
         
-        # Store inline comments for later retrieval in parse_param_declaration
-        if not hasattr(self, '_param_inline_comments'):
-            self._param_inline_comments = []
+        # Capture inline comment for this ParamVal
+        inline_comment = None
+        comment_to_remove = None
+        
         for comment_text, comment_type, line_num in new_comments:
             if comment_type == "//":
-                self._param_inline_comments.append(comment_text)
+                inline_comment = comment_text
+                comment_to_remove = (comment_text, comment_type, line_num)
+                break  # Take the first inline comment on this line
         
-        return ParamVal(name, e)
+        # Also check current_line_comments (in case it hasn't been cleared yet)
+        if inline_comment is None and hasattr(self.lex, 'current_line_comments'):
+            for comment_text, comment_type in self.lex.current_line_comments:
+                if comment_type == "//":
+                    inline_comment = comment_text
+                    # Remove from current_line_comments
+                    self.lex.current_line_comments = [(t, ct) for t, ct in self.lex.current_line_comments 
+                                                     if not (t == comment_text and ct == comment_type)]
+                    break  # Take the first inline comment
+        
+        # If still no comment, check if the next token is a comment
+        if inline_comment is None:
+            # Skip whitespace to see if there's a comment coming
+            while self.nxt and self.nxt.tp == Tokens.WHITE:
+                self.advance()
+            
+            # Check if the next token is a comment (// style)
+            if self.nxt and self.is_comment(self.nxt) and self.nxt.tp == Tokens.DUBSLASH:
+                # There's an inline comment - manually process it
+                comment_token = self.nxt
+                # Call eat_idle to process the comment - this will collect it
+                next_token = self.lex.eat_idle(comment_token)
+                # The comment should now be in current_line_comments
+                if hasattr(self.lex, 'current_line_comments'):
+                    for comment_text, comment_type in self.lex.current_line_comments:
+                        if comment_type == "//":
+                            inline_comment = comment_text
+                            # Remove from current_line_comments
+                            self.lex.current_line_comments = [(t, ct) for t, ct in self.lex.current_line_comments 
+                                                             if not (t == comment_text and ct == comment_type)]
+                            break  # Take the first inline comment
+                # Update nxt to the token after the comment
+                self.nxt = next_token
+        
+        # Remove the comment from comment_queue if we captured it
+        if comment_to_remove and hasattr(self.lex, 'comment_queue'):
+            self.lex.comment_queue = [(t, ct, ln) for t, ct, ln in self.lex.comment_queue 
+                                     if not (t == comment_to_remove[0] and ct == comment_to_remove[1] and ln == comment_to_remove[2])]
+        
+        # Note: We do NOT store inline comments in _param_inline_comments here because:
+        # 1. For instance parameters (ParamVal), we store it directly in ParamVal.comment
+        # 2. For parameter declarations (ParamDecl), parse_param_declaration() will handle it
+        # This prevents comments from instance parameters from being incorrectly associated with model parameters
+        
+        return ParamVal(name, e, comment=inline_comment)
 
     def parse_param_declaration(self):
         val = self.parse_param_val()
@@ -339,17 +386,10 @@ class DialectParser:
             _e = self.parse_expr()
         
         # Check for inline comment (// style) on the same line
-        # We stored any inline comments found during parameter value parsing in _param_inline_comments
-        inline_comment = None
+        # Use the comment from the ParamVal (which was captured in parse_param_val)
+        inline_comment = val.comment if hasattr(val, 'comment') else None
         
-        # Check if we stored any inline comments during parameter value parsing
-        if hasattr(self, '_param_inline_comments') and self._param_inline_comments:
-            inline_comment = self._param_inline_comments.pop(0)  # Take the first one
-            # Clean up if empty
-            if not self._param_inline_comments:
-                delattr(self, '_param_inline_comments')
-        
-        # If no comment was found, also check comment_queue for comments on the current line
+        # If no comment was found in ParamVal, check comment_queue for comments on the current line
         if inline_comment is None:
             current_line = self.lex.line_num
             if hasattr(self.lex, 'comment_queue'):

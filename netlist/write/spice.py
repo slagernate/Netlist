@@ -348,6 +348,10 @@ class SpiceNetlister(Netlister):
         name = self.format_ident(param.name)
         val = self.format_expr(param.val)
         self.write(f"{name}={val}")
+        
+        # Write inline comment if present (only for ParamVal, not Option)
+        if hasattr(param, 'comment') and param.comment:
+            self.write(f" ; {param.comment}")
 
     def write_comment(self, comment: str) -> None:
         """While dialects vary, the *generic* Spice-comment begins with the asterisk."""

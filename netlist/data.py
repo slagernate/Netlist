@@ -414,6 +414,7 @@ class ParamVal:
 
     name: Ident
     val: "Expr"
+    comment: Optional[str] = None  # Inline comment (// style) on the same line as the parameter
 
 
 @datatype
