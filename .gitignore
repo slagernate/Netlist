@@ -145,3 +145,5 @@ cython_debug/
 
 # Generated example output files
 examples/spectre_to_xyce/*.cir
+
+tags
