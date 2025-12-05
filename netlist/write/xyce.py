@@ -112,7 +112,7 @@ class XyceNetlister(SpiceNetlister):
                 # Create a safe name by appending _param
                 safe_name = f"{name}_param"
                 self._reserved_param_map[name_lower] = safe_name
-                warn(f"Renaming reserved parameter '{name}' to '{safe_name}' for Xyce compatibility")
+                self.log_warning(f"Renaming reserved parameter '{name}' to '{safe_name}' for Xyce compatibility")
             return self._reserved_param_map[name_lower]
         
         return name
@@ -507,7 +507,7 @@ class XyceNetlister(SpiceNetlister):
             if mod_name in ("resistor", "res", "r"):
                 if not inst_name_base.upper().startswith("R"):
                     prefix = "R"
-                    warn(f"Instance {pinst.name.name} uses resistor model but lacks R prefix. Prepending R_")
+                    self.log_warning(f"Instance {pinst.name.name} uses resistor model but lacks R prefix. Prepending R_", f"Instance: {pinst.name.name}")
                 else:
                     prefix = "R"  # Ensure prefix is set
                     # If name starts with lowercase 'r', we still want to ensure it's uppercase R
@@ -517,7 +517,7 @@ class XyceNetlister(SpiceNetlister):
             elif mod_name in ("capacitor", "cap", "c"):
                 if not inst_name_base.upper().startswith("C"):
                     prefix = "C"
-                    warn(f"Instance {pinst.name.name} uses capacitor model but lacks C prefix. Prepending C_")
+                    self.log_warning(f"Instance {pinst.name.name} uses capacitor model but lacks C prefix. Prepending C_", f"Instance: {pinst.name.name}")
                 else:
                     prefix = "C"  # Ensure prefix is set
                     # If name starts with lowercase 'c', we still want to ensure it's uppercase C
@@ -527,7 +527,7 @@ class XyceNetlister(SpiceNetlister):
             elif mod_name in ("inductor", "ind", "l"):
                 if not inst_name_base.upper().startswith("L"):
                     prefix = "L"
-                    warn(f"Instance {pinst.name.name} uses inductor model but lacks L prefix. Prepending L_")
+                    self.log_warning(f"Instance {pinst.name.name} uses inductor model but lacks L prefix. Prepending L_", f"Instance: {pinst.name.name}")
                 else:
                     prefix = "L"  # Ensure prefix is set
                     # If name starts with lowercase 'l', we still want to ensure it's uppercase L
@@ -578,7 +578,7 @@ class XyceNetlister(SpiceNetlister):
                 m_param_val = ParamVal(name=Ident("m"), val=Ref(ident=Ident("m")))
                 # Insert m parameter at the beginning (typical MOS device ordering)
                 pinst.params.insert(0, m_param_val)
-                warn(f"Added m={{m}} parameter to instance {pinst.name.name} (referenced in expressions)")
+                self.log_warning(f"Added m={{m}} parameter to instance {pinst.name.name} (referenced in expressions)", f"Instance: {pinst.name.name}")
 
         # Write its parameter values (pass is_model to skip PARAMS: for models, and module_ref for BSIM4 detection)
         module_ref = pinst.module if isinstance(pinst.module, Ref) else None
@@ -637,21 +637,21 @@ class XyceNetlister(SpiceNetlister):
             if model_name in ("resistor", "res", "r"):
                 if not inst_name_base.upper().startswith("R"):
                     prefix = "R"
-                    warn(f"Instance {pinst.name.name} uses resistor model but lacks R prefix. Prepending R_")
+                    self.log_warning(f"Instance {pinst.name.name} uses resistor model but lacks R prefix. Prepending R_", f"Instance: {pinst.name.name}")
                 else:
                     prefix = "R"  # Ensure prefix is set even if name already has it
                 skip_model_name = True
             elif model_name in ("capacitor", "cap", "c"):
                 if not inst_name_base.upper().startswith("C"):
                     prefix = "C"
-                    warn(f"Instance {pinst.name.name} uses capacitor model but lacks C prefix. Prepending C_")
+                    self.log_warning(f"Instance {pinst.name.name} uses capacitor model but lacks C prefix. Prepending C_", f"Instance: {pinst.name.name}")
                 else:
                     prefix = "C"  # Ensure prefix is set even if name already has it
                 skip_model_name = True
             elif model_name in ("inductor", "ind", "l"):
                 if not inst_name_base.upper().startswith("L"):
                     prefix = "L"
-                    warn(f"Instance {pinst.name.name} uses inductor model but lacks L prefix. Prepending L_")
+                    self.log_warning(f"Instance {pinst.name.name} uses inductor model but lacks L prefix. Prepending L_", f"Instance: {pinst.name.name}")
                 else:
                     prefix = "L"  # Ensure prefix is set even if name already has it
                 skip_model_name = True
@@ -765,7 +765,7 @@ class XyceNetlister(SpiceNetlister):
 
         if options.name is not None:
             msg = f"Warning invalid `name`d Options"
-            warn(msg)
+            self.log_warning(msg)
             self.write_comment(msg)
             self.write("\n")
 
@@ -1116,7 +1116,7 @@ class XyceNetlister(SpiceNetlister):
         """Format a parameter declaration, with special handling for param functions in Xyce."""
         if param.distr is not None:
             msg = f"Unsupported `distr` for parameter {param.name} will be ignored"
-            warn(msg)
+            self.log_warning(msg, f"Parameter: {param.name.name}")
             self.write("\n+ ")
             self.write_comment(msg)
             self.write("\n+ ")
@@ -1128,7 +1128,7 @@ class XyceNetlister(SpiceNetlister):
             # This is a param function like lnorm(mu,sigma) or mm_z1__mismatch__(dummy_param)
             if param.default is None:
                 msg = f"Required (non-default) param function {param.name} is not supported."
-                warn(msg)
+                self.log_warning(msg, f"Parameter: {param.name.name}")
                 default = str(sys.float_info.max)
             else:
                 # For param functions, use = for lnorm, ' quotes for mismatch
@@ -1175,7 +1175,7 @@ class XyceNetlister(SpiceNetlister):
                 else:
                     msg = f"Required (non-default) parameter {param.name} is not supported by {self.__class__.__name__}. "
                     msg += f"Setting to maximum floating-point value {sys.float_info.max}, which almost certainly will not work if instantiated."
-                    warn(msg)
+                    self.log_warning(msg, f"Parameter: {param.name.name}")
                     default = str(sys.float_info.max)
         else:
             default = self.format_expr(param.default)
@@ -1336,15 +1336,20 @@ class XyceNetlister(SpiceNetlister):
         else:  # MetricNum - convert to Float since we can't preserve suffix easily
             return Float(clamped_val)
 
-    def _map_bjt_level1_to_mextram_params(self, params: List[ParamDecl]) -> List[Tuple[ParamDecl, Optional[str], bool]]:
+    def _map_bjt_level1_to_mextram_params(self, params: List[ParamDecl], model_name: str = "") -> List[Tuple[ParamDecl, Optional[str], bool]]:
         """Map BJT level 1 (Gummel-Poon) parameters to MEXTRAM (level 504) parameters.
         
         Args:
             params: List of ParamDecl objects with level 1 parameter names
+            model_name: Name of the model being converted (for warning context)
             
         Returns:
             List of (ParamDecl, comment, commented_out) tuples
         """
+        # Track warnings for this conversion
+        commented_params = []
+        mapped_params_list = []
+        clamped_params = []
         # Mapping table: (level1_param_name, mextram_param_name_or_action, optional_range_tuple)
         # Actions can be:
         # - 'PARAM': Direct mapping to new name
@@ -1549,6 +1554,7 @@ class XyceNetlister(SpiceNetlister):
                 
                 if action is None:
                     # Drop (comment out)
+                    commented_params.append(param.name.name)
                     mapped_params.append((param, "Dropped: No MEXTRAM equivalent", True))
                     continue
                     
@@ -1556,6 +1562,7 @@ class XyceNetlister(SpiceNetlister):
                     new_name, warning_msg = action
                     if new_name is None:
                         # Comment out with custom message
+                        commented_params.append(f"{param.name.name} ({warning_msg})")
                         mapped_params.append((param, f"Dropped: {warning_msg}", True))
                         continue
                     else:
@@ -1581,6 +1588,7 @@ class XyceNetlister(SpiceNetlister):
                                             old_val = default_val.val if hasattr(default_val, 'val') else default_val
                                             new_val = clamped.val if hasattr(clamped, 'val') else clamped
                                             if abs(old_val - new_val) >= 1e-12:
+                                                clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val})")
                                                 default_val = clamped
                                         else:
                                             default_val = clamped
@@ -1624,6 +1632,7 @@ class XyceNetlister(SpiceNetlister):
                                         old_val = default_val.val if hasattr(default_val, 'val') else default_val
                                         new_val = clamped.val if hasattr(clamped, 'val') else clamped
                                         if abs(old_val - new_val) >= 1e-12:
+                                            clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val})")
                                             default_val = clamped
                                     else:
                                         default_val = clamped
@@ -1650,14 +1659,35 @@ class XyceNetlister(SpiceNetlister):
                     comment = f"{param.name.name} -> {new_name} (lvl 1 -> lvl 504)"
                     if param.name.name.lower() == new_name.lower():
                         comment = None
+                    else:
+                        mapped_params_list.append(f"{param.name.name} -> {new_name}")
                         
                     add_param(new_name, default_val, param.distr, comment=comment)
                 else:
                     # Fallback
+                    commented_params.append(f"{param.name.name} (Unknown mapping action)")
                     mapped_params.append((param, "Dropped: Unknown mapping action", True))
             else:
                 # Not in mapping, keep as-is
                 add_param(param.name.name, param.default, param.distr)
+        
+        # Log warnings about the conversion
+        context = f"Model: {model_name}" if model_name else None
+        if commented_params:
+            self.log_warning(
+                f"BJT Level 1 -> MEXTRAM conversion: {len(commented_params)} parameter(s) commented out (not compatible with Xyce MEXTRAM): {', '.join(commented_params)}",
+                context
+            )
+        if mapped_params_list:
+            self.log_warning(
+                f"BJT Level 1 -> MEXTRAM conversion: {len(mapped_params_list)} parameter(s) renamed: {', '.join(mapped_params_list)}",
+                context
+            )
+        if clamped_params:
+            self.log_warning(
+                f"BJT Level 1 -> MEXTRAM conversion: {len(clamped_params)} parameter value(s) clamped to valid range: {', '.join(clamped_params)}",
+                context
+            )
         
         return mapped_params
 
@@ -1746,8 +1776,15 @@ class XyceNetlister(SpiceNetlister):
                     
                     # Apply parameter mapping based on device type and level transition
                     if mtype_lower in ("npn", "pnp") and current_level == 1 and output_level == 504:
+                        # Log summary warning about BJT conversion
+                        self.log_warning(
+                            f"Converting BJT model '{mname}' from Level 1 (Gummel-Poon) to Level 504 (MEXTRAM). "
+                            "Many Level 1 parameters are not compatible with Xyce MEXTRAM and will be commented out. "
+                            "See detailed warnings below.",
+                            f"Model: {mname}"
+                        )
                         # Map level 1 BJT parameters to MEXTRAM (level 504)
-                        params_to_write = self._map_bjt_level1_to_mextram_params(params_to_write)
+                        params_to_write = self._map_bjt_level1_to_mextram_params(params_to_write, model_name=mname)
                     
                     # Update or add level parameter
                     if has_level:
@@ -1805,11 +1842,32 @@ class XyceNetlister(SpiceNetlister):
             # Check if level parameter already exists
             has_level = any(self._get_param_name(p) == "level" for p in params_to_write)
             
+            # Check current level if it exists
+            current_level = 1  # Default
+            if has_level:
+                for p in params_to_write:
+                    if self._get_param_name(p) == "level":
+                        default_val = self._get_param_default(p)
+                        if isinstance(default_val, (Int, Float)):
+                            current_level = int(float(default_val.val) if hasattr(default_val, 'val') else float(default_val))
+                        elif isinstance(default_val, MetricNum):
+                            current_level = int(float(default_val.val))
+                        break
+            
             # Add level=504 at the beginning if not already present
             if not has_level:
                 level_param = ParamDecl(name=Ident("level"), default=Int(504), distr=None)
                 params_to_write.insert(0, level_param)
                 bjt_uses_level_504 = True
+                # If we're defaulting to level 504, check if we need to convert parameters
+                if current_level == 1:
+                    self.log_warning(
+                        f"BJT model '{mname}' defaulting to Level 504 (MEXTRAM). "
+                        "Many Level 1 parameters may not be compatible and will be commented out. "
+                        "See detailed warnings below.",
+                        f"Model: {mname}"
+                    )
+                    params_to_write = self._map_bjt_level1_to_mextram_params(params_to_write, model_name=mname)
             else:
                 # If level exists, check its value
                 for i, p in enumerate(params_to_write):
@@ -1827,6 +1885,15 @@ class XyceNetlister(SpiceNetlister):
                                 # Update to level=504
                                 params_to_write[i] = ParamDecl(name=Ident("level"), default=Int(504), distr=None)
                                 bjt_uses_level_504 = True
+                                # Convert parameters if upgrading from level 1
+                                if current_level == 1:
+                                    self.log_warning(
+                                        f"BJT model '{mname}' upgraded from Level {int(current_level)} to Level 504 (MEXTRAM). "
+                                        "Many Level 1 parameters are not compatible and will be commented out. "
+                                        "See detailed warnings below.",
+                                        f"Model: {mname}"
+                                    )
+                                    params_to_write = self._map_bjt_level1_to_mextram_params(params_to_write, model_name=mname)
                             elif abs(current_level - 504.0) < 0.1:  # Close to 504
                                 # Already level 504, but ensure it's Int not Float
                                 params_to_write[i] = ParamDecl(name=Ident("level"), default=Int(504), distr=None)

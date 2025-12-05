@@ -4,8 +4,9 @@ Base Netlister Class and Error Modes
 
 import sys
 from enum import Enum
-from typing import IO, Union, Tuple, List
+from typing import IO, Union, Tuple, List, Optional
 from warnings import warn
+from datetime import datetime
 from ..data import (
     Program,
     Expr,
@@ -58,6 +59,7 @@ class Netlister:
         self.indent = "  "
         self.file_type = file_type  # "models" or "library" (or empty for default)
         self.errors = []
+        self._warnings = []  # List of (message, context) tuples for log file
 
     @property
     def enum(self):
@@ -256,6 +258,28 @@ class Netlister:
             print(f"Warning: {msg} in {obj}")
         if self.errormode == ErrorMode.STORE:
             self.errors.append((obj, msg))
+    
+    def log_warning(self, message: str, context: Optional[str] = None) -> None:
+        """Log a warning message for inclusion in the translation log file.
+        
+        Args:
+            message: The warning message
+            context: Optional context information (e.g., model name, parameter name)
+        """
+        self._warnings.append((message, context))
+        # Also emit standard warning for backward compatibility
+        if context:
+            warn(f"{message} (Context: {context})")
+        else:
+            warn(message)
+    
+    def get_warnings(self) -> List[Tuple[str, Optional[str]]]:
+        """Get all collected warnings.
+        
+        Returns:
+            List of (message, context) tuples
+        """
+        return self._warnings.copy()
 
     def format_ident(self, ident: Union[Ident, Ref]) -> str:
         """Format an identifier"""
