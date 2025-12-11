@@ -1370,3 +1370,146 @@ def test_ngspice_statistics_mismatch():
     
     # Original parameter should be removed
     assert "width" not in param_names
+
+
+def test_ngspice_subcircuit_param_scope_in_models():
+    """Test that subcircuit parameters used in models get .param statements for ngspice"""
+    from netlist.data import ModelDef, ParamDecl, Ident, Float, Ref, Expr
+    
+    # Create subcircuit with parameter
+    subckt = SubcktDef(
+        name=Ident("nmos"),
+        ports=[Ident("d"), Ident("g"), Ident("s"), Ident("b")],
+        params=[
+            ParamDecl(name=Ident("swx_nrds"), default=BinaryOp(
+                tp=BinaryOperator.ADD,
+                left=BinaryOp(tp=BinaryOperator.MUL, left=Float(89.1), right=BinaryOp(tp=BinaryOperator.DIV, left=Ref(ident=Ident("nf")), right=Ref(ident=Ident("w")))),
+                right=Float(443.5)
+            ), distr=None)
+        ],
+        entries=[
+            # Model that references subcircuit parameter
+            ModelDef(
+                name=Ident("nshort_model"),
+                mtype=Ident("nmos"),
+                args=[],
+                params=[
+                    ParamDecl(name=Ident("rsh"), default=Ref(ident=Ident("swx_nrds")), distr=None)
+                ]
+            )
+        ]
+    )
+    src = Program(files=[SourceFile(path="/", contents=[subckt])])
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.NGSPICE))
+    output = dest.getvalue()
+    
+    # Should have .param statement for swx_nrds before the model
+    lines = output.split('\n')
+    subckt_start = None
+    param_line = None
+    model_line = None
+    for i, line in enumerate(lines):
+        if '.SUBCKT nmos' in line:
+            subckt_start = i
+        if subckt_start is not None and '.param swx_nrds' in line:
+            param_line = i
+        if subckt_start is not None and '.model nshort_model' in line:
+            model_line = i
+            break
+    
+    assert param_line is not None, "Should have .param swx_nrds statement"
+    assert model_line is not None, "Should have model definition"
+    assert param_line < model_line, ".param statement should come before model"
+
+
+def test_ngspice_subcircuit_param_scope_in_instances():
+    """Test that subcircuit parameters used in instance parameters get .param statements for ngspice"""
+    from netlist.data import Instance, ParamVal, Ref
+    
+    # Create subcircuit with parameter
+    subckt = SubcktDef(
+        name=Ident("nmos_de_nat_v20"),
+        ports=[Ident("d"), Ident("g"), Ident("s"), Ident("b")],
+        params=[
+            ParamDecl(name=Ident("nrd"), default=BinaryOp(
+                tp=BinaryOperator.MUL,
+                left=Float(0.205),
+                right=BinaryOp(tp=BinaryOperator.DIV, left=Ref(ident=Ident("nf")), right=Ref(ident=Ident("w")))
+            ), distr=None),
+            ParamDecl(name=Ident("as"), default=BinaryOp(
+                tp=BinaryOperator.MUL,
+                left=Float(0.29),
+                right=Ref(ident=Ident("w"))
+            ), distr=None)
+        ],
+        entries=[
+            # Instance that uses subcircuit parameters directly (nrd={nrd}, as={as})
+            Instance(
+                name=Ident("m1"),
+                module=Ref(ident=Ident("nmos_de_v20_base")),
+                conns=[Ident("d1"), Ident("g"), Ident("s"), Ident("b")],
+                params=[
+                    ParamVal(name=Ident("nrd"), val=Ref(ident=Ident("nrd"))),
+                    ParamVal(name=Ident("as"), val=Ref(ident=Ident("as")))
+                ]
+            )
+        ]
+    )
+    src = Program(files=[SourceFile(path="/", contents=[subckt])])
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.NGSPICE))
+    output = dest.getvalue()
+    
+    # Should have .param statements for nrd and as before the instance
+    lines = output.split('\n')
+    subckt_start = None
+    nrd_param_line = None
+    as_param_line = None
+    instance_line = None
+    for i, line in enumerate(lines):
+        if '.SUBCKT nmos_de_nat_v20' in line:
+            subckt_start = i
+        if subckt_start is not None and '.param nrd=' in line:
+            nrd_param_line = i
+        if subckt_start is not None and '.param as=' in line:
+            as_param_line = i
+        if subckt_start is not None and 'm1 ' in line and not line.strip().startswith('+'):
+            instance_line = i
+            break
+    
+    assert nrd_param_line is not None, "Should have .param nrd statement"
+    assert as_param_line is not None, "Should have .param as statement"
+    assert instance_line is not None, "Should have instance"
+    assert nrd_param_line < instance_line, ".param nrd should come before instance"
+    assert as_param_line < instance_line, ".param as should come before instance"
+
+
+def test_ngspice_node_names_no_braces():
+    """Test that node names in ngspice are written without braces"""
+    from netlist.data import Instance, Ref, Ident
+    
+    # Create instance with node connections
+    instance = Instance(
+        name=Ident("m1"),
+        module=Ref(ident=Ident("nmos_model")),
+        conns=[Ident("d1"), Ident("g"), Ident("s"), Ident("b")],
+        params=[]
+    )
+    subckt = SubcktDef(
+        name=Ident("test_sub"),
+        ports=[],
+        params=[],
+        entries=[instance]
+    )
+    src = Program(files=[SourceFile(path="/", contents=[subckt])])
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.NGSPICE))
+    output = dest.getvalue()
+    
+    # Node names should NOT have braces
+    assert "{d1}" not in output, "Node names should not have braces"
+    assert "d1 " in output or "d1\n" in output, "Should have node name d1 without braces"
+    assert "{g}" not in output
+    assert "{s}" not in output
+    assert "{b}" not in output
