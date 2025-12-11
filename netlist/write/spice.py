@@ -172,11 +172,23 @@ class SpiceNetlister(Netlister):
 
     def write_subckt_instance(self, pinst: Instance) -> None:
         """Write sub-circuit-instance `pinst`."""
+        from ..data import ParamVal, Ref, Ident
         # Detect if the instance looks like a MOS device (even if parsed as subcircuit instance)
         conn_count = len(pinst.conns)
         has_l_w = {'l', 'w'} <= {p.name.name for p in pinst.params}
         is_module_ref = isinstance(pinst.module, Ref)
         name_has_mos = any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet'])
+        name_has_bjt = any(keyword in pinst.name.name.lower() for keyword in ['npn', 'pnp', 'bjt', 'q'])
+        name_has_res = any(keyword in pinst.name.name.lower() for keyword in ['res', 'rc', 'r'])
+        name_has_diode = any(keyword in pinst.name.name.lower() for keyword in ['diode', 'd', 'dn'])
+        
+        # Check if module name suggests resistor or diode
+        module_name_res = False
+        module_name_diode = False
+        if is_module_ref:
+            module_name = pinst.module.ident.name.lower()
+            module_name_res = any(keyword in module_name for keyword in ['resistor', 'res', 'r'])
+            module_name_diode = any(keyword in module_name for keyword in ['diode', 'd'])
         
         is_mos_like = (
             conn_count == 4  # Exactly 4 ports (d, g, s, b)
@@ -184,8 +196,31 @@ class SpiceNetlister(Netlister):
             and has_l_w  # Has both 'l' and 'w' params
             and name_has_mos  # Instance name indicates MOS
         )
+        
+        # Detect if the instance looks like a BJT device (even if parsed as subcircuit instance)
+        is_bjt_like = (
+            conn_count == 4  # Exactly 4 ports (c, b, e, s)
+            and is_module_ref  # References a model
+            and name_has_bjt  # Instance name indicates BJT
+        )
+        
+        # Detect if the instance looks like a resistor (even if parsed as subcircuit instance)
+        # Resistors typically have 2 ports and reference a resistor model
+        has_r_param = 'r' in {p.name.name.lower() for p in pinst.params}
+        is_res_like = (
+            conn_count == 2  # Exactly 2 ports
+            and (is_module_ref and module_name_res) or (not is_module_ref and (name_has_res or has_r_param))
+        )
+        
+        # Detect if the instance looks like a diode (even if parsed as subcircuit instance)
+        # Diodes typically have 2 ports and reference a diode model
+        has_diode_params = any(p.name.name.lower() in ['area', 'perim', 'pj'] for p in pinst.params)
+        is_diode_like = (
+            conn_count == 2  # Exactly 2 ports
+            and (is_module_ref and module_name_diode) or (not is_module_ref and (name_has_diode or has_diode_params))
+        )
 
-        prefix = 'M' if is_mos_like else 'X'
+        prefix = 'M' if is_mos_like else ('Q' if is_bjt_like else ('R' if is_res_like else ('D' if is_diode_like else 'X')))
 
         inst_name = self.format_ident(pinst.name)
         if prefix and not inst_name.upper().startswith(prefix):
@@ -197,8 +232,11 @@ class SpiceNetlister(Netlister):
         # Write its port-connections
         self.write_instance_conns(pinst)
 
-        # Write the sub-circuit name
-        self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
+        # For resistors and diodes detected as primitives, don't write the module name (they're primitives)
+        # For other devices, write the sub-circuit/model name
+        if not is_res_like and not is_diode_like:
+            # Write the sub-circuit name
+            self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
 
         # Check if instance parameter expressions reference 'm' and add m={m} if needed
         has_m_in_params = any(p.name.name == "m" for p in pinst.params)
@@ -228,7 +266,20 @@ class SpiceNetlister(Netlister):
                 warn(f"Added m={{m}} parameter to instance {pinst.name.name} (referenced in expressions)")
         
         # Write its parameter values
-        self.write_instance_params(pinst.params)
+        # For resistors, replace 'temp' with 'temper' in expressions (ngspice uses 'temper' as built-in)
+        if is_res_like:
+            # Create modified params with temp->temper replacement
+            modified_params = []
+            for pval in pinst.params:
+                if isinstance(pval.val, Expr):
+                    # Replace temp references with temper in expressions
+                    modified_val = self._replace_temp_with_temper(pval.val)
+                    modified_params.append(ParamVal(name=pval.name, val=modified_val))
+                else:
+                    modified_params.append(pval)
+            self.write_instance_params(modified_params)
+        else:
+            self.write_instance_params(pinst.params)
 
         # Add a blank after each instance
         self.write("\n")
@@ -251,14 +302,26 @@ class SpiceNetlister(Netlister):
         self.write(inst_name + " \n")
 
         # Write ports (exluding last (model)) on a separate continuation line
+        # For ngspice, ensure node names are written without braces
         self.write("+ ")
         for arg in pinst.args[:-1]:  # Ports only (exclude the model)
             if isinstance(arg, Ident):
-                self.write(self.format_ident(arg) + " ")
+                conn_name = arg.name
+            elif isinstance(arg, Ref):
+                conn_name = arg.ident.name
             elif isinstance(arg, (Int, Float, MetricNum)):
                 self.write(self.format_number(arg) + " ")
+                continue
             else:
-                self.write(self.format_expr(arg) + " ")
+                # For other types, try to extract name, but fall back to format_expr
+                # Then remove braces if present
+                conn_name = self.format_expr(arg)
+                if conn_name.startswith('{') and conn_name.endswith('}'):
+                    conn_name = conn_name[1:-1]
+            
+            # Write node name without braces (SPICE standard)
+            if isinstance(arg, (Ident, Ref)) or (not isinstance(arg, (Int, Float, MetricNum))):
+                self.write(conn_name + " ")
         self.write("\n")
         # Write the model (last arg) on another continuation line
         self.write("+ " + self.format_ident(pinst.args[-1]) + " \n")
@@ -505,6 +568,92 @@ class NgspiceNetlister(SpiceNetlister):
     - Parameter functions use .param func_name(args) = {expression} syntax
     """
 
+    def write_instance_conns(self, pinst: Instance) -> None:
+        """Write the port-connections for Instance `pinst`.
+        
+        Override to ensure node names are written without braces (ngspice interprets braces as expressions).
+        """
+        from ..data import Ref, Ident, Expr
+        
+        # Write a quick comment for port-less modules
+        if not len(pinst.conns):
+            self.write("+ ")
+            return self.write_comment("No ports")
+
+        if isinstance(pinst.conns[0], tuple):
+            # FIXME: connections by-name are not supported.
+            raise RuntimeError(f"Unsupported by-name connections on {pinst}")
+
+        self.write("+ ")
+        # And write the Instance ports, in that order
+        # For ngspice, ensure node names are written without braces
+        # Node names should NEVER have braces - braces are for expressions/parameters only
+        for pconn in pinst.conns:
+            # Extract the identifier name directly without any expression formatting
+            # Connections are always identifiers (node names), never expressions
+            # Check Ident first (most common)
+            if isinstance(pconn, Ident):
+                conn_name = pconn.name
+            # Check Ref second (Ref is a subclass of Expr, so check before Expr)
+            elif isinstance(pconn, Ref):
+                conn_name = pconn.ident.name
+            # Check if it has a name attribute (but Ref and Ident are already handled above)
+            elif hasattr(pconn, 'name'):
+                try:
+                    # Try to get name directly
+                    name_attr = getattr(pconn, 'name')
+                    # If it's a property/method, call it; otherwise use the value
+                    if callable(name_attr):
+                        conn_name = name_attr()
+                    else:
+                        conn_name = name_attr
+                except:
+                    conn_name = None
+            # Check if it has an ident attribute (Ref-like)
+            elif hasattr(pconn, 'ident'):
+                try:
+                    ident = getattr(pconn, 'ident')
+                    if hasattr(ident, 'name'):
+                        name_attr = getattr(ident, 'name')
+                        if callable(name_attr):
+                            conn_name = name_attr()
+                        else:
+                            conn_name = name_attr
+                    else:
+                        conn_name = None
+                except:
+                    conn_name = None
+            else:
+                conn_name = None
+            
+            # If we still don't have a name, use format_ident as last resort
+            if conn_name is None:
+                conn_name = self.format_ident(pconn)
+            
+            # Ensure conn_name is a string
+            if not isinstance(conn_name, str):
+                conn_name = str(conn_name)
+            
+            # CRITICAL: Remove any braces that might have been added
+            # SPICE node names must NEVER have braces - braces are only for expressions
+            # This is a safety check in case format_ident or something else added braces
+            if conn_name.startswith('{') and conn_name.endswith('}'):
+                conn_name = conn_name[1:-1]
+            
+            # Write node name without braces (SPICE standard)
+            self.write(conn_name + " ")
+        self.write("\n")
+
+    def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "", includes: List[Tuple[str, str]] = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None) -> None:
+        super().__init__(src, dest, errormode=errormode, file_type=file_type)
+        self.includes = includes or []
+        self.model_file = model_file
+        # Process model_level_mapping: convert lists to dicts for efficient lookup
+        self._model_level_mapping: Dict[str, Dict[int, int]] = {}
+        if model_level_mapping:
+            for key, mappings in model_level_mapping.items():
+                self._model_level_mapping[key.lower()] = {in_level: out_level for in_level, out_level in mappings}
+
     @property
     def enum(self):
         """Get our entry in the `NetlistDialects` enumeration"""
@@ -536,6 +685,19 @@ class NgspiceNetlister(SpiceNetlister):
         """ngspice uses standard SPICE comment syntax with asterisk."""
         self.write(f"* {comment}\n")
 
+    def _format_expr_inner(self, expr: Expr) -> str:
+        """Override to replace round() with nint() for ngspice compatibility."""
+        if isinstance(expr, Call):
+            func = self.format_ident(expr.func)
+            # Replace round() with nint() for ngspice compatibility
+            if func.lower() == "round":
+                func = "nint"
+            args = [self._format_expr_inner(arg) for arg in expr.args]
+            return f"{func}({','.join(args)})"
+        
+        # For all other expression types, call parent implementation
+        return super()._format_expr_inner(expr)
+
     def write_function_def(self, func: FunctionDef) -> None:
         """Write a ngspice .param function definition for FunctionDef `func`.
 
@@ -566,11 +728,142 @@ class NgspiceNetlister(SpiceNetlister):
 
         self.write(" }\n")
 
+    def write_subckt_def(self, module: SubcktDef) -> None:
+        """Write the `SUBCKT` definition for `Module` `module`.
+        
+        Overrides base class to put ports on the same line as .SUBCKT (standard SPICE format).
+        """
+        # Store current subcircuit context for use in write_subckt_instance
+        self._current_subckt = module
+
+        # Create the module name
+        module_name = self.format_ident(module.name)
+
+        # Create the sub-circuit definition header with ports on same line (standard SPICE)
+        if module.ports:
+            port_names = [self.format_ident(port) for port in module.ports]
+            self.write(f".SUBCKT {module_name} {' '.join(port_names)}\n")
+        else:
+            self.write(f".SUBCKT {module_name}\n")
+            self.write("+ ")
+            self.write_comment("No ports")
+            self.write("\n")
+
+        # Check if any entries reference 'm' parameter and ensure it exists in subcircuit params
+        has_m_param = any(p.name.name == "m" for p in module.params)
+        needs_m_param = False
+        
+        # Check all entries for 'm' references
+        for entry in module.entries:
+            if isinstance(entry, Instance):
+                # Check if any instance parameter value references 'm'
+                for pval in entry.params:
+                    if isinstance(pval.val, Expr):
+                        if expr_references_param(pval.val, "m"):
+                            needs_m_param = True
+                            break
+                if needs_m_param:
+                    break
+        
+        # Add m=1 parameter if needed but not present
+        if needs_m_param and not has_m_param:
+            m_param = ParamDecl(name=Ident("m"), default=Float(1.0), distr=None)
+            module.params.append(m_param)
+        
+        # Create its parameters, if any are defined
+        if module.params:
+            self.write_module_params(module.params)
+        else:
+            self.write("+ ")
+            self.write_comment("No parameters")
+            self.write("\n")
+
+        # End the `subckt` header-content with a blank line
+        self.write("\n")
+
+        # For ngspice: Check if any models inside this subcircuit reference subcircuit parameters
+        # If so, add .param statements for those parameters to ensure they're in scope when models are evaluated
+        if module.params:
+            from ..data import ModelDef, ModelFamily, Ref
+            
+            # Collect parameter names from subcircuit
+            subckt_param_names = {p.name.name for p in module.params}
+            
+            # Check all entries for models and instances that reference subcircuit parameters
+            params_needed_as_param_statements = set()
+            for entry in module.entries:
+                if isinstance(entry, ModelDef):
+                    # Check all model parameters for references to subcircuit parameters
+                    for param in entry.params:
+                        if param.default is not None and isinstance(param.default, Expr):
+                            # Check if this expression references any subcircuit parameter
+                            for subckt_param_name in subckt_param_names:
+                                if expr_references_param(param.default, subckt_param_name):
+                                    params_needed_as_param_statements.add(subckt_param_name)
+                                    break
+                elif isinstance(entry, ModelFamily):
+                    # Check all variants
+                    for variant in entry.variants:
+                        for param in variant.params:
+                            if param.default is not None and isinstance(param.default, Expr):
+                                for subckt_param_name in subckt_param_names:
+                                    if expr_references_param(param.default, subckt_param_name):
+                                        params_needed_as_param_statements.add(subckt_param_name)
+                                        break
+                elif isinstance(entry, Instance):
+                    # Check instance parameters for references to subcircuit parameters
+                    for pval in entry.params:
+                        # Check Ref first (it's a subclass of Expr, so order matters)
+                        if isinstance(pval.val, Ref):
+                            # Direct parameter reference (e.g., nrd={nrd})
+                            if pval.val.ident.name in subckt_param_names:
+                                params_needed_as_param_statements.add(pval.val.ident.name)
+                        elif isinstance(pval.val, Expr):
+                            # Complex expression that might reference subcircuit parameters
+                            for subckt_param_name in subckt_param_names:
+                                if expr_references_param(pval.val, subckt_param_name):
+                                    params_needed_as_param_statements.add(subckt_param_name)
+                                    break
+            
+            # Add .param statements for parameters that are referenced in models
+            # This ensures they're available when ngspice evaluates the model parameters
+            if params_needed_as_param_statements:
+                for param_name in sorted(params_needed_as_param_statements):  # Sort for deterministic output
+                    # Find the parameter definition
+                    for param in module.params:
+                        if param.name.name == param_name:
+                            # Write as .param statement
+                            self.write(".param ")
+                            self.write_param_decl(param)
+                            self.write("\n")
+                            break
+
+        # Write its internal content/ entries
+        for entry in module.entries:
+            self.write_entry(entry)
+
+        # And close up the sub-circuit
+        self.write(".ENDS\n\n")
+        # Clear current subcircuit context
+        self._current_subckt = None
+
+    def write_module_params(self, params: List[ParamDecl]) -> None:
+        """Write the parameter declarations for Module parameters.
+        
+        For ngspice, parameters are written on continuation lines without spaces around =.
+        Format: + name1=val1 name2=val2 name3=val3
+        """
+        self.write("+ ")
+        for param in params:
+            self.write_param_decl(param)
+            self.write(" ")
+        self.write("\n")
+
     def write_param_decl(self, param: ParamDecl) -> str:
         """Format a parameter declaration for ngspice.
         
         For parameter functions (with parentheses), uses .param func(args) = {expr} syntax.
-        For normal parameters, uses name = {expr} syntax (without .param prefix, as write_param_decls adds it).
+        For normal parameters, uses name={expr} syntax (no spaces around =, without .param prefix, as write_param_decls adds it).
         """
         if param.distr is not None:
             msg = f"Unsupported `distr` for parameter {param.name} will be ignored"
@@ -606,20 +899,196 @@ class NgspiceNetlister(SpiceNetlister):
                 return
 
         # Normal parameter declaration
-        # Note: write_param_decls adds ".param " prefix, so we just write name=value
+        # Note: write_param_decls adds ".param " prefix, so we just write name=value (no spaces around =)
         if param.default is None:
             msg = f"Required (non-default) parameter {param.name} is not supported by {self.__class__.__name__}. "
             msg += f"Setting to maximum floating-point value {sys.float_info.max}, which almost certainly will not work if instantiated."
             self.log_warning(msg, f"Parameter: {param.name.name}")
             default = str(sys.float_info.max)
         else:
-            default = self.format_expr(param.default)
+            # Special handling for 'type' parameter in model definitions
+            # In ngspice, type should be a string literal (type=n or type=p), not an expression (type={n})
+            if param_name.lower() == "type" and isinstance(param.default, Ref):
+                # If type is a simple reference like {n} or {p}, write as string literal
+                ref_name = param.default.ident.name.lower()
+                if ref_name in ('n', 'p'):
+                    default = ref_name
+                else:
+                    default = self.format_expr(param.default)
+            else:
+                default = self.format_expr(param.default)
 
-        self.write(f"{param_name} = {default}")
+        self.write(f"{param_name}={default}")
         
         # Write inline comment if present
+        # In ngspice, inline comments use semicolon (;) on the same line
         if param.comment:
-            self.write(f" * {param.comment}")
+            self.write(f" ; {param.comment}")
+
+    def write_model_def(self, model: ModelDef) -> None:
+        """Write a model definition in ngspice format, handling BJT level mapping."""
+        from ..data import Int, Float, MetricNum, ParamDecl, Ident
+        
+        # Helper to get param name safely
+        def get_param_name(item):
+            if isinstance(item, tuple):
+                return item[0].name.name
+            return item.name.name
+
+        mname = self.format_ident(model.name)
+        mtype = self.format_ident(model.mtype).lower()
+        
+        # Use local variable for params to avoid mutating the model object
+        params_to_write = list(model.params)  # Create a copy
+        
+        # Check for model level mapping (specific model name or device type)
+        level_mapping_applied = False
+        output_level = None
+        if self._model_level_mapping:
+            model_name_lower = model.name.name.lower()
+            mtype_lower = mtype.lower()
+            
+            # First check for specific model name mapping, then device type mapping
+            mapping_dict = None
+            if model_name_lower in self._model_level_mapping:
+                mapping_dict = self._model_level_mapping[model_name_lower]
+            elif mtype_lower in self._model_level_mapping:
+                mapping_dict = self._model_level_mapping[mtype_lower]
+            
+            if mapping_dict:
+                # Extract current level (default to 1 if not specified)
+                current_level = 1
+                has_level = False
+                for p in params_to_write:
+                    if get_param_name(p).lower() == "level":
+                        has_level = True
+                        if isinstance(p, tuple):
+                            p_obj = p[0]
+                        else:
+                            p_obj = p
+                        if isinstance(p_obj.default, (Int, Float)):
+                            current_level = int(float(p_obj.default.val) if hasattr(p_obj.default, 'val') else float(p_obj.default))
+                        elif isinstance(p_obj.default, MetricNum):
+                            current_level = int(float(p_obj.default.val))
+                        break
+                
+                # Check if current level has a mapping
+                if current_level in mapping_dict:
+                    output_level = mapping_dict[current_level]
+                    level_mapping_applied = True
+                    
+                    # Apply parameter mapping based on device type and level transition
+                    # ngspice uses level 6 for MEXTRAM (same as Xyce level 504)
+                    if mtype_lower in ("npn", "pnp") and current_level == 1 and output_level == 6:
+                        # Import the mapping function from XyceNetlister
+                        from .xyce import XyceNetlister
+                        # Create a temporary XyceNetlister instance to use its mapping function
+                        # We'll use a dummy IO object
+                        import io
+                        temp_xyce = XyceNetlister(self.src, io.StringIO(), model_level_mapping={"npn": [(1, 504)], "pnp": [(1, 504)]})
+                        # Extract just the ParamDecl objects (not tuples)
+                        param_decls = [p[0] if isinstance(p, tuple) else p for p in params_to_write]
+                        # Map level 1 BJT parameters to MEXTRAM (level 6 uses same params as level 504)
+                        mapped_params = temp_xyce._map_bjt_level1_to_mextram_params(param_decls, model_name=mname)
+                        # Convert back to list format (mapped_params returns tuples)
+                        params_to_write = mapped_params
+                    
+                    # Update or add level parameter
+                    if has_level:
+                        # Replace existing level parameter
+                        for i, p in enumerate(params_to_write):
+                            if get_param_name(p).lower() == "level":
+                                new_level_param = ParamDecl(name=Ident("level"), default=Int(output_level), distr=None)
+                                if isinstance(p, tuple):
+                                    # Preserve comment if present, but ensure not commented out
+                                    params_to_write[i] = (new_level_param, p[1], False)
+                                else:
+                                    params_to_write[i] = new_level_param
+                                break
+                    else:
+                        # Add level parameter at the beginning
+                        level_param = ParamDecl(name=Ident("level"), default=Int(output_level), distr=None)
+                        params_to_write.insert(0, level_param)
+        
+        # Write model header
+        # For BSIM4 models in ngspice, extract type from parameters and put it on .model line
+        # Format: .model name nmos level=14 or .model name pmos level=14
+        model_type_on_line = mtype.lower()
+        type_param_removed = False
+        
+        if mtype.lower() == "bsim4":
+            # Look for type parameter in params_to_write
+            for i, param_item in enumerate(params_to_write):
+                param = param_item[0] if isinstance(param_item, tuple) else param_item
+                if param.name.name.lower() == "type" and isinstance(param.default, Ref):
+                    ref_name = param.default.ident.name.lower()
+                    if ref_name in ('n', 'p'):
+                        # Use nmos/pmos on the .model line
+                        model_type_on_line = f"{ref_name}mos"
+                        # Remove type parameter from the list
+                        params_to_write.pop(i)
+                        type_param_removed = True
+                        break
+                elif param.name.name.lower() == "type" and isinstance(param.default, (Int, Float, MetricNum)):
+                    # Handle numeric type (shouldn't happen, but just in case)
+                    type_val = str(param.default.val if hasattr(param.default, 'val') else param.default)
+                    if type_val.lower() in ('n', 'p'):
+                        model_type_on_line = f"{type_val.lower()}mos"
+                        params_to_write.pop(i)
+                        type_param_removed = True
+                        break
+            
+            # Check for level parameter to add to .model line (BSIM4 uses level=14)
+            level_str = " level=14"  # Default for BSIM4
+            level_param_index = None
+            for i, param_item in enumerate(params_to_write):
+                param = param_item[0] if isinstance(param_item, tuple) else param_item
+                if param.name.name.lower() == "level":
+                    level_param_index = i
+                    if isinstance(param.default, (Int, Float)):
+                        level_val = int(float(param.default.val) if hasattr(param.default, 'val') else float(param.default))
+                        level_str = f" level={level_val}"
+                    elif isinstance(param.default, MetricNum):
+                        level_val = int(float(param.default.val))
+                        level_str = f" level={level_val}"
+                    break
+            
+            # Remove level parameter from params_to_write since it's on the .model line
+            if level_param_index is not None:
+                params_to_write.pop(level_param_index)
+            
+            self.writeln(f".model {mname} {model_type_on_line}{level_str}")
+        else:
+            self.writeln(f".model {mname} {mtype}")
+        
+        self.write("+ ")
+        
+        for arg in model.args:
+            self.write(self.format_expr(arg) + " ")
+        
+        self.write("\n")
+        
+        # Write parameters
+        for param_item in params_to_write:
+            self.write("+ ")
+            if isinstance(param_item, tuple):
+                # Handle (ParamDecl, comment, commented_out) tuple from mapping
+                param, comment, commented_out = param_item
+                if commented_out:
+                    # Write as comment
+                    self.write_comment(f"{get_param_name(param_item)}={self.format_expr(param.default)} - {comment}")
+                else:
+                    # Write parameter with optional comment
+                    self.write_param_decl(param)
+                    if comment:
+                        self.write(f" * {comment}")
+                    self.write("\n")
+            else:
+                # Normal parameter
+                self.write_param_decl(param_item)
+                self.write("\n")
+        
+        self.write("\n")  # Ending blank-line
 
     def netlist(self) -> None:
         """Override netlist() to apply ngspice-specific statistics variations before writing.
@@ -636,8 +1105,100 @@ class NgspiceNetlister(SpiceNetlister):
         # This modifies the AST directly, replacing StatisticsBlocks with generated content
         apply_statistics_variations(self.src, output_format=NetlistDialects.NGSPICE)
 
+        # For models files, add global tref and temp parameters if not already defined
+        # (tref and temp are commonly used in resistor expressions)
+        # Note: ngspice uses 'temper' as built-in, but expressions may use 'temp', so we define temp=temper
+        if self.file_type == "models":
+            from ..data import ParamDecls, ParamDecl, Float, Ident, Ref
+            # Check if tref and temp are already defined as global parameters
+            tref_defined = False
+            temp_defined = False
+            for file in self.src.files:
+                for entry in file.contents:
+                    if isinstance(entry, ParamDecls):
+                        for param in entry.params:
+                            if param.name.name.lower() == "tref":
+                                tref_defined = True
+                            if param.name.name.lower() == "temp":
+                                temp_defined = True
+                    elif isinstance(entry, ParamDecl):
+                        if entry.name.name.lower() == "tref":
+                            tref_defined = True
+                        if entry.name.name.lower() == "temp":
+                            temp_defined = True
+                    if tref_defined and temp_defined:
+                        break
+                if tref_defined and temp_defined:
+                    break
+            
+            # Add missing parameters at the beginning of the first file
+            if self.src.files:
+                first_file = self.src.files[0]
+                params_to_add = []
+                if not tref_defined:
+                    tref_param = ParamDecl(name=Ident("tref"), default=Float(30.0), distr=None)
+                    params_to_add.append(tref_param)
+                if not temp_defined:
+                    # Define temp as alias to ngspice's built-in 'temper' variable
+                    # Note: In ngspice, 'temper' is the built-in temperature variable
+                    temp_param = ParamDecl(name=Ident("temp"), default=Ref(ident=Ident("temper")), distr=None)
+                    params_to_add.append(temp_param)
+                
+                if params_to_add:
+                    # Insert at the beginning
+                    first_file.contents.insert(0, ParamDecls(params=params_to_add))
+
         # Call parent implementation to do the actual writing
         super().netlist()
+
+    def _replace_temp_with_temper(self, expr: Expr) -> Expr:
+        """Replace 'temp' parameter references with 'temper' (ngspice's built-in temperature variable) in expressions.
+        
+        This recursively walks the expression tree and replaces Ref objects with name 'temp'
+        with Ref objects with name 'temper'.
+        """
+        from ..data import Ref, Ident, BinaryOp, UnaryOp, TernOp, Call
+        
+        # Base case: if it's a Ref to 'temp', replace with 'temper'
+        if isinstance(expr, Ref):
+            if expr.ident.name.lower() == "temp":
+                # Create new Ref to 'temper'
+                return Ref(ident=Ident("temper"), resolved=expr.resolved)
+            return expr
+        
+        # For literals, return as-is
+        if isinstance(expr, (Int, Float, MetricNum, QuotedString)):
+            return expr
+        
+        # For compound expressions, recurse
+        if isinstance(expr, BinaryOp):
+            return BinaryOp(
+                tp=expr.tp,
+                left=self._replace_temp_with_temper(expr.left),
+                right=self._replace_temp_with_temper(expr.right)
+            )
+        
+        if isinstance(expr, UnaryOp):
+            return UnaryOp(
+                tp=expr.tp,
+                targ=self._replace_temp_with_temper(expr.targ)
+            )
+        
+        if isinstance(expr, TernOp):
+            return TernOp(
+                cond=self._replace_temp_with_temper(expr.cond),
+                if_true=self._replace_temp_with_temper(expr.if_true),
+                if_false=self._replace_temp_with_temper(expr.if_false)
+            )
+        
+        if isinstance(expr, Call):
+            return Call(
+                func=expr.func,
+                args=[self._replace_temp_with_temper(arg) for arg in expr.args]
+            )
+        
+        # For anything else, return as-is
+        return expr
 
     def write_test_netlist(self) -> None:
         """Write a sanity check netlist."""
@@ -650,6 +1211,18 @@ class NgspiceNetlister(SpiceNetlister):
         self.write(".param enable_mismatch=0\n")
         self.write(".param mismatch_factor=0\n")
         self.write(".param corner_factor=0\n\n")
+        
+        # Includes
+        self.write("* Includes\n")
+        for inc_file, section in self.includes:
+            if section:
+                self.write(f".lib '{inc_file}' {section}\n")
+            else:
+                self.write(f".include '{inc_file}'\n")
+        
+        if self.model_file:
+            self.write(f".include '{self.model_file}'\n")
+        self.write("\n")
         
         # Ground Reference
         self.write("* Ground Reference\n")
