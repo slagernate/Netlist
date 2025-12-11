@@ -1,0 +1,9 @@
+simulator lang=spectre
+
+* Minimal example: Parameter declarations
+parameters
++    vdd = 1.8
++    vss = 0.0
++    width = 1.0u
++    length = 0.18u
++    tox = 4.0n

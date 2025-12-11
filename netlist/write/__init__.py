@@ -189,6 +189,8 @@ def netlist(src, dest, options):
         netlister = XyceNetlister(src, dest, file_type=options.file_type, 
                                   includes=options.includes, model_file=options.model_file,
                                   model_level_mapping=options.model_level_mapping)
+    elif options.fmt == NetlistDialects.NGSPICE:
+        netlister = NgspiceNetlister(src, dest, file_type=options.file_type)
     else:
         netlister = SpiceNetlister(src, dest, file_type=options.file_type)
         

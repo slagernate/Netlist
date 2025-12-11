@@ -496,15 +496,214 @@ class HspiceNetlister(SpiceNetlister):
 
 
 class NgspiceNetlister(SpiceNetlister):
-    """FIXME: Ngspice-Format Netlister"""
-
-    def __init__(self, *_, **__):
-        raise NotImplementedError
+    """Ngspice-Format Netlister
+    
+    ngspice uses standard SPICE syntax with some specific features:
+    - Expressions use { } delimiters (same as Xyce)
+    - Comments use * (standard SPICE, not ; like Xyce)
+    - No PARAMS: keyword for subcircuit parameters
+    - Parameter functions use .param func_name(args) = {expression} syntax
+    """
 
     @property
     def enum(self):
         """Get our entry in the `NetlistDialects` enumeration"""
         return NetlistDialects.NGSPICE
+
+    def expression_delimiters(self) -> Tuple[str, str]:
+        """Return the starting and closing delimiters for expressions.
+        ngspice uses curly braces like Xyce."""
+        return ("{", "}")
+
+    def format_expr(self, expr: Expr) -> str:
+        """Format an expression for ngspice.
+        
+        Overrides base implementation to ensure Ref objects (parameters) 
+        are wrapped in curly braces, e.g. {Vdd} instead of just Vdd.
+        """
+        # Base cases that don't need braces
+        if isinstance(expr, (Int, Float, MetricNum)):
+            return self.format_number(expr)
+        if isinstance(expr, QuotedString):
+            return f"'{expr.val}'"
+
+        # Everything else (Ref, BinaryOp, Call, etc.) gets wrapped in braces
+        start, end = self.expression_delimiters()
+        inner = self._format_expr_inner(expr)
+        return f"{start}{inner}{end}"
+
+    def write_comment(self, comment: str) -> None:
+        """ngspice uses standard SPICE comment syntax with asterisk."""
+        self.write(f"* {comment}\n")
+
+    def write_function_def(self, func: FunctionDef) -> None:
+        """Write a ngspice .param function definition for FunctionDef `func`.
+
+        Format: .param func_name(arg1, arg2, ...) = { expression }
+        """
+        func_name = self.format_ident(func.name)
+
+        # Write function signature
+        self.write(f".param {func_name}(")
+
+        # Write arguments
+        if func.args:
+            arg_names = [self.format_ident(arg.name) for arg in func.args]
+            self.write(",".join(arg_names))
+
+        self.write(") = { ")
+
+        # Write function body - should be a single Return statement
+        if func.stmts and len(func.stmts) == 1 and isinstance(func.stmts[0], Return):
+            expr_str = self.format_expr(func.stmts[0].val)
+            # Remove outer braces if present (format_expr adds them, but we're already in { })
+            if expr_str.startswith("{") and expr_str.endswith("}"):
+                expr_str = expr_str[1:-1]
+            self.write(expr_str)
+        else:
+            # Fallback: handle multiple statements (shouldn't happen for our use case)
+            self.handle_error(func, "FunctionDef with multiple statements not supported")
+
+        self.write(" }\n")
+
+    def write_param_decl(self, param: ParamDecl) -> str:
+        """Format a parameter declaration for ngspice.
+        
+        For parameter functions (with parentheses), uses .param func(args) = {expr} syntax.
+        For normal parameters, uses name = {expr} syntax (without .param prefix, as write_param_decls adds it).
+        """
+        if param.distr is not None:
+            msg = f"Unsupported `distr` for parameter {param.name} will be ignored"
+            self.log_warning(msg, f"Parameter: {param.name.name}")
+            self.write("\n+ ")
+            self.write_comment(msg)
+            self.write("\n+ ")
+
+        param_name = self.format_ident(param.name)
+
+        # Check if this is a param function (name contains parentheses)
+        if '(' in param_name and param_name.endswith(')'):
+            # This is a param function like lnorm(mu,sigma) or mm_z1__mismatch__(dummy_param)
+            if param.default is None:
+                msg = f"Required (non-default) param function {param.name} is not supported."
+                self.log_warning(msg, f"Parameter: {param.name.name}")
+                default = str(sys.float_info.max)
+            else:
+                # For param functions, format expression and wrap in { }
+                default = param.default
+                if isinstance(default, str):
+                    # Already formatted
+                    default_str = default
+                else:
+                    default_str = self.format_expr(default)
+                    # Remove outer braces if present (format_expr adds them, but we're already in { })
+                    if default_str.startswith("{") and default_str.endswith("}"):
+                        default_str = default_str[1:-1]
+
+                # Use .param func_name(args) = {expression} syntax
+                # Note: write_param_decls adds ".param " prefix, so we just write the function definition
+                self.write(f"{param_name} = {{ {default_str} }}")
+                return
+
+        # Normal parameter declaration
+        # Note: write_param_decls adds ".param " prefix, so we just write name=value
+        if param.default is None:
+            msg = f"Required (non-default) parameter {param.name} is not supported by {self.__class__.__name__}. "
+            msg += f"Setting to maximum floating-point value {sys.float_info.max}, which almost certainly will not work if instantiated."
+            self.log_warning(msg, f"Parameter: {param.name.name}")
+            default = str(sys.float_info.max)
+        else:
+            default = self.format_expr(param.default)
+
+        self.write(f"{param_name} = {default}")
+        
+        # Write inline comment if present
+        if param.comment:
+            self.write(f" * {param.comment}")
+
+    def netlist(self) -> None:
+        """Override netlist() to apply ngspice-specific statistics variations before writing.
+
+        This applies statistics variations (process and mismatch) to the Program,
+        creating ngspice-specific artifacts like .param function definitions for mismatch parameters.
+        This only happens when writing to ngspice format.
+        """
+        # Check if we are generating a test netlist
+        if self.file_type == "test":
+            return self.write_test_netlist()
+
+        # Apply statistics variations with NGSPICE format before writing
+        # This modifies the AST directly, replacing StatisticsBlocks with generated content
+        apply_statistics_variations(self.src, output_format=NetlistDialects.NGSPICE)
+
+        # Call parent implementation to do the actual writing
+        super().netlist()
+
+    def write_test_netlist(self) -> None:
+        """Write a sanity check netlist."""
+        # Header
+        self.write("* Sanity Check Netlist generated by NgspiceNetlister\n\n")
+        
+        # Monte Carlo Control Parameters
+        self.write("* Monte Carlo Control Parameters\n")
+        self.write(".param process_mc_factor=0\n")
+        self.write(".param enable_mismatch=0\n")
+        self.write(".param mismatch_factor=0\n")
+        self.write(".param corner_factor=0\n\n")
+        
+        # Ground Reference
+        self.write("* Ground Reference\n")
+        self.write("R_gnd_ref 0 0 1M\n\n")
+        
+        self.write("* Device Instantiations\n\n")
+        
+        inst_count = 0
+        node_count = 0  # Simple counter for net names
+        
+        # Iterate definitions - only instantiate subcircuits, not models
+        definitions = []
+        for file in self.src.files:
+            for entry in file.contents:
+                if isinstance(entry, SubcktDef):
+                    definitions.append(entry)
+                    
+        for defn in definitions:
+            name = defn.name.name
+            inst_name = f"{name}_{inst_count}"
+            inst_count += 1
+            
+            # Get ports from subcircuit definition
+            ports = [p.name for p in defn.ports]
+            prefix = "X"
+            
+            # Instantiate resistors to ground for each port with simple net names
+            nodes = []
+            for port in ports:
+                node = f"n{node_count}"
+                nodes.append(node)
+                self.write(f"R_pd_{node} {node} 0 1M\n")
+                node_count += 1
+            
+            # Instantiate subcircuit with only m=1 parameter (skip all other defaults)
+            full_inst_name = f"{prefix}_{inst_name}"
+            self.write(f"{full_inst_name} {' '.join(nodes)} {name}\n")
+            
+            # Collect parameters to write - only m=1 for test files
+            inst_params = []
+            
+            # Only add m=1 parameter, skip all other default parameters
+            inst_params.append("m=1")
+            
+            # Write parameters
+            if inst_params:
+                self.write(f"+ {' '.join(inst_params)}\n")
+            
+            self.write("\n")
+            
+        self.write("* Simulation Commands\n")
+        self.write(".tran 1n 10n\n")
+        self.write(".print tran V(*)\n")
+        self.write(".end\n")
 
 
 class CdlNetlister(SpiceNetlister):
@@ -1021,6 +1220,57 @@ def add_lnorm_functions(program: Program) -> None:
     stats_file.contents.insert(0, ParamDecls(params=math_params))
 
 
+def add_lnorm_functions_ngspice(program: Program) -> None:
+    """Add lnorm and alnorm .param function declarations for ngspice.
+
+    Creates: .param lnorm(mu,sigma) = {exp(gauss(mu,sigma))}
+    These are added to the beginning of the file containing statistics blocks.
+    """
+    if not program.files:
+        return
+
+    # Find the file that contains statistics blocks (models.scs) to add params there
+    stats_file = None
+    for file in program.files:
+        for entry in file.contents:
+            if isinstance(entry, StatisticsBlock):
+                stats_file = file
+                break
+        if stats_file:
+            break
+
+    # Fallback to first file if no stats file found
+    if not stats_file:
+        stats_file = program.files[0]
+
+    # Create .param function declarations for lnorm and alnorm
+    # Create expression: exp(gauss(mu,sigma))
+    gauss_call = Call(
+        func=Ref(ident=Ident("gauss")),
+        args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma"))]
+    )
+    exp_call = Call(
+        func=Ref(ident=Ident("exp")),
+        args=[gauss_call]
+    )
+
+    math_params = [
+        ParamDecl(
+            name=Ident("lnorm(mu,sigma)"),
+            default=exp_call,
+            distr=None
+        ),
+        ParamDecl(
+            name=Ident("alnorm(mu,sigma)"),
+            default=exp_call,
+            distr=None
+        )
+    ]
+
+    # Insert params at the beginning of the file
+    stats_file.contents.insert(0, ParamDecls(params=math_params))
+
+
 def create_monte_carlo_distribution_call(dist_type: str, std: Float) -> Optional[Call]:
     """Create a distribution function call (gauss or lnorm) for Monte Carlo variation.
 
@@ -1152,7 +1402,7 @@ def apply_all_process_variations_legacy(program: Program, stats_blocks: List[Sta
                         matching_param.default = new_expr
 
 
-def replace_statistics_blocks_with_generated_content(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
+def replace_statistics_blocks_with_generated_content(program: Program, stats_blocks: List[StatisticsBlock], output_format: Optional["NetlistDialects"] = None) -> None:
     """Replace StatisticsBlocks in the AST with generated functions and process variations for library parameters."""
     # Verify all parameters exist (error if any missing)
     verify_process_variation_params(program, stats_blocks)
@@ -1292,7 +1542,7 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
     # Now apply mismatch variations (creates functions and replaces references)
     # IMPORTANT: Process variations MUST be applied before mismatch variations.
     # This ensures we always get __process____mismatch__ suffixes and never __mismatch____process__.
-    apply_all_mismatch_variations(program, stats_blocks)
+    apply_all_mismatch_variations(program, stats_blocks, output_format=output_format)
 
 
 def move_header_comments_to_top(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
@@ -1366,19 +1616,24 @@ def move_header_comments_to_top(program: Program, stats_blocks: List[StatisticsB
             break
 
 
-def create_mismatch_function(var: Variation, idx: int, original_expr: Optional[Expr] = None) -> Optional[ParamDecl]:
+def create_mismatch_function(var: Variation, idx: int, original_expr: Optional[Expr] = None, output_format: Optional["NetlistDialects"] = None) -> Optional[ParamDecl]:
     """Create a mismatch .param declaration with dummy parameter syntax as requested.
 
-    Creates: mm_z1__mismatch__(dummy_param) with expression original_expr+enable_mismatch*gauss(0,mismatch_factor)
+    For Xyce: Creates .FUNC mm_z1__mismatch__(dummy_param) {original_expr+enable_mismatch*gauss(0,mismatch_factor)}
+    For ngspice: Creates .param mm_z1__mismatch__(dummy_param) = {original_expr+enable_mismatch*gauss(0,mismatch_factor)}
     This is placed near the top and called as mm_z1__mismatch__(0).
     
     Args:
         var: The variation definition
         idx: Index for uniqueness
         original_expr: The original parameter's default expression (if None, uses Int(0))
+        output_format: The target output format (Xyce or ngspice)
     """
     if not var.dist:
         return None
+
+    from .. import NetlistDialects
+    is_ngspice = output_format == NetlistDialects.NGSPICE
 
     param_name = f"{var.name.name}__mismatch__(dummy_param)"
     dist_type_lower = var.dist.lower()
@@ -1404,6 +1659,8 @@ def create_mismatch_function(var: Variation, idx: int, original_expr: Optional[E
     mismatch_term = BinaryOp(tp=BinaryOperator.MUL, left=enable_mismatch_ref, right=dist_call)
     param_expr = BinaryOp(tp=BinaryOperator.ADD, left=base_expr, right=mismatch_term)
 
+    # For ngspice, the syntax is the same (parameter function), but it will be written
+    # as .param instead of .FUNC by the NgspiceNetlister.write_param_decl() method
     return ParamDecl(
         name=Ident(param_name),
         default=param_expr,
@@ -1411,7 +1668,7 @@ def create_mismatch_function(var: Variation, idx: int, original_expr: Optional[E
     )
 
 
-def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_blocks: List[StatisticsBlock]) -> None:
+def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_blocks: List[StatisticsBlock], output_format: Optional["NetlistDialects"] = None) -> None:
     """Apply a single mismatch variation by creating a function and replacing all references.
     
     This effectively "deletes" the parameter by:
@@ -1468,7 +1725,7 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_b
         mismatch_param_name = f"{param_name}__mismatch__(dummy_param)"
 
     # Create mismatch function with the correct name
-    mismatch_param = create_mismatch_function(var, idx, original_expr=original_expr)
+    mismatch_param = create_mismatch_function(var, idx, original_expr=original_expr, output_format=output_format)
     if not mismatch_param:
         return
     
@@ -1542,14 +1799,14 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_b
         remove_param_declaration(program, var.name.name)
 
 
-def apply_all_mismatch_variations(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
-    """Apply all mismatch variations from statistics blocks (Xyce-specific)."""
+def apply_all_mismatch_variations(program: Program, stats_blocks: List[StatisticsBlock], output_format: Optional["NetlistDialects"] = None) -> None:
+    """Apply all mismatch variations from statistics blocks (Xyce/ngspice-specific)."""
 
     mismatch_idx = 0
     for stats in stats_blocks:
         if stats.mismatch:
             for var in stats.mismatch:
-                apply_mismatch_variation(program, var, mismatch_idx, stats_blocks)
+                apply_mismatch_variation(program, var, mismatch_idx, stats_blocks, output_format=output_format)
                 mismatch_idx += 1
 
 
@@ -1560,7 +1817,7 @@ def apply_statistics_variations(program: Program, output_format: Optional["Netli
     Both process and mismatch variations use Monte Carlo (implied).
     Process variations may also include mean values for corner analysis.
 
-    For Xyce format, replaces StatisticsBlocks in the AST with generated functions and process variations.
+    For Xyce and ngspice formats, replaces StatisticsBlocks in the AST with generated functions and process variations.
     For other formats, applies variations directly to parameters (legacy behavior).
     """
     stats_blocks = collect_statistics_blocks(program)
@@ -1569,17 +1826,21 @@ def apply_statistics_variations(program: Program, output_format: Optional["Netli
 
     from .. import NetlistDialects
     is_xyce = output_format == NetlistDialects.XYCE
+    is_ngspice = output_format == NetlistDialects.NGSPICE
 
-    if is_xyce:
-        # Add lnorm functions if needed (Xyce-specific)
+    if is_xyce or is_ngspice:
+        # Add lnorm functions if needed (for both Xyce and ngspice)
         if has_lognorm_distributions(stats_blocks):
-            add_lnorm_functions(program)
+            if is_xyce:
+                add_lnorm_functions(program)
+            else:  # ngspice
+                add_lnorm_functions_ngspice(program)
 
-        # For Xyce: replace StatisticsBlocks in AST with generated content
-        replace_statistics_blocks_with_generated_content(program, stats_blocks)
+        # For Xyce/ngspice: replace StatisticsBlocks in AST with generated content
+        replace_statistics_blocks_with_generated_content(program, stats_blocks, output_format=output_format)
         
         # Move header comments (those that were before the first StatisticsBlock) to the top
         move_header_comments_to_top(program, stats_blocks)
     else:
-        # Legacy behavior: apply directly to parameters (for non-Xyce formats)
+        # Legacy behavior: apply directly to parameters (for non-Xyce/ngspice formats)
         apply_all_process_variations_legacy(program, stats_blocks)

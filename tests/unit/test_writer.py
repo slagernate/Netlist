@@ -49,6 +49,7 @@ from netlist.write import WriteOptions
 # So I will import from `netlist.write.spice` for now.
 from netlist.write.spice import apply_statistics_variations, debug_find_all_param_refs
 from netlist.dialects.spectre import SpectreDialectParser
+from netlist.write.spice import NgspiceNetlister
 
 
 def test_write1():
@@ -1227,3 +1228,145 @@ def test_inline_comment_preservation():
     assert "l=" in output
     # Comment should be on same line as parameter
     assert any("l=" in line and "test comment" in line for line in output.split('\n'))
+
+
+def test_write_ngspice_basic():
+    """Test basic ngspice netlist writing"""
+    src = Program(files=[SourceFile(path="/", contents=[])])
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.NGSPICE))
+    output = dest.getvalue()
+    # Should produce valid output (even if empty)
+    assert isinstance(output, str)
+
+
+def test_write_ngspice_expressions():
+    """Test ngspice expression formatting with { } delimiters"""
+    params = ParamDecls(params=[
+        ParamDecl(name=Ident("Rval"), default=Ref(ident=Ident("Vdd")), distr=None)
+    ])
+    src = Program(files=[SourceFile(path="/", contents=[params])])
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.NGSPICE))
+    output = dest.getvalue()
+    # Should use { } for expressions
+    assert "{Vdd}" in output or "{ Vdd }" in output
+
+
+def test_write_ngspice_comments():
+    """Test ngspice comment formatting with *"""
+    from netlist.data import Comment
+    comment = Comment(text="Test comment", position="standalone")
+    src = Program(files=[SourceFile(path="/", contents=[comment])])
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.NGSPICE))
+    output = dest.getvalue()
+    # Should use * for comments, not ;
+    assert "* Test comment" in output
+    assert "; Test comment" not in output
+
+
+def test_write_ngspice_no_params_keyword():
+    """Test that ngspice does NOT use PARAMS: keyword for subcircuit parameters"""
+    subckt = SubcktDef(
+        name=Ident("test_sub"),
+        ports=[Ident("p1"), Ident("p2")],
+        params=[ParamDecl(name=Ident("w"), default=Float(1.0), distr=None)],
+        entries=[]
+    )
+    src = Program(files=[SourceFile(path="/", contents=[subckt])])
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.NGSPICE))
+    output = dest.getvalue()
+    # Should NOT have PARAMS: keyword
+    assert "PARAMS:" not in output
+    # Should have parameter declaration (with spaces around =)
+    assert "w" in output and "1.0" in output
+
+
+def test_write_ngspice_param_function():
+    """Test ngspice .param function syntax"""
+    func = FunctionDef(
+        name=Ident("test_func"),
+        rtype=ArgType.REAL,
+        args=[TypedArg(tp=ArgType.REAL, name=Ident("x"))],
+        stmts=[
+            Return(
+                val=BinaryOp(
+                    tp=BinaryOperator.MUL,
+                    left=Ref(ident=Ident("x")),
+                    right=Float(2.0)
+                )
+            )
+        ]
+    )
+    src = Program(files=[SourceFile(path="/", contents=[func])])
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.NGSPICE))
+    output = dest.getvalue()
+    # Should use .param func_name(args) = {expression} syntax
+    assert ".param" in output
+    assert "test_func" in output
+    assert "=" in output
+    assert "{" in output
+    assert "}" in output
+    # Should NOT use .FUNC
+    assert ".FUNC" not in output
+
+
+def test_ngspice_statistics_handling():
+    """Test ngspice statistics processing with parameter functions"""
+    params = [
+        ParamDecl(name=Ident("vth0_nom"), default=Float(0.45), distr=None),
+    ]
+    stats = StatisticsBlock(
+        process=[
+            Variation(name=Ident("vth0_nom"), dist="gauss", std=Float(0.01), mean=None),
+        ],
+        mismatch=None
+    )
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=params), stats])])
+    
+    # Apply variations
+    apply_statistics_variations(program, output_format=NetlistDialects.NGSPICE)
+    
+    # Verify process variation parameter was created
+    all_params = [
+        param for file in program.files
+        for entry in file.contents
+        if isinstance(entry, ParamDecls)
+        for param in entry.params
+    ]
+    param_names = [p.name.name for p in all_params]
+    assert "vth0_nom__process__" in param_names
+
+
+def test_ngspice_statistics_mismatch():
+    """Test ngspice mismatch variation with parameter functions"""
+    params = [
+        ParamDecl(name=Ident("width"), default=Float(1.0), distr=None),
+    ]
+    stats = StatisticsBlock(
+        process=None,
+        mismatch=[
+            Variation(name=Ident("width"), dist="gauss", std=Float(0.1), mean=None),
+        ]
+    )
+    program = Program(files=[SourceFile(path="test", contents=[ParamDecls(params=params), stats])])
+    
+    # Apply variations
+    apply_statistics_variations(program, output_format=NetlistDialects.NGSPICE)
+    
+    # Verify mismatch parameter function was created
+    all_params = [
+        param for file in program.files
+        for entry in file.contents
+        if isinstance(entry, ParamDecls)
+        for param in entry.params
+    ]
+    param_names = [p.name.name for p in all_params]
+    # Should have mismatch function with dummy parameter
+    assert any("__mismatch__" in name and "(" in name for name in param_names)
+    
+    # Original parameter should be removed
+    assert "width" not in param_names

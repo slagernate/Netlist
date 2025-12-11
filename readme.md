@@ -26,7 +26,7 @@ Support as of this writing includes:
 | -------------------- | ------------------ | ----------- |
 | "Generic" Spice\*    | :white_check_mark: |             |
 | Hspice               | :white_check_mark: |             |
-| Ngspice              |                    |             |
+| Ngspice              |                    | :white_check_mark: |
 | CDL                  |                    |             |
 | Xyce                 |                    | :white_check_mark: |
 | Spectre              | :white_check_mark: |             |
