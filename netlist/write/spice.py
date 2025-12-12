@@ -96,8 +96,414 @@ class SpiceNetlister(Netlister):
         """Get our entry in the `NetlistDialects` enumeration"""
         return NetlistDialects.SPICE
 
+    def _is_bsim4_model_ref(self, ref: Ref) -> bool:
+        """Check if a Ref points to a BSIM4 model definition.
+        
+        First checks if ref.resolved is already set (more direct).
+        Otherwise searches through the program recursively, including library sections.
+        
+        Handles:
+        - Direct ModelDef matches (exact name)
+        - ModelFamily base name matches (instance references base, model has variants)
+        - ModelVariant matches (standalone variants)
+        - Models nested in LibSectionDef entries
+        
+        Args:
+            ref: A Ref object pointing to a model name
+            
+        Returns:
+            True if the reference points to a BSIM4 model, False otherwise
+        """
+        if not isinstance(ref, Ref):
+            return False
+        
+        model_name = ref.ident.name
+        
+        # First, check if ref.resolved is already set (more direct and reliable)
+        if hasattr(ref, 'resolved') and ref.resolved is not None:
+            from ..data import Model, ModelDef, ModelFamily, Int, Float
+            
+            def is_bsim4_model(model_entry):
+                """Check if a model entry is BSIM4 (by mtype or level=14/54)."""
+                if model_entry.mtype.name.lower() == "bsim4":
+                    return True
+                # Also check for level=14 or 54 (BSIM4 levels)
+                for param in model_entry.params:
+                    if param.name.name == "level":
+                        if isinstance(param.default, (Int, Float)):
+                            level_val = param.default.val if hasattr(param.default, 'val') else float(param.default)
+                            if level_val in (14, 54):
+                                return True
+                return False
+            
+            if isinstance(ref.resolved, Model):
+                if isinstance(ref.resolved, ModelDef):
+                    return is_bsim4_model(ref.resolved)
+                elif isinstance(ref.resolved, ModelFamily):
+                    return any(is_bsim4_model(v) for v in ref.resolved.variants)
+            return False
+        
+        # If not resolved, search through the program
+        from ..data import ModelDef, ModelFamily, ModelVariant, LibSectionDef, SubcktDef
+        
+        def check_entry(entry) -> bool:
+            """Helper to check if an entry is a BSIM4 model matching model_name."""
+            def is_bsim4_model(model_entry):
+                """Check if a model entry is BSIM4 (by mtype or level=14/54)."""
+                if model_entry.mtype.name.lower() == "bsim4":
+                    return True
+                # Also check for level=14 or 54 (BSIM4 levels)
+                for param in model_entry.params:
+                    if param.name.name == "level":
+                        from ..data import Int, Float
+                        if isinstance(param.default, (Int, Float)):
+                            level_val = param.default.val if hasattr(param.default, 'val') else float(param.default)
+                            if level_val in (14, 54):
+                                return True
+                return False
+            
+            if isinstance(entry, ModelDef):
+                if entry.name.name == model_name:
+                    return is_bsim4_model(entry)
+            elif isinstance(entry, ModelFamily):
+                if entry.name.name == model_name:
+                    return any(is_bsim4_model(v) for v in entry.variants)
+            elif isinstance(entry, ModelVariant):
+                variant_name = f"{entry.model.name}.{entry.variant.name}"
+                if variant_name == model_name or entry.model.name == model_name:
+                    return is_bsim4_model(entry.variant)
+            elif isinstance(entry, SubcktDef):
+                # Check if subcircuit contains BSIM4 models
+                if entry.name.name == model_name:
+                    for sub_entry in entry.entries:
+                        if check_entry(sub_entry):
+                            return True
+            elif isinstance(entry, LibSectionDef):
+                # Check entries in library section
+                for sub_entry in entry.entries:
+                    if check_entry(sub_entry):
+                        return True
+            return False
+        
+        # Search through all files
+        if hasattr(self, 'src') and self.src:
+            for file in self.src.files:
+                for entry in file.contents:
+                    if check_entry(entry):
+                        return True
+        
+        # If we can't find the definition, use heuristics
+        # Most nmos/pmos models in PDKs are BSIM4
+        model_name_lower = model_name.lower()
+        return 'mos' in model_name_lower or 'bsim4' in model_name_lower
+
     def write_subckt_def(self, module: SubcktDef) -> None:
         """Write the `SUBCKT` definition for `Module` `module`."""
+        # DEBUG: Write immediately at function entry
+        import sys
+        import os
+        try:
+            subckt_name = module.name.name if hasattr(module.name, 'name') else str(module.name)
+        except:
+            subckt_name = str(module.name) if hasattr(module, 'name') else 'unknown'
+        
+        debug_msg = f"[DEBUG {subckt_name}] write_subckt_def ENTRY, entries={len(module.entries) if hasattr(module, 'entries') else 0}\n"
+        # Try multiple locations
+        for log_path in ['/tmp/ngspice_delvto_debug.log', './ngspice_delvto_debug.log']:
+            try:
+                with open(log_path, 'a') as f:
+                    f.write(debug_msg)
+                    f.flush()
+                    os.fsync(f.fileno())
+                break
+            except:
+                pass
+        
+        # Pre-process: Move deltox/dtox from instances to local BSIM4 models
+        # For ngspice, we move deltox to dtox on the model card (similar to Xyce)
+        # Also handle delvto by converting to dvth0 parameter
+        
+        from ..data import ModelDef, ModelFamily, Instance, Ref, ParamVal, Ident, ParamDecl, Primitive
+        from warnings import warn
+        
+        # Enable debug for subcircuits that should have delvto
+        debug_subcircuits = ['nmos_lvt', 'nmos', 'pmos', 'nmos_de_v12_base', 'nmos_esd', 'nmos_nat_v3', 'nmos_nat_v5', 'nmos_v5']
+        debug = subckt_name in debug_subcircuits
+        
+        # 1. Check if subcircuit A) contains/references a BSIM4 model (level=14 or 54) and B) has delvto param
+        # Simplified: if subcircuit has delvto, assume it's BSIM4 (delvto is only used with BSIM4)
+        has_bsim4_model = False
+        local_models = {}
+        has_delvto = False
+        
+        # First pass: Check for local BSIM4 models and delvto parameters
+        for entry in module.entries:
+            # Check for local BSIM4 models
+            if isinstance(entry, ModelDef):
+                # Check if it's BSIM4 by looking for level parameter or mtype
+                is_bsim4 = entry.mtype.name.lower() == "bsim4"
+                # Also check for level=14 or 54 in params (for nmos/pmos with level)
+                if not is_bsim4:
+                    for param in entry.params:
+                        if param.name.name == "level":
+                            from ..data import Int, Float
+                            if isinstance(param.default, (Int, Float)):
+                                level_val = param.default.val if hasattr(param.default, 'val') else float(param.default)
+                                if level_val in (14, 54):
+                                    is_bsim4 = True
+                                    break
+                if is_bsim4:
+                    has_bsim4_model = True
+                    local_models[entry.name.name] = entry
+                    if debug:
+                        try:
+                            with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                                print(f"[DEBUG {subckt_name}] Found local BSIM4 ModelDef: {entry.name.name}", file=f, flush=True)
+                        except:
+                            pass
+            elif isinstance(entry, ModelFamily):
+                # Check variants for BSIM4
+                for variant in entry.variants:
+                    is_bsim4 = variant.mtype.name.lower() == "bsim4"
+                    if not is_bsim4:
+                        for param in variant.params:
+                            if param.name.name == "level":
+                                from ..data import Int, Float
+                                if isinstance(param.default, (Int, Float)):
+                                    level_val = param.default.val if hasattr(param.default, 'val') else float(param.default)
+                                    if level_val in (14, 54):
+                                        is_bsim4 = True
+                                        if debug:
+                                            warn(f"[DEBUG {subckt_name}] Found BSIM4 ModelFamily variant with level={level_val}: {entry.name.name}")
+                                        break
+                    if is_bsim4:
+                        has_bsim4_model = True
+                        local_models[entry.name.name] = entry
+                        if debug:
+                            warn(f"[DEBUG {subckt_name}] Found local BSIM4 ModelFamily: {entry.name.name}")
+                        break
+            
+            # Check for delvto parameters (don't break - need to check all entries)
+            if isinstance(entry, Instance):
+                for pval in entry.params:
+                    if pval.name.name == "delvto":
+                        has_delvto = True
+                        if debug:
+                            import sys
+                            entry_name = entry.name.name if hasattr(entry, 'name') else 'unknown'
+                            print(f"[DEBUG {subckt_name}] Found delvto in Instance: {entry_name}", file=sys.stderr)
+            elif isinstance(entry, Primitive):
+                for kwarg in entry.kwargs:
+                    if kwarg.name.name == "delvto":
+                        has_delvto = True
+                        if debug:
+                            try:
+                                with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                                    entry_name = entry.name.name if hasattr(entry, 'name') else 'unknown'
+                                    print(f"[DEBUG {subckt_name}] Found delvto in Primitive: {entry_name}", file=f, flush=True)
+                            except:
+                                pass
+        
+        # Also check if entries reference BSIM4 models (global models)
+        # Use heuristics: if model name contains 'mos' or 'bsim4', assume BSIM4
+        # (This is a fallback if _is_bsim4_model_ref doesn't find the model definition)
+        if not has_bsim4_model:
+            for entry in module.entries:
+                model_ref = None
+                if isinstance(entry, Instance) and isinstance(entry.module, Ref):
+                    model_ref = entry.module
+                elif isinstance(entry, Primitive) and len(entry.args) > 0 and isinstance(entry.args[-1], Ref):
+                    model_ref = entry.args[-1]
+                
+                if model_ref:
+                    # Try _is_bsim4_model_ref first
+                    if self._is_bsim4_model_ref(model_ref):
+                        has_bsim4_model = True
+                        break
+                    # Fallback: use heuristics (model names with 'mos' or 'bsim4' are likely BSIM4)
+                    model_name = model_ref.ident.name.lower()
+                    if 'mos' in model_name or 'bsim4' in model_name:
+                        has_bsim4_model = True
+                        break
+        
+        # If we found delvto but not BSIM4 model, assume BSIM4 (delvto is only used with BSIM4)
+        if has_delvto and not has_bsim4_model:
+            has_bsim4_model = True
+            if debug:
+                warn(f"[DEBUG {subckt_name}] Assuming BSIM4 because delvto found but no BSIM4 model detected")
+        
+        if debug:
+            warn(f"[DEBUG {subckt_name}] Summary: has_bsim4_model={has_bsim4_model}, has_delvto={has_delvto}, local_models={list(local_models.keys())}")
+                    
+        # 2. Process delvto if subcircuit has BSIM4 model and delvto parameter
+        needs_dvth0_param = False
+        delvto_entries = []  # Track entries with delvto for processing
+        
+        if has_bsim4_model and has_delvto:
+            if debug:
+                warn(f"[DEBUG {subckt_name}] Entering delvto processing block")
+            for entry in module.entries:
+                dtox_val = None
+                delvto_val = None
+                params_to_keep = []
+                kwargs_to_keep = []
+                
+                # Check Instance entries
+                if isinstance(entry, Instance):
+                    for pval in entry.params:
+                        if pval.name.name in ("deltox", "dtox"):
+                            dtox_val = pval.val
+                        elif pval.name.name == "delvto":
+                            delvto_val = pval.val
+                            needs_dvth0_param = True
+                            delvto_entries.append((entry, delvto_val, "params"))
+                            if debug:
+                                try:
+                                    with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                                        entry_name = entry.name.name if hasattr(entry, 'name') else 'unknown'
+                                        print(f"[DEBUG {subckt_name}] Processing delvto in Instance {entry_name}: {delvto_val}", file=f, flush=True)
+                                except:
+                                    pass
+                        else:
+                            params_to_keep.append(pval)
+                
+                # Check Primitive entries
+                elif isinstance(entry, Primitive):
+                    for kwarg in entry.kwargs:
+                        if kwarg.name.name in ("deltox", "dtox"):
+                            dtox_val = kwarg.val
+                        elif kwarg.name.name == "delvto":
+                            delvto_val = kwarg.val
+                            needs_dvth0_param = True
+                            delvto_entries.append((entry, delvto_val, "kwargs"))
+                            if debug:
+                                warn(f"[DEBUG {subckt_name}] Processing delvto in Primitive {entry.name.name if hasattr(entry, 'name') else 'unknown'}: {delvto_val}")
+                        else:
+                            kwargs_to_keep.append(kwarg)
+                
+                # Update entry params/kwargs (remove deltox/dtox/delvto)
+                if dtox_val is not None or delvto_val is not None:
+                    if isinstance(entry, Instance):
+                        entry.params = params_to_keep
+                    elif isinstance(entry, Primitive):
+                        entry.kwargs = kwargs_to_keep
+                
+                # Handle deltox -> dtox for local models only
+                if dtox_val is not None:
+                    # Find which local model this entry uses (if any)
+                    model_name = None
+                    if isinstance(entry, Instance) and isinstance(entry.module, Ref):
+                        model_name = entry.module.ident.name
+                    elif isinstance(entry, Primitive) and len(entry.args) > 0 and isinstance(entry.args[-1], Ref):
+                        model_name = entry.args[-1].ident.name
+                    
+                    if model_name and model_name in local_models:
+                        model = local_models[model_name]
+                        
+                        # Helper to add dtox to a param list
+                        def add_dtox(params_list, val):
+                            # Remove existing dtox/deltox
+                            new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
+                            # Add new dtox (mapped from deltox)
+                            new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
+                            return new_params
+
+                        if isinstance(model, ModelDef):
+                            model.params = add_dtox(model.params, dtox_val)
+                        elif isinstance(model, ModelFamily):
+                            for variant in model.variants:
+                                variant.params = add_dtox(variant.params, dtox_val)
+        
+        # 3. Add dvth0 parameter to subcircuit if needed, and modify model vth0
+        if needs_dvth0_param:
+            if debug:
+                try:
+                    with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                        print(f"[DEBUG {subckt_name}] Adding dvth0 parameter to subcircuit, processing {len(delvto_entries)} entries", file=f, flush=True)
+                except:
+                    pass
+            from ..data import BinaryOp, BinaryOperator, Ref as RefData, Int, Float, MetricNum, Expr
+            # Check if dvth0 already exists in subcircuit params
+            has_dvth0 = any(p.name.name == "dvth0" for p in module.params)
+            if not has_dvth0:
+                # Add dvth0 parameter with default 0
+                dvth0_param = ParamDecl(name=Ident("dvth0"), default=Float(0.0), distr=None)
+                module.params.append(dvth0_param)
+                if debug:
+                    warn(f"[DEBUG {subckt_name}] Added dvth0 parameter to subcircuit")
+            
+            # Modify model's vth0 parameter to include dvth0
+            for model_name, model in local_models.items():
+                # Helper to modify vth0 to include dvth0
+                def modify_vth0(params_list):
+                    new_params = []
+                    vth0_found = False
+                    dvth0_ref = RefData(ident=Ident("dvth0"))
+                    
+                    for p in params_list:
+                        if p.name.name == "vth0":
+                            vth0_found = True
+                            # Modify vth0 to be vth0 + dvth0
+                            if isinstance(p.default, (Int, Float, MetricNum)):
+                                # If vth0 is a literal, create expression: vth0 + dvth0
+                                vth0_expr = BinaryOp(
+                                    tp=BinaryOperator.ADD,
+                                    left=p.default,
+                                    right=dvth0_ref
+                                )
+                                new_params.append(ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment))
+                            elif isinstance(p.default, Expr):
+                                # If vth0 is already an expression, wrap it: (vth0_expr) + dvth0
+                                vth0_expr = BinaryOp(
+                                    tp=BinaryOperator.ADD,
+                                    left=p.default,
+                                    right=dvth0_ref
+                                )
+                                new_params.append(ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment))
+                            else:
+                                # Fallback: just add dvth0
+                                vth0_expr = BinaryOp(
+                                    tp=BinaryOperator.ADD,
+                                    left=Float(0.0),
+                                    right=dvth0_ref
+                                )
+                                new_params.append(ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment))
+                        else:
+                            new_params.append(p)
+                    
+                    # If vth0 not found, add it as dvth0 (so it's just dvth0)
+                    if not vth0_found:
+                        new_params.append(ParamDecl(name=Ident("vth0"), default=dvth0_ref, distr=None))
+                    
+                    return new_params
+                
+                if isinstance(model, ModelDef):
+                    model.params = modify_vth0(model.params)
+                elif isinstance(model, ModelFamily):
+                    for variant in model.variants:
+                        variant.params = modify_vth0(variant.params)
+            
+            # Update entries (instances or primitives) to use dvth0 instead of delvto
+            for entry, delvto_val, param_type in delvto_entries:
+                # Add dvth0 parameter to entry, using delvto value
+                dvth0_param_val = ParamVal(name=Ident("dvth0"), val=delvto_val)
+                if param_type == "params":
+                    entry.params.append(dvth0_param_val)
+                    if debug:
+                        try:
+                            with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                                print(f"[DEBUG {subckt_name}] Added dvth0={delvto_val} to Instance params", file=f, flush=True)
+                        except:
+                            pass
+                elif param_type == "kwargs":
+                    entry.kwargs.append(dvth0_param_val)
+                    if debug:
+                        try:
+                            with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                                print(f"[DEBUG {subckt_name}] Added dvth0={delvto_val} to Primitive kwargs", file=f, flush=True)
+                        except:
+                            pass
+        
         # Store current subcircuit context for use in write_subckt_instance
         self._current_subckt = module
 
@@ -326,8 +732,17 @@ class SpiceNetlister(Netlister):
         # Write the model (last arg) on another continuation line
         self.write("+ " + self.format_ident(pinst.args[-1]) + " \n")
 
+        # Filter deltox and delvto from instance parameters if this instance references a BSIM4 model
+        # ngspice's BSIM4 model doesn't support these parameters on instances
+        kwargs_to_write = pinst.kwargs
+        if len(pinst.args) > 0 and isinstance(pinst.args[-1], Ref):
+            module_ref = pinst.args[-1]
+            if self._is_bsim4_model_ref(module_ref):
+                # Filter deltox and delvto from instance parameters
+                kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name not in ("deltox", "delvto", "dtox")]
+
         self.write("+ ")
-        for kwarg in pinst.kwargs:
+        for kwarg in kwargs_to_write:
             self.write_param_val(kwarg)
             self.write(" ")
 
@@ -397,6 +812,17 @@ class SpiceNetlister(Netlister):
             warn(msg)
             default = str(sys.float_info.max)
         else:
+            # DEBUG for vth0
+            if param.name.name == "vth0":
+                import sys
+                try:
+                    with open('/tmp/ngspice_vth0_write_debug.log', 'a') as f:
+                        f.write(f"[DEBUG write_param_decl] vth0: default={param.default}, type={type(param.default)}\n")
+                        formatted = self.format_expr(param.default)
+                        f.write(f"[DEBUG write_param_decl] Formatted: {formatted}\n")
+                        f.flush()
+                except:
+                    pass
             default = self.format_expr(param.default)
 
         self.write(f"{self.format_ident(param.name)}={default}")
@@ -493,6 +919,17 @@ class SpiceNetlister(Netlister):
     def write_model_variant(self, mvar: ModelVariant) -> None:
         """Write a model variant"""
 
+        # DEBUG: Check if vth0 param has dvth0
+        vth0_param = next((p for p in mvar.params if p.name.name == "vth0"), None)
+        if vth0_param:
+            import sys
+            try:
+                with open('/tmp/ngspice_vth0_write_debug.log', 'a') as f:
+                    f.write(f"[DEBUG write_model_variant] {mvar.model.name}.{mvar.variant.name}: vth0={vth0_param.default}, type={type(vth0_param.default)}\n")
+                    f.flush()
+            except:
+                pass
+
         # This just convertes to a `ModelDef` with a dot-separated name, and running `write_model_def`.
         model = ModelDef(
             name=Ident(f"{mvar.model.name}.{mvar.variant.name}"),
@@ -521,6 +958,17 @@ class SpiceNetlister(Netlister):
         self.write("\n")
         for param in model.params:
             self.write("+ ")
+            # DEBUG: Check if this is vth0 and if it has dvth0
+            if param.name.name == "vth0":
+                import sys
+                try:
+                    with open('/tmp/ngspice_vth0_write_debug.log', 'a') as f:
+                        f.write(f"[DEBUG] Writing vth0 param: default={param.default}, type={type(param.default)}\n")
+                        formatted = self.format_expr(param.default)
+                        f.write(f"[DEBUG] Formatted: {formatted}\n")
+                        f.flush()
+                except:
+                    pass
             self.write_param_decl(param)
             self.write("\n")
 
@@ -766,6 +1214,254 @@ class NgspiceNetlister(SpiceNetlister):
         
         Overrides base class to put ports on the same line as .SUBCKT (standard SPICE format).
         """
+        # Pre-process: Handle deltox/dtox and delvto/dvth0 for BSIM4 models
+        from ..data import ModelDef, ModelFamily, Instance, Ref, ParamVal, Ident, ParamDecl, Primitive, BinaryOp, BinaryOperator, Int, Float, MetricNum, Expr
+        
+        # Get subcircuit name
+        try:
+            subckt_name = module.name.name if hasattr(module.name, 'name') else str(module.name)
+        except:
+            subckt_name = str(module.name) if hasattr(module, 'name') else 'unknown'
+        
+        # DEBUG
+        import sys
+        import os
+        debug_subcircuits = ['nmos_lvt', 'nmos', 'pmos']
+        debug = subckt_name in debug_subcircuits
+        if debug:
+            try:
+                with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                    f.write(f"[DEBUG {subckt_name}] NgspiceNetlister.write_subckt_def, entries={len(module.entries)}\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except:
+                pass
+        
+        # 1. Check if subcircuit A) contains/references a BSIM4 model (level=14 or 54) and B) has delvto param
+        has_bsim4_model = False
+        local_models = {}
+        has_delvto = False
+        
+        # First pass: Check for local BSIM4 models and delvto parameters
+        for entry in module.entries:
+            # Check for local BSIM4 models
+            if isinstance(entry, ModelDef):
+                is_bsim4 = entry.mtype.name.lower() == "bsim4"
+                if not is_bsim4:
+                    for param in entry.params:
+                        if param.name.name == "level":
+                            if isinstance(param.default, (Int, Float)):
+                                level_val = param.default.val if hasattr(param.default, 'val') else float(param.default)
+                                if level_val in (14, 54):
+                                    is_bsim4 = True
+                                    break
+                if is_bsim4:
+                    has_bsim4_model = True
+                    local_models[entry.name.name] = entry
+            elif isinstance(entry, ModelFamily):
+                # Check variants for BSIM4
+                for variant in entry.variants:
+                    is_bsim4 = variant.mtype.name.lower() == "bsim4"
+                    if not is_bsim4:
+                        for param in variant.params:
+                            if param.name.name == "level":
+                                if isinstance(param.default, (Int, Float)):
+                                    level_val = param.default.val if hasattr(param.default, 'val') else float(param.default)
+                                    if level_val in (14, 54):
+                                        is_bsim4 = True
+                                        break
+                    if is_bsim4:
+                        has_bsim4_model = True
+                        local_models[entry.name.name] = entry
+                        break
+            
+            # Check for delvto parameters
+            if isinstance(entry, Instance):
+                for pval in entry.params:
+                    if pval.name.name == "delvto":
+                        has_delvto = True
+            elif isinstance(entry, Primitive):
+                for kwarg in entry.kwargs:
+                    if kwarg.name.name == "delvto":
+                        has_delvto = True
+        
+        # Also check if entries reference BSIM4 models (global models)
+        if not has_bsim4_model:
+            for entry in module.entries:
+                model_ref = None
+                if isinstance(entry, Instance) and isinstance(entry.module, Ref):
+                    model_ref = entry.module
+                elif isinstance(entry, Primitive) and len(entry.args) > 0 and isinstance(entry.args[-1], Ref):
+                    model_ref = entry.args[-1]
+                
+                if model_ref:
+                    if self._is_bsim4_model_ref(model_ref):
+                        has_bsim4_model = True
+                        break
+                    model_name = model_ref.ident.name.lower()
+                    if 'mos' in model_name or 'bsim4' in model_name:
+                        has_bsim4_model = True
+                        break
+        
+        # If we found delvto but not BSIM4 model, assume BSIM4 (delvto is only used with BSIM4)
+        if has_delvto and not has_bsim4_model:
+            has_bsim4_model = True
+            if debug:
+                try:
+                    with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                        f.write(f"[DEBUG {subckt_name}] Assuming BSIM4 because delvto found\n")
+                        f.flush()
+                except:
+                    pass
+        
+        if debug:
+            try:
+                with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                    f.write(f"[DEBUG {subckt_name}] Summary: has_bsim4_model={has_bsim4_model}, has_delvto={has_delvto}, local_models={list(local_models.keys())}\n")
+                    f.flush()
+            except:
+                pass
+                    
+        # 2. Process delvto if subcircuit has BSIM4 model and delvto parameter
+        needs_dvth0_param = False
+        delvto_entries = []
+        
+        if has_bsim4_model and has_delvto:
+            if debug:
+                try:
+                    with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
+                        f.write(f"[DEBUG {subckt_name}] Entering delvto processing block\n")
+                        f.flush()
+                except:
+                    pass
+            for entry in module.entries:
+                dtox_val = None
+                delvto_val = None
+                params_to_keep = []
+                kwargs_to_keep = []
+                
+                # Check Instance entries
+                if isinstance(entry, Instance):
+                    for pval in entry.params:
+                        if pval.name.name in ("deltox", "dtox"):
+                            dtox_val = pval.val
+                        elif pval.name.name == "delvto":
+                            delvto_val = pval.val
+                            needs_dvth0_param = True
+                            delvto_entries.append((entry, delvto_val, "params"))
+                        else:
+                            params_to_keep.append(pval)
+                
+                # Check Primitive entries
+                elif isinstance(entry, Primitive):
+                    for kwarg in entry.kwargs:
+                        if kwarg.name.name in ("deltox", "dtox"):
+                            dtox_val = kwarg.val
+                        elif kwarg.name.name == "delvto":
+                            delvto_val = kwarg.val
+                            needs_dvth0_param = True
+                            delvto_entries.append((entry, delvto_val, "kwargs"))
+                        else:
+                            kwargs_to_keep.append(kwarg)
+                
+                # Update entry params/kwargs (remove deltox/dtox/delvto)
+                if dtox_val is not None or delvto_val is not None:
+                    if isinstance(entry, Instance):
+                        entry.params = params_to_keep
+                    elif isinstance(entry, Primitive):
+                        entry.kwargs = kwargs_to_keep
+                
+                # Handle deltox -> dtox for local models only
+                if dtox_val is not None:
+                    model_name = None
+                    if isinstance(entry, Instance) and isinstance(entry.module, Ref):
+                        model_name = entry.module.ident.name
+                    elif isinstance(entry, Primitive) and len(entry.args) > 0 and isinstance(entry.args[-1], Ref):
+                        model_name = entry.args[-1].ident.name
+                    
+                    if model_name and model_name in local_models:
+                        model = local_models[model_name]
+                        
+                        def add_dtox(params_list, val):
+                            new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
+                            new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
+                            return new_params
+
+                        if isinstance(model, ModelDef):
+                            model.params = add_dtox(model.params, dtox_val)
+                        elif isinstance(model, ModelFamily):
+                            for variant in model.variants:
+                                variant.params = add_dtox(variant.params, dtox_val)
+        
+        # 3. Add dvth0 parameter to subcircuit if needed, and modify model vth0
+        if needs_dvth0_param:
+            # Check if dvth0 already exists in subcircuit params
+            has_dvth0 = any(p.name.name == "dvth0" for p in module.params)
+            if not has_dvth0:
+                dvth0_param = ParamDecl(name=Ident("dvth0"), default=Float(0.0), distr=None)
+                module.params.append(dvth0_param)
+            
+            # Modify model's vth0 parameter to include dvth0
+            # Since models are defined inside the subcircuit, they should have access to subcircuit parameters
+            for model_name, model in local_models.items():
+                def modify_vth0(params_list):
+                    new_params = []
+                    vth0_found = False
+                    dvth0_ref = Ref(ident=Ident("dvth0"))
+                    
+                    for p in params_list:
+                        if p.name.name == "vth0":
+                            vth0_found = True
+                            if isinstance(p.default, (Int, Float, MetricNum)):
+                                vth0_expr = BinaryOp(tp=BinaryOperator.ADD, left=p.default, right=dvth0_ref)
+                                new_params.append(ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment))
+                            elif isinstance(p.default, Expr):
+                                vth0_expr = BinaryOp(tp=BinaryOperator.ADD, left=p.default, right=dvth0_ref)
+                                new_params.append(ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment))
+                            else:
+                                vth0_expr = BinaryOp(tp=BinaryOperator.ADD, left=Float(0.0), right=dvth0_ref)
+                                new_params.append(ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment))
+                        else:
+                            new_params.append(p)
+                    
+                    if not vth0_found:
+                        new_params.append(ParamDecl(name=Ident("vth0"), default=dvth0_ref, distr=None))
+                    
+                    return new_params
+                
+                # DEBUG
+                import sys
+                try:
+                    with open('/tmp/ngspice_vth0_debug.log', 'a') as f:
+                        f.write(f"[DEBUG {subckt_name}] Modifying model {model_name}, type={type(model).__name__}\n")
+                        f.flush()
+                except:
+                    pass
+                
+                if isinstance(model, ModelDef):
+                    old_vth0 = next((p.default for p in model.params if p.name.name == "vth0"), None)
+                    model.params = modify_vth0(model.params)
+                    new_vth0 = next((p.default for p in model.params if p.name.name == "vth0"), None)
+                    try:
+                        with open('/tmp/ngspice_vth0_debug.log', 'a') as f:
+                            f.write(f"[DEBUG {subckt_name}] ModelDef {model_name}: vth0 {old_vth0} -> {new_vth0}\n")
+                            f.flush()
+                    except:
+                        pass
+                elif isinstance(model, ModelFamily):
+                    for variant in model.variants:
+                        old_vth0 = next((p.default for p in variant.params if p.name.name == "vth0"), None)
+                        variant.params = modify_vth0(variant.params)
+                        new_vth0 = next((p.default for p in variant.params if p.name.name == "vth0"), None)
+                        try:
+                            with open('/tmp/ngspice_vth0_debug.log', 'a') as f:
+                                f.write(f"[DEBUG {subckt_name}] ModelFamily {model_name} variant: vth0 {old_vth0} -> {new_vth0}\n")
+                                f.flush()
+                        except:
+                            pass
+            
+            # We don't pass dvth0 to instances - it's incorporated into the model's vth0 instead
+        
         # Store current subcircuit context for use in write_subckt_instance
         self._current_subckt = module
 

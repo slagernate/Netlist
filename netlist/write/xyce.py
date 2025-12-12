@@ -34,6 +34,10 @@ from ..data import (
     NetlistDialects,
     Call,
     Comment,
+    BinaryOp,
+    BinaryOperator,
+    UnaryOp,
+    TernOp,
 )
 from .base import Netlister, ErrorMode
 from .spice import SpiceNetlister, apply_statistics_variations, debug_find_all_param_refs, replace_param_refs_in_program, expr_references_param, count_param_refs_in_entry
@@ -750,6 +754,63 @@ class XyceNetlister(SpiceNetlister):
         start, end = self.expression_delimiters()
         inner = self._format_expr_inner(expr)
         return f"{start}{inner}{end}"
+    
+    def _format_expr_inner(self, expr: Expr) -> str:
+        """Format the *inner* content of an expression, without delimiters.
+        
+        Overrides base implementation to replace ^ operator with ** for Xyce compatibility.
+        In Xyce, ^ is boolean XOR, not exponentiation. Xyce uses ** for exponentiation.
+        """
+        if isinstance(expr, (Int, Float, MetricNum)):
+            return self.format_number(expr)
+        if isinstance(expr, Ref):
+            return self.format_ident(expr)
+        
+        if isinstance(expr, BinaryOp):
+            # Replace ^ operator with ** for Xyce compatibility
+            # In Xyce, ^ is boolean XOR, not exponentiation. Use ** for exponentiation.
+            op_value = expr.tp.value if hasattr(expr.tp, 'value') else str(expr.tp)
+            if op_value == '^' or (hasattr(BinaryOperator, 'POW') and expr.tp == BinaryOperator.POW):
+                left = self._format_expr_inner(expr.left)
+                right = self._format_expr_inner(expr.right)
+                # Wrap operands in parentheses for safety
+                if isinstance(expr.left, BinaryOp):
+                    left = f"({left})"
+                if isinstance(expr.right, BinaryOp):
+                    right = f"({right})"
+                return f"{left}**{right}"
+            
+            # Handle other binary operators normally
+            left = self._format_expr_inner(expr.left)
+            right = self._format_expr_inner(expr.right)
+            op = op_value
+            
+            # Check if we need parentheses for precedence
+            if isinstance(expr.left, BinaryOp):
+                left = f"({left})"
+            if isinstance(expr.right, BinaryOp):
+                right = f"({right})"
+                
+            return f"{left}{op}{right}"
+            
+        if isinstance(expr, UnaryOp):
+            targ = self._format_expr_inner(expr.targ)
+            op_value = expr.tp.value if hasattr(expr.tp, 'value') else str(expr.tp)
+            return f"{op_value}({targ})"
+            
+        if isinstance(expr, TernOp):
+            cond = self._format_expr_inner(expr.cond)
+            if_true = self._format_expr_inner(expr.if_true)
+            if_false = self._format_expr_inner(expr.if_false)
+            return f"({cond} ? {if_true} : {if_false})"
+            
+        if isinstance(expr, Call):
+            func = self.format_ident(expr.func)
+            args = [self._format_expr_inner(arg) for arg in expr.args]
+            return f"{func}({','.join(args)})"
+
+        self.handle_error(expr, f"Unknown Expression Type {expr}")
+        return ""
 
     def write_options(self, options: Options) -> None:
         """Write Options `options`
@@ -910,6 +971,63 @@ class XyceNetlister(SpiceNetlister):
             m_param = ParamDecl(name=Ident("m"), default=Float(1.0), distr=None)
             module.params.insert(0, m_param)
 
+        # Check if this is a BJT subcircuit by:
+        # 1. Checking subcircuit name (npn_*, pnp_*)
+        # 2. Checking for BJT models inside
+        # 3. Checking for BJT-specific parameters
+        is_bjt_subckt = False
+        bjt_param_names = {'dkisnpn1x1', 'dkbfnpn1x1', 'dkispnp', 'dkbfpnp', 'var_is', 'var_bf', 'm'}
+        
+        # Check subcircuit name
+        module_name_lower = module_name.lower()
+        if module_name_lower.startswith('npn_') or module_name_lower.startswith('pnp_'):
+            is_bjt_subckt = True
+            # Debug: log BJT detection
+            self.log_warning(f"BJT subcircuit detected: {module_name}", f"Subcircuit: {module_name}")
+        
+        # Check for BJT models inside subcircuit
+        if not is_bjt_subckt:
+            for entry in module.entries:
+                if isinstance(entry, ModelDef):
+                    mtype = entry.mtype.name.lower() if hasattr(entry.mtype, 'name') else str(entry.mtype).lower()
+                    if mtype in ('npn', 'pnp', 'q'):
+                        is_bjt_subckt = True
+                        break
+                elif isinstance(entry, ModelFamily):
+                    for variant in entry.variants:
+                        mtype = variant.mtype.name.lower() if hasattr(variant.mtype, 'name') else str(variant.mtype).lower()
+                        if mtype in ('npn', 'pnp', 'q'):
+                            is_bjt_subckt = True
+                            break
+                    if is_bjt_subckt:
+                        break
+        
+        # Check for BJT-specific parameters in params list
+        if not is_bjt_subckt and module.params:
+            for param in module.params:
+                if param.name.name.lower() in bjt_param_names:
+                    is_bjt_subckt = True
+                    break
+
+        # For BJT subcircuits, separate parameters into:
+        # 1. Instance-specific params (m) -> keep in PARAMS:
+        # 2. Model-accessed params (dkisnpn1x1, dkbfnpn1x1, var_is, var_bf) -> write as .param statements
+        params_for_params_line = []
+        params_for_param_statements = []
+        
+        if is_bjt_subckt and module.params:
+            for param in module.params:
+                param_name = param.name.name.lower()
+                if param_name in bjt_param_names and param_name != 'm':
+                    # BJT-specific parameter used in model -> write as .param statement
+                    params_for_param_statements.append(param)
+                else:
+                    # Instance-specific or other parameter -> keep in PARAMS:
+                    params_for_params_line.append(param)
+        else:
+            # Not a BJT subcircuit, or no params -> use normal behavior
+            params_for_params_line = module.params
+
         # Start the sub-circuit definition header with inline ports
         self.write(f".SUBCKT {module_name}")
         if module.ports:
@@ -917,15 +1035,25 @@ class XyceNetlister(SpiceNetlister):
                 self.write(f" {self.format_ident(port)}")
         self.write("\n")
 
-        # Add parameters on a continuation line
-        if module.params:
-            self.write_module_params(module.params)
+        # Add parameters on a continuation line (only instance-specific params for BJT)
+        if params_for_params_line:
+            self.write_module_params(params_for_params_line)
         else:
             self.write("+ ")
             self.write_comment("No parameters")
 
         # End the header with a blank line
         self.write("\n")
+
+        # For BJT subcircuits, write .param statements for model-accessed parameters
+        if is_bjt_subckt and params_for_param_statements:
+            self.write_comment("BJT parameters moved from PARAMS: to .param statements for model access")
+            self.write("\n")
+            for param in params_for_param_statements:
+                self.write(".param ")
+                self.write_param_decl(param)
+                self.write("\n")
+            self.write("\n")
 
         # Write internal content
         for entry in module.entries:
@@ -1258,7 +1386,7 @@ class XyceNetlister(SpiceNetlister):
         return False
 
     def _clamp_param_value(self, expr: Expr, min_val: Optional[float], max_val: Optional[float], 
-                          min_exclusive: bool = False, max_exclusive: bool = False) -> Expr:
+                          min_exclusive: bool = False, max_exclusive: bool = False, preserve_zero: bool = False) -> Expr:
         """Clamp a parameter value expression to valid range.
         
         Args:
@@ -1267,6 +1395,7 @@ class XyceNetlister(SpiceNetlister):
             max_val: Maximum value (None for unbounded)
             min_exclusive: If True, min is exclusive (use min + epsilon)
             max_exclusive: If True, max is exclusive (use max - epsilon)
+            preserve_zero: If True, preserve value 0 (don't clamp) as 0 often has special meaning
             
         Returns:
             Clamped Expr (preserves original type), or original if not a numeric literal
@@ -1300,6 +1429,10 @@ class XyceNetlister(SpiceNetlister):
             else:
                 val = float(val_str) if val_str else 0.0
         else:
+            return expr
+        
+        # Preserve zero if requested (0 often has special meaning in SPICE models)
+        if preserve_zero and abs(val) < 1e-12:
             return expr
         
         # Clamp to range
@@ -1368,7 +1501,7 @@ class XyceNetlister(SpiceNetlister):
             ('NF',   'SPECIAL_NF'),  # forward emission coeff -> PE + MLF
             ('NR',   'PC'),     # reverse emission coeff -> PC
             ('VAF',  'VEF', (0.01, None)),  # forward Early voltage -> VEF, range: [0.01, +inf)
-            ('VAR',  'VER', (0.01, None)),  # reverse Early voltage -> VER, range: [0.01, +inf)
+            ('VAR',  'VER', (0.0, None)),  # reverse Early voltage -> VER, range: [0.0, +inf) - var=0 means infinite/unused in SPICE, will be handled specially
             ('IKF',  'SPECIAL_IK'),  # forward knee -> IK (conflict with IKR)
             ('IKR',  'SPECIAL_IK'),  # reverse knee -> IK (conflict with IKF)
             ('ISE',  'IBF'),    # B-E leakage sat current -> IBF
@@ -1378,11 +1511,13 @@ class XyceNetlister(SpiceNetlister):
             
             # === Resistances ===
             ('RB',   'RBV'),    # parasitic base resistance -> RBV (variable part)
-            ('RBM',  'RBC', (0.001, None)),  # minimum intrinsic base resistance -> RBC, range: [0.001, +inf)
+            ('RBM',  'RBC', (0.001, None)),  # minimum intrinsic base resistance -> RBC, range: [0.001, +inf) - MEXTRAM requires RBC >= 0.001
             ('RBI',  'SPECIAL_RBI'), # distribute to RBV + RBC
             ('IRB',  (None, "Unsupported; no direct IRB equivalent")),
             ('RE',   'RE'),     # emitter resistance
             ('RC',   'RCC'),    # collector resistance -> RCC
+            # NOTE: RCC should be calculated using Buried Layer (NBL) sheet resistance (~20Ω/□), not N-Well (~1000Ω/□)
+            # If RCC is too high (e.g., >50Ω for a 1x1 device), it may indicate wrong sheet resistance was used
             
             # === Capacitances & junction parameters ===
             ('CJE',  'CJE'),    # B-E capacitance
@@ -1447,13 +1582,18 @@ class XyceNetlister(SpiceNetlister):
         # Format: (level1_name, action, optional_range_tuple)
         param_map = {}
         range_map = {}  # Store range info separately
+        preserve_zero_map = {}  # Track which params should preserve 0
         for mapping_entry in level1_to_mextram_mapping:
             level1_name = mapping_entry[0]
             action = mapping_entry[1]
             param_map[level1_name.upper()] = action
             # Check if there's a range tuple (3rd element)
             if len(mapping_entry) >= 3:
-                range_map[level1_name.upper()] = mapping_entry[2]
+                range_info = mapping_entry[2]
+                range_map[level1_name.upper()] = range_info
+                # Check if preserve_zero flag is set (5th element in tuple)
+                if len(range_info) >= 5:
+                    preserve_zero_map[level1_name.upper()] = range_info[4]
             
         # Pre-scan params to handle conflicts/merges (IK, NF, RBI)
         params_dict = {p.name.name.upper(): p for p in params}
@@ -1567,6 +1707,15 @@ class XyceNetlister(SpiceNetlister):
                         continue
                     else:
                         # Map with warning/comment
+                        # Special handling: VAR=0 means infinite/unused in SPICE, set VER to large value (100000V) for convergence
+                        if name_upper == 'VAR' and self._is_number(param.default):
+                            var_val = float(param.default.val) if hasattr(param.default, 'val') else float(param.default)
+                            if abs(var_val) < 1e-12:  # VAR = 0
+                                # Set VER to large value (100000V) instead of skipping - helps Xyce convergence
+                                ver_val = Float(100000.0)
+                                add_param('VER', ver_val, param.distr, comment="var=0 means infinite/unused in SPICE, VER set to 100000V for convergence")
+                                continue
+                        
                         # Check for range clamping
                         default_val = param.default
                         if name_upper in range_map:
@@ -1582,31 +1731,46 @@ class XyceNetlister(SpiceNetlister):
                                     clamped_default = min_val + (1e-12 if min_exclusive else 0)
                                     default_val = Float(clamped_default)
                                 elif self._is_number(default_val):
-                                    clamped = self._clamp_param_value(default_val, min_val, max_val, min_exclusive, max_exclusive)
+                                    # Check if we should preserve zero for this parameter
+                                    preserve_zero = preserve_zero_map.get(name_upper, False)
+                                    # Normal clamping
+                                    clamped = self._clamp_param_value(default_val, min_val, max_val, min_exclusive, max_exclusive, preserve_zero=preserve_zero)
                                     if self._is_number(clamped):
                                         if isinstance(default_val, (Int, Float)) and isinstance(clamped, (Int, Float)):
                                             old_val = default_val.val if hasattr(default_val, 'val') else default_val
                                             new_val = clamped.val if hasattr(clamped, 'val') else clamped
-                                            if abs(old_val - new_val) >= 1e-12:
+                                            # Special case: VER cannot be 0 in Xyce, use minimum 0.01 if clamped to 0
+                                            if name_upper == 'VAR' and new_name == 'VER' and abs(new_val) < 1e-12:
+                                                new_val = 0.01
+                                                clamped = Float(new_val)
+                                                clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val} - Xyce requires VER > 0)")
+                                            elif abs(old_val - new_val) >= 1e-12:
                                                 clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val})")
-                                                default_val = clamped
-                                        else:
                                             default_val = clamped
+                                    else:
+                                        default_val = clamped
                                 else:
-                                    # Expression - wrap in max()/min() to enforce bounds
-                                    EPSILON = 1e-12
-                                    if min_val is not None:
-                                        min_expr = Float(min_val + (EPSILON if min_exclusive else 0))
-                                        default_val = Call(func=Ref(ident=Ident("max")), args=[default_val, min_expr])
-                                    if max_val is not None:
-                                        max_expr = Float(max_val - (EPSILON if max_exclusive else 0))
-                                        default_val = Call(func=Ref(ident=Ident("min")), args=[default_val, max_expr])
+                                    # Expression - DO NOT wrap in max()/min() for expressions
+                                    # Xyce has trouble with max()/min() during DC analysis convergence
+                                    # Range constraints are only enforced for numeric literals
+                                    # Expressions are assumed to evaluate correctly (or will fail at runtime if invalid)
+                                    # This matches the working simplified model which uses pre-evaluated numeric values
+                                    pass  # Keep expression as-is without max()/min() wrapping
                         add_param(new_name, default_val, param.distr, comment=f"{param.name.name} -> {new_name} (lvl 1 -> lvl 504). {warning_msg}")
                         
                 elif isinstance(action, str):
                     if action.startswith('SPECIAL_'):
                         continue # Already handled
                     new_name = action
+                    
+                    # Special handling: VAR=0 means infinite/unused in SPICE, set VER to large value (100000V) for convergence
+                    if name_upper == 'VAR' and new_name == 'VER' and self._is_number(param.default):
+                        var_val = float(param.default.val) if hasattr(param.default, 'val') else float(param.default)
+                        if abs(var_val) < 1e-12:  # VAR = 0
+                            # Set VER to large value (100000V) instead of skipping - helps Xyce convergence
+                            ver_val = Float(100000.0)
+                            add_param('VER', ver_val, param.distr, comment="var=0 means infinite/unused in SPICE, VER set to 100000V for convergence")
+                            continue
                     
                     # Apply range clamping if range info exists
                     default_val = param.default
@@ -1623,37 +1787,34 @@ class XyceNetlister(SpiceNetlister):
                                 # Use minimum value as default (with epsilon for exclusive)
                                 clamped_default = min_val + (1e-12 if min_exclusive else 0)
                                 default_val = Float(clamped_default)
-                            else:
-                                clamped = self._clamp_param_value(default_val, min_val, max_val, min_exclusive, max_exclusive)
+                            elif self._is_number(default_val):
+                                # Check if we should preserve zero for this parameter
+                                preserve_zero = preserve_zero_map.get(name_upper, False)
+                                # Normal clamping
+                                clamped = self._clamp_param_value(default_val, min_val, max_val, min_exclusive, max_exclusive, preserve_zero=preserve_zero)
                                 # Only use clamped value if it's a numeric literal (clamping worked)
                                 if self._is_number(clamped):
                                     # Check if value actually changed (use >= to catch epsilon changes)
                                     if isinstance(default_val, (Int, Float)) and isinstance(clamped, (Int, Float)):
                                         old_val = default_val.val if hasattr(default_val, 'val') else default_val
                                         new_val = clamped.val if hasattr(clamped, 'val') else clamped
-                                        if abs(old_val - new_val) >= 1e-12:
+                                        # Special case: VER cannot be 0 in Xyce, use minimum 0.01 if clamped to 0
+                                        if name_upper == 'VAR' and new_name == 'VER' and abs(new_val) < 1e-12:
+                                            new_val = 0.01
+                                            clamped = Float(new_val)
+                                            clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val} - Xyce requires VER > 0)")
+                                        elif abs(old_val - new_val) >= 1e-12:
                                             clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val})")
-                                            default_val = clamped
-                                    else:
                                         default_val = clamped
-                                elif self._is_number(default_val):
-                                    # If clamping didn't produce a number but original was, keep original
-                                    pass
                                 else:
-                                    # Neither is a number, but we have a range constraint
-                                    # Wrap expression in max()/min() to ensure it stays within bounds
-                                    if not self._is_number(default_val):
-                                        EPSILON = 1e-12  # Consistent with _clamp_param_value
-                                        if min_val is not None:
-                                            # Create max(expr, min_val) to ensure minimum value
-                                            min_expr = Float(min_val + (EPSILON if min_exclusive else 0))
-                                            default_val = Call(func=Ref(ident=Ident("max")), args=[default_val, min_expr])
-                                        if max_val is not None:
-                                            # Create min(expr, max_val) to ensure maximum value
-                                            max_expr = Float(max_val - (EPSILON if max_exclusive else 0))
-                                            default_val = Call(func=Ref(ident=Ident("min")), args=[default_val, max_expr])
-                                    else:
-                                        default_val = clamped
+                                    default_val = clamped
+                            else:
+                                # Expression - DO NOT wrap in max()/min() for expressions
+                                # Xyce has trouble with max()/min() during DC analysis convergence
+                                # Range constraints are only enforced for numeric literals
+                                # Expressions are assumed to evaluate correctly (or will fail at runtime if invalid)
+                                # This matches the working simplified model which uses pre-evaluated numeric values
+                                pass  # Keep expression as-is without max()/min() wrapping
                     
                     # Suppress comment if rename is only capitalization change
                     comment = f"{param.name.name} -> {new_name} (lvl 1 -> lvl 504)"
