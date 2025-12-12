@@ -686,7 +686,11 @@ class NgspiceNetlister(SpiceNetlister):
         self.write(f"* {comment}\n")
 
     def _format_expr_inner(self, expr: Expr) -> str:
-        """Override to replace round() with nint() for ngspice compatibility."""
+        """Override to replace round() with nint() and ^ with ** for ngspice compatibility.
+        
+        ngspice supports both ^ and ** for exponentiation, but ** is more compatible
+        across SPICE simulators. If ** doesn't work, pow() is also supported.
+        """
         if isinstance(expr, Call):
             func = self.format_ident(expr.func)
             # Replace round() with nint() for ngspice compatibility
@@ -694,6 +698,35 @@ class NgspiceNetlister(SpiceNetlister):
                 func = "nint"
             args = [self._format_expr_inner(arg) for arg in expr.args]
             return f"{func}({','.join(args)})"
+        
+        if isinstance(expr, BinaryOp):
+            from ..data import BinaryOperator
+            # Replace ^ operator with ** for better SPICE compatibility
+            # ngspice supports both ^ and **, but ** is more widely supported
+            # If ** doesn't work, pow() is also available as fallback
+            op_value = expr.tp.value if hasattr(expr.tp, 'value') else str(expr.tp)
+            if op_value == '^' or (hasattr(BinaryOperator, 'POW') and expr.tp == BinaryOperator.POW):
+                left = self._format_expr_inner(expr.left)
+                right = self._format_expr_inner(expr.right)
+                # Wrap operands in parentheses for safety
+                if isinstance(expr.left, BinaryOp):
+                    left = f"({left})"
+                if isinstance(expr.right, BinaryOp):
+                    right = f"({right})"
+                return f"{left}**{right}"
+            
+            # Handle other binary operators normally
+            left = self._format_expr_inner(expr.left)
+            right = self._format_expr_inner(expr.right)
+            op = op_value
+            
+            # Check if we need parentheses for precedence
+            if isinstance(expr.left, BinaryOp):
+                left = f"({left})"
+            if isinstance(expr.right, BinaryOp):
+                right = f"({right})"
+                
+            return f"{left}{op}{right}"
         
         # For all other expression types, call parent implementation
         return super()._format_expr_inner(expr)
@@ -784,7 +817,7 @@ class NgspiceNetlister(SpiceNetlister):
         # For ngspice: Check if any models inside this subcircuit reference subcircuit parameters
         # If so, add .param statements for those parameters to ensure they're in scope when models are evaluated
         if module.params:
-            from ..data import ModelDef, ModelFamily, Ref
+            from ..data import ModelDef, ModelFamily, Ref, Primitive
             
             # Collect parameter names from subcircuit
             subckt_param_names = {p.name.name for p in module.params}
@@ -824,12 +857,33 @@ class NgspiceNetlister(SpiceNetlister):
                                 if expr_references_param(pval.val, subckt_param_name):
                                     params_needed_as_param_statements.add(subckt_param_name)
                                     break
+                elif isinstance(entry, Primitive):
+                    # Check primitive instance parameters (kwargs) for references to subcircuit parameters
+                    for pval in entry.kwargs:
+                        # Check Ref first (it's a subclass of Expr, so order matters)
+                        if isinstance(pval.val, Ref):
+                            # Direct parameter reference (e.g., nrd={nrd})
+                            if pval.val.ident.name in subckt_param_names:
+                                params_needed_as_param_statements.add(pval.val.ident.name)
+                        elif isinstance(pval.val, Expr):
+                            # Complex expression that might reference subcircuit parameters
+                            for subckt_param_name in subckt_param_names:
+                                if expr_references_param(pval.val, subckt_param_name):
+                                    params_needed_as_param_statements.add(subckt_param_name)
+                                    break
             
             # Add .param statements for parameters that are referenced in models
-            # This ensures they're available when ngspice evaluates the model parameters
+            # BUT: Do NOT add .param statements for parameters that are already subcircuit parameters
+            # Subcircuit parameters are automatically in scope in ngspice
+            # We only need .param statements for parameters that are referenced but NOT subcircuit parameters
             if params_needed_as_param_statements:
                 for param_name in sorted(params_needed_as_param_statements):  # Sort for deterministic output
-                    # Find the parameter definition
+                    # Skip if this is already a subcircuit parameter (it's already in scope)
+                    if param_name in subckt_param_names:
+                        continue
+                    # Find the parameter definition (must be a global parameter or from parent scope)
+                    # Note: This case is rare - usually referenced params are subcircuit params
+                    # But we handle it for completeness
                     for param in module.params:
                         if param.name.name == param_name:
                             # Write as .param statement
