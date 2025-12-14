@@ -1728,18 +1728,11 @@ class NgspiceNetlister(SpiceNetlister):
                     level_mapping_applied = True
                     
                     # Apply parameter mapping based on device type and level transition
-                    # ngspice uses level 6 for MEXTRAM (same as Xyce level 504)
-                    if mtype_lower in ("npn", "pnp") and current_level == 1 and output_level == 6:
-                        # Import the mapping function from XyceNetlister
-                        from .xyce import XyceNetlister
-                        # Create a temporary XyceNetlister instance to use its mapping function
-                        # We'll use a dummy IO object
-                        import io
-                        temp_xyce = XyceNetlister(self.src, io.StringIO(), model_level_mapping={"npn": [(1, 504)], "pnp": [(1, 504)]})
-                        # Extract just the ParamDecl objects (not tuples)
+                    # ngspice uses Level 1 (Gummel-Poon) for BJTs (same as Xyce Level 1)
+                    if mtype_lower in ("npn", "pnp") and current_level == 1 and output_level == 1:
+                        # Filter Level 1 parameters to keep only those supported in ngspice Level 1
                         param_decls = [p[0] if isinstance(p, tuple) else p for p in params_to_write]
-                        # Map level 1 BJT parameters to MEXTRAM (level 6 uses same params as level 504)
-                        mapped_params = temp_xyce._map_bjt_level1_to_mextram_params(param_decls, model_name=mname)
+                        mapped_params = self._map_bjt_level1_to_level1_params(param_decls, model_name=mname)
                         # Convert back to list format (mapped_params returns tuples)
                         params_to_write = mapped_params
                     
@@ -1759,6 +1752,43 @@ class NgspiceNetlister(SpiceNetlister):
                         # Add level parameter at the beginning
                         level_param = ParamDecl(name=Ident("level"), default=Int(output_level), distr=None)
                         params_to_write.insert(0, level_param)
+        
+        # Handle BJT models (NPN and PNP): default to level=1 (Gummel-Poon) if not already set
+        # Only apply default behavior if level mapping was not already applied
+        if mtype.lower() in ("npn", "pnp") and not level_mapping_applied:
+            # Check if level parameter already exists
+            has_level = False
+            current_level = None
+            for p in params_to_write:
+                if get_param_name(p).lower() == "level":
+                    has_level = True
+                    if isinstance(p, tuple):
+                        p_obj = p[0]
+                    else:
+                        p_obj = p
+                    if isinstance(p_obj.default, (Int, Float)):
+                        current_level = int(float(p_obj.default.val) if hasattr(p_obj.default, 'val') else float(p_obj.default))
+                    elif isinstance(p_obj.default, MetricNum):
+                        current_level = int(float(p_obj.default.val))
+                    break
+            
+            # Add level=1 at the beginning if not already present
+            if not has_level:
+                level_param = ParamDecl(name=Ident("level"), default=Int(1), distr=None)
+                params_to_write.insert(0, level_param)
+                # Filter parameters to keep only Level 1 supported ones
+                param_decls = [p[0] if isinstance(p, tuple) else p for p in params_to_write]
+                params_to_write = self._map_bjt_level1_to_level1_params(param_decls, model_name=mname)
+            else:
+                # If level exists, check its value
+                for i, p in enumerate(params_to_write):
+                    if get_param_name(p).lower() == "level":
+                        # Check current level value
+                        if current_level == 1:
+                            # Already level 1, filter parameters
+                            param_decls = [p[0] if isinstance(p, tuple) else p for p in params_to_write]
+                            params_to_write = self._map_bjt_level1_to_level1_params(param_decls, model_name=mname)
+                        break
         
         # Write model header
         # For BSIM4 models in ngspice, extract type from parameters and put it on .model line
@@ -1949,6 +1979,114 @@ class NgspiceNetlister(SpiceNetlister):
         
         # For anything else, return as-is
         return expr
+
+    def _map_bjt_level1_to_level1_params(self, params: List[ParamDecl], model_name: str = "") -> List[Tuple[ParamDecl, Optional[str], bool]]:
+        """Filter BJT Level 1 (Gummel-Poon) parameters to keep only those supported in ngspice Level 1.
+        
+        Args:
+            params: List of ParamDecl objects with level 1 parameter names
+            model_name: Name of the model being converted (for warning context)
+            
+        Returns:
+            List of (ParamDecl, comment, commented_out) tuples
+        """
+        from warnings import warn
+        
+        # Track warnings for this conversion
+        dropped_params = []
+        kept_params = []
+        
+        # List of parameters supported in ngspice Level 1 (Gummel-Poon)
+        # These map directly from Spectre Level 1 to ngspice Level 1
+        supported_level1_params = {
+            # DC parameters
+            'IS', 'BF', 'BR', 'NF', 'NR', 'VAF', 'VAR',
+            'IKF', 'IKR', 'ISE', 'ISC', 'NE', 'NC',
+            # Resistance parameters
+            'RB', 'RBM', 'RE', 'RC', 'IRB',
+            # Capacitance parameters
+            'CJE', 'CJC', 'CJS', 'VJE', 'VJC', 'VJS',
+            'MJE', 'MJC', 'MJS', 'FC', 'XCJC',
+            # Transit time parameters
+            'TF', 'TR',
+            # Temperature parameters
+            'TREF', 'EG', 'XTI', 'XTB',
+            # Noise parameters
+            'AF', 'KF',
+        }
+        
+        # Parameters to drop (not in ngspice Level 1)
+        unsupported_params = {
+            # Advanced TF parameters
+            'ITF', 'VTF', 'XTF', 'PTF',
+            # Substrate/advanced parameters
+            'ISS', 'NKF', 'IBC', 'SUBS',
+            # Spectre-only parameters
+            'DCAP', 'GAP1', 'GAP2',
+            # Temperature coefficients (ngspice Level 1 uses simpler temp model)
+            'CTC', 'CTE', 'CTS', 'TLEV', 'TLEVC',
+            'TVJC', 'TVJE', 'TVJS',
+            # All T* temperature coefficient parameters
+        }
+        
+        # Process each parameter
+        filtered_params = []
+        for param_item in params:
+            # Handle both ParamDecl and tuple formats
+            if isinstance(param_item, tuple):
+                param = param_item[0]  # Extract ParamDecl from tuple
+            else:
+                param = param_item
+            
+            param_name_upper = param.name.name.upper()
+            
+            # Check if parameter is supported
+            if param_name_upper in supported_level1_params:
+                # Special handling for VAR=0 (infinite reverse Early voltage)
+                # Set to large value (100000V) to avoid numerical issues in base charge calculation
+                if param_name_upper == 'VAR':
+                    # Check if VAR is 0 (either as number or in expression)
+                    var_val = None
+                    if isinstance(param.default, (Int, Float)):
+                        var_val = float(param.default.val) if hasattr(param.default, 'val') else float(param.default)
+                    elif isinstance(param.default, MetricNum):
+                        var_val = float(param.default.val)
+                    
+                    if var_val is not None and abs(var_val) < 1e-12:  # VAR = 0
+                        # Set VAR to large value (100000V) instead of 0
+                        var_param = ParamDecl(
+                            name=param.name,
+                            default=Float(100000.0),
+                            distr=param.distr
+                        )
+                        filtered_params.append((var_param, "var=0 means infinite/unused in SPICE, VAR set to 100000V for numerical stability", False))
+                        kept_params.append(param.name.name)
+                        continue
+                
+                # Keep parameter as-is (direct mapping, same name)
+                filtered_params.append((param, None, False))
+                kept_params.append(param.name.name)
+            elif param_name_upper in unsupported_params:
+                # Drop parameter
+                dropped_params.append(param.name.name)
+                # Don't add to filtered_params (effectively drops it)
+            elif param_name_upper.startswith('T') and len(param_name_upper) > 1:
+                # Check if it's a temperature coefficient parameter (TIS1, TBF1, etc.)
+                # These are not in ngspice Level 1
+                # But exclude TREF, TF, TR which are valid
+                if param_name_upper not in ('TREF', 'TF', 'TR'):
+                    dropped_params.append(param.name.name)
+            else:
+                # Unknown parameter - keep it but log a warning
+                warn(f"BJT Level 1 parameter '{param.name.name}' not in known supported/dropped list. Keeping it. Model: {model_name}")
+                filtered_params.append((param, None, False))
+                kept_params.append(param.name.name)
+        
+        # Log summary
+        if dropped_params:
+            warn(f"BJT Level 1 -> Level 1 conversion: {len(dropped_params)} parameter(s) dropped (not supported in ngspice Level 1): {', '.join(dropped_params)}. Model: {model_name}")
+        
+        return filtered_params
 
     def write_test_netlist(self) -> None:
         """Write a sanity check netlist."""

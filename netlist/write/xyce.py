@@ -1469,6 +1469,120 @@ class XyceNetlister(SpiceNetlister):
         else:  # MetricNum - convert to Float since we can't preserve suffix easily
             return Float(clamped_val)
 
+    def _map_bjt_level1_to_level1_params(self, params: List[ParamDecl], model_name: str = "") -> List[Tuple[ParamDecl, Optional[str], bool]]:
+        """Filter BJT Level 1 (Gummel-Poon) parameters to keep only those supported in Xyce Level 1.
+        
+        Args:
+            params: List of ParamDecl objects with level 1 parameter names
+            model_name: Name of the model being converted (for warning context)
+            
+        Returns:
+            List of (ParamDecl, comment, commented_out) tuples
+        """
+        # Track warnings for this conversion
+        dropped_params = []
+        kept_params = []
+        
+        # List of parameters supported in Xyce Level 1 (Gummel-Poon)
+        # These map directly from Spectre Level 1 to Xyce Level 1
+        supported_level1_params = {
+            # DC parameters
+            'IS', 'BF', 'BR', 'NF', 'NR', 'VAF', 'VAR',
+            'IKF', 'IKR', 'ISE', 'ISC', 'NE', 'NC',
+            # Resistance parameters
+            'RB', 'RBM', 'RE', 'RC', 'IRB',
+            # Capacitance parameters
+            'CJE', 'CJC', 'CJS', 'VJE', 'VJC', 'VJS',
+            'MJE', 'MJC', 'MJS', 'FC', 'XCJC',
+            # Transit time parameters
+            'TF', 'TR',
+            # Temperature parameters
+            'TREF', 'EG', 'XTI', 'XTB',
+            # Noise parameters
+            'AF', 'KF',
+        }
+        
+        # Parameters to drop (not in Xyce Level 1)
+        unsupported_params = {
+            # Advanced TF parameters
+            'ITF', 'VTF', 'XTF', 'PTF',
+            # Substrate/advanced parameters
+            'ISS', 'NKF', 'IBC', 'SUBS',
+            # Spectre-only parameters
+            'DCAP', 'GAP1', 'GAP2',
+            # Temperature coefficients (Xyce Level 1 uses simpler temp model)
+            'CTC', 'CTE', 'CTS', 'TLEV', 'TLEVC',
+            'TVJC', 'TVJE', 'TVJS',
+            # All T* temperature coefficient parameters
+        }
+        
+        # Process each parameter
+        filtered_params = []
+        for param_item in params:
+            # Handle both ParamDecl and tuple formats
+            if isinstance(param_item, tuple):
+                param = param_item[0]  # Extract ParamDecl from tuple
+            else:
+                param = param_item
+            
+            param_name_upper = param.name.name.upper()
+            
+            # Check if parameter is supported
+            if param_name_upper in supported_level1_params:
+                # Special handling for VAR=0 (infinite reverse Early voltage)
+                # Set to large value (100000V) to avoid numerical issues in base charge calculation
+                if param_name_upper == 'VAR':
+                    # Check if VAR is 0 (either as number or in expression)
+                    var_val = None
+                    if self._is_number(param.default):
+                        var_val = float(param.default.val) if hasattr(param.default, 'val') else float(param.default)
+                    elif isinstance(param.default, (Int, Float)):
+                        var_val = float(param.default.val) if hasattr(param.default, 'val') else float(param.default)
+                    
+                    if var_val is not None and abs(var_val) < 1e-12:  # VAR = 0
+                        # Set VAR to large value (100000V) instead of 0
+                        from ..data import Float
+                        var_param = ParamDecl(
+                            name=param.name,
+                            default=Float(100000.0),
+                            distr=param.distr
+                        )
+                        filtered_params.append((var_param, "var=0 means infinite/unused in SPICE, VAR set to 100000V for numerical stability", False))
+                        kept_params.append(param.name.name)
+                        continue
+                
+                # Keep parameter as-is (direct mapping, same name)
+                filtered_params.append((param, None, False))
+                kept_params.append(param.name.name)
+            elif param_name_upper in unsupported_params:
+                # Drop parameter
+                dropped_params.append(param.name.name)
+                # Don't add to filtered_params (effectively drops it)
+            elif param_name_upper.startswith('T') and len(param_name_upper) > 1:
+                # Check if it's a temperature coefficient parameter (TIS1, TBF1, etc.)
+                # These are not in Xyce Level 1
+                # But exclude TREF, TF, TR which are valid
+                if param_name_upper not in ('TREF', 'TF', 'TR'):
+                    dropped_params.append(param.name.name)
+            else:
+                # Unknown parameter - keep it but log a warning
+                self.log_warning(
+                    f"BJT Level 1 parameter '{param.name.name}' not in known supported/dropped list. Keeping it.",
+                    f"Model: {model_name}"
+                )
+                filtered_params.append((param, None, False))
+                kept_params.append(param.name.name)
+        
+        # Log summary
+        context = f"Model: {model_name}" if model_name else "BJT conversion"
+        if dropped_params:
+            self.log_warning(
+                f"BJT Level 1 -> Level 1 conversion: {len(dropped_params)} parameter(s) dropped (not supported in Xyce Level 1): {', '.join(dropped_params)}",
+                context
+            )
+        
+        return filtered_params
+
     def _map_bjt_level1_to_mextram_params(self, params: List[ParamDecl], model_name: str = "") -> List[Tuple[ParamDecl, Optional[str], bool]]:
         """Map BJT level 1 (Gummel-Poon) parameters to MEXTRAM (level 504) parameters.
         
@@ -1936,7 +2050,10 @@ class XyceNetlister(SpiceNetlister):
                     level_mapping_applied = True
                     
                     # Apply parameter mapping based on device type and level transition
-                    if mtype_lower in ("npn", "pnp") and current_level == 1 and output_level == 504:
+                    if mtype_lower in ("npn", "pnp") and current_level == 1 and output_level == 1:
+                        # Keep Level 1, just filter unsupported parameters
+                        params_to_write = self._map_bjt_level1_to_level1_params(params_to_write, model_name=mname)
+                    elif mtype_lower in ("npn", "pnp") and current_level == 1 and output_level == 504:
                         # Log summary warning about BJT conversion
                         self.log_warning(
                             f"Converting BJT model '{mname}' from Level 1 (Gummel-Poon) to Level 504 (MEXTRAM). "
@@ -1996,9 +2113,8 @@ class XyceNetlister(SpiceNetlister):
                 level_param = ParamDecl(name=Ident("level"), default=Float(54.0), distr=None)
                 params_to_write.insert(0, level_param)
         
-        # Handle BJT models (NPN and PNP): add level=504 (Mextram) if not already present
+        # Handle BJT models (NPN and PNP): keep level=1 (Gummel-Poon) if not already set
         # Only apply default behavior if level mapping was not already applied
-        bjt_uses_level_504 = False
         if mtype in ("npn", "pnp") and not level_mapping_applied:
             # Check if level parameter already exists
             has_level = any(self._get_param_name(p) == "level" for p in params_to_write)
@@ -2015,25 +2131,17 @@ class XyceNetlister(SpiceNetlister):
                             current_level = int(float(default_val.val))
                         break
             
-            # Add level=504 at the beginning if not already present
+            # Add level=1 at the beginning if not already present
             if not has_level:
-                level_param = ParamDecl(name=Ident("level"), default=Int(504), distr=None)
+                level_param = ParamDecl(name=Ident("level"), default=Int(1), distr=None)
                 params_to_write.insert(0, level_param)
-                bjt_uses_level_504 = True
-                # If we're defaulting to level 504, check if we need to convert parameters
-                if current_level == 1:
-                    self.log_warning(
-                        f"BJT model '{mname}' defaulting to Level 504 (MEXTRAM). "
-                        "Many Level 1 parameters may not be compatible and will be commented out. "
-                        "See detailed warnings below.",
-                        f"Model: {mname}"
-                    )
-                    params_to_write = self._map_bjt_level1_to_mextram_params(params_to_write, model_name=mname)
+                # Filter parameters to keep only Level 1 supported ones
+                params_to_write = self._map_bjt_level1_to_level1_params(params_to_write, model_name=mname)
             else:
                 # If level exists, check its value
                 for i, p in enumerate(params_to_write):
                     if self._get_param_name(p) == "level":
-                        # Check if current level value is less than 504
+                        # Check current level value
                         current_level = None
                         default_val = self._get_param_default(p)
                         if isinstance(default_val, (Int, Float)):
@@ -2042,27 +2150,19 @@ class XyceNetlister(SpiceNetlister):
                             current_level = float(default_val.val)
                         
                         if current_level is not None:
-                            if current_level < 504.0:
-                                # Update to level=504
-                                params_to_write[i] = ParamDecl(name=Ident("level"), default=Int(504), distr=None)
-                                bjt_uses_level_504 = True
-                                # Convert parameters if upgrading from level 1
-                                if current_level == 1:
-                                    self.log_warning(
-                                        f"BJT model '{mname}' upgraded from Level {int(current_level)} to Level 504 (MEXTRAM). "
-                                        "Many Level 1 parameters are not compatible and will be commented out. "
-                                        "See detailed warnings below.",
-                                        f"Model: {mname}"
-                                    )
-                                    params_to_write = self._map_bjt_level1_to_mextram_params(params_to_write, model_name=mname)
-                            elif abs(current_level - 504.0) < 0.1:  # Close to 504
-                                # Already level 504, but ensure it's Int not Float
-                                params_to_write[i] = ParamDecl(name=Ident("level"), default=Int(504), distr=None)
-                                bjt_uses_level_504 = True
+                            if current_level == 1.0:
+                                # Already level 1, filter parameters
+                                params_to_write = self._map_bjt_level1_to_level1_params(params_to_write, model_name=mname)
+                            elif abs(current_level - 504.0) < 0.1:  # Level 504
+                                # Keep level 504 if explicitly set (for backward compatibility)
+                                # But this shouldn't happen in normal flow now
+                                pass
                         break
-        elif mtype in ("npn", "pnp") and level_mapping_applied and output_level == 504:
-            # Level mapping was applied and resulted in level 504
-            bjt_uses_level_504 = True
+        elif mtype in ("npn", "pnp") and level_mapping_applied:
+            # Level mapping was applied - check what level it resulted in
+            if output_level == 1:
+                # Filter parameters if needed
+                params_to_write = self._map_bjt_level1_to_level1_params(params_to_write, model_name=mname)
         
         # Map to Xyce model type equivalent
         xyce_mtype = xyce_mtype_map.get(mtype, mtype)
@@ -2097,10 +2197,27 @@ class XyceNetlister(SpiceNetlister):
             else:
                 self.write("+ ")
             
-            # For BJT models with level=504, uppercase parameter names
+            # For BJT models with level=504, uppercase parameter names (MEXTRAM convention)
+            # For BJT models with level=1, keep lowercase parameter names (Gummel-Poon convention)
             # Note: Parameters from _map_bjt_level1_to_mextram_params are already uppercase
-            if bjt_uses_level_504 and param.name.name != "level":
-                # Create a temporary param with uppercase name for writing
+            # Note: Parameters from _map_bjt_level1_to_level1_params keep original case
+            # Check if this is a Level 504 model by checking if level parameter exists and equals 504
+            is_level_504 = False
+            for p in params_to_write:
+                if isinstance(p, tuple):
+                    p_param = p[0]
+                else:
+                    p_param = p
+                if p_param.name.name.lower() == "level":
+                    level_val = self._get_param_default(p_param)
+                    if isinstance(level_val, (Int, Float)):
+                        level_num = int(float(level_val.val) if hasattr(level_val, 'val') else float(level_val))
+                        if level_num == 504:
+                            is_level_504 = True
+                            break
+            
+            if is_level_504 and param.name.name != "level":
+                # Create a temporary param with uppercase name for writing (MEXTRAM)
                 param_upper = ParamDecl(
                     name=Ident(param.name.name.upper()),
                     default=param.default,
@@ -2108,6 +2225,7 @@ class XyceNetlister(SpiceNetlister):
                 )
                 self.write_param_decl(param_upper)
             else:
+                # Level 1 or other models - keep original case
                 self.write_param_decl(param)
                 
             if comment:
