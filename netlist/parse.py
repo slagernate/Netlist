@@ -555,6 +555,12 @@ class HierarchyCollector:
             elif isinstance(stmt, StartLibSection):
                 s = self.collect_lib_section(start=stmt)
                 sections.append(s)
+            elif isinstance(stmt, Comment):
+                # Skip comments in library context
+                continue
+            elif isinstance(stmt, BlankLine):
+                # Skip blank lines in library context
+                continue
             else:
                 msg = f"Invalid statement in library: {stmt}"
                 self.fail(msg)  # invalid type

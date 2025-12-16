@@ -56,6 +56,7 @@ _patterns1 = dict(
     COLON=r"\:",
     GE=r"\>\=",
     LE=r"\<\=",
+    DUBEQUALS=r"\=\=",  # Equality comparison operator
     GT=r"\>",
     LT=r"\<",
     EQUALS=r"\=",
@@ -142,6 +143,8 @@ class Lexer:
         self.current_line_comments: List[Tuple[str, str]] = []  # (comment_text, comment_type)
         # Persistent queue of comments that haven't been retrieved yet
         self.comment_queue: List[Tuple[str, str, int]] = []  # (comment_text, comment_type, line_num)
+        # Track if current line ends with backslash (for continuation)
+        self.current_line_ends_with_backslash = False
 
     def nxt(self) -> Optional[Token]:
         """Get our next Token, pulling a new line if necessary."""
@@ -156,6 +159,11 @@ class Lexer:
             self.recent_lines.append(self.line.rstrip('\n'))
             if len(self.recent_lines) > 5:
                 self.recent_lines.pop(0)
+
+            # Check if current line ends with backslash (for continuation)
+            # Strip trailing whitespace and newline, then check last char
+            line_stripped = self.line.rstrip('\n\r').rstrip()
+            self.current_line_ends_with_backslash = line_stripped.endswith('\\')
 
             self.toks = iter(pat.scanner(self.line).match, None)
             m = next(self.toks, None)
@@ -232,6 +240,29 @@ class Lexer:
 
             # Skip whitespace & comments
             token = self.eat_idle(token)
+
+            # Handle backslash line continuation
+            # If we see a BACKSLASH and the current line ends with backslash, skip it and the following NEWLINE
+            if token and token.tp == Tokens.BACKSLASH and self.current_line_ends_with_backslash:
+                # Skip the BACKSLASH token
+                token = self.nxt()
+                # Skip whitespace
+                while token and token.tp == Tokens.WHITE:
+                    token = self.nxt()
+                # If next is NEWLINE, skip it (continuation)
+                if token and token.tp == Tokens.NEWLINE:
+                    self.lexed_nonwhite_on_this_line = False
+                    self.current_line_comments.clear()
+                    # Continue to next line without yielding NEWLINE
+                    token = self.eat_idle(self.nxt())
+                    # Skip any additional newlines/whitespace
+                    while token and token.tp in (
+                        Tokens.NEWLINE,
+                        Tokens.WHITE,
+                    ):
+                        token = self.eat_idle(self.nxt())
+                    continue
+                # If not NEWLINE, fall through to yield the BACKSLASH (shouldn't happen normally)
 
             # Handle continuation-lines
             if token and token.tp == Tokens.NEWLINE:

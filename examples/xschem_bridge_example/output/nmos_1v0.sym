@@ -1,0 +1,16 @@
+v {xschem version=3.0.0 file_version=1.2}
+G nmos_1v0 0 0 0 0
+P -200 0 -200 0 0 0 0 0
+P 0 -200 0 -200 0 0 0 0
+P 200 0 200 0 0 0 0 0
+P 0 200 0 200 0 0 0 0
+T mosfet 0 0 0 0 0 0 0 0
+T spice_primitive=true 0 0 0 0 0 0 0 0
+T type=mosfet 0 0 0 0 0 0 0 0
+T format="@name @pinlist @symname @model" 0 0 0 0 0 0 0 0
+T template="X@name d g s b @model l={l} w={w} m={m}" 0 0 0 0 0 0 0 0
+T model=nmos_1v0 0 0 0 0 0 0 0 0
+T l=0.15 0 0 0 0 0 0 0 0
+T w=1.0 0 0 0 0 0 0 0 0
+T m=1.0 0 0 0 0 0 0 0 0
+R -100 -100 100 100

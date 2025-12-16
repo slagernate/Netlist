@@ -10,6 +10,7 @@ from datetime import datetime
 from .base import Netlister, ErrorMode
 from .spice import SpiceNetlister, HspiceNetlister, NgspiceNetlister, CdlNetlister
 from .xyce import XyceNetlister
+from .xschem import XschemNetlister
 
 class ReportCollector:
     """Collects warnings from multiple netlist conversions into a single report.
@@ -100,7 +101,7 @@ class ReportCollector:
 
 class WriteOptions:
     """Options for writing a netlist"""
-    def __init__(self, fmt, file_type: str = "", includes: list = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None, log_file: Optional[str] = None, report_collector: Optional[ReportCollector] = None):
+    def __init__(self, fmt, file_type: str = "", includes: list = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None, log_file: Optional[str] = None, report_collector: Optional[ReportCollector] = None, primitive_config_file: Optional[str] = None, subcircuit_dialect = None, bridge_file_name: Optional[str] = None):
         self.fmt = fmt
         self.file_type = file_type
         self.includes = includes or []  # List of (file, section) tuples for .lib statements
@@ -108,6 +109,9 @@ class WriteOptions:
         self.model_level_mapping = model_level_mapping
         self.log_file = log_file  # Optional path to log file for warnings
         self.report_collector = report_collector  # Optional report collector for multi-conversion reports
+        self.primitive_config_file = primitive_config_file  # Optional path to config file for primitive detection overrides (xschem)
+        self.subcircuit_dialect = subcircuit_dialect  # Optional dialect for bridge file generation (xschem)
+        self.bridge_file_name = bridge_file_name  # Optional custom name for bridge file (xschem)
 
 def _write_log_file(warnings: List[Tuple[str, Optional[str]]], log_path: str, src_info: Optional[str] = None, dest_info: Optional[str] = None) -> None:
     """Write collected warnings to a log file.
@@ -193,6 +197,11 @@ def netlist(src, dest, options):
         netlister = NgspiceNetlister(src, dest, file_type=options.file_type, 
                                      includes=options.includes, model_file=options.model_file,
                                      model_level_mapping=options.model_level_mapping)
+    elif options.fmt == NetlistDialects.XSCHEM:
+        netlister = XschemNetlister(src, dest, file_type=options.file_type,
+                                    primitive_config_file=options.primitive_config_file,
+                                    subcircuit_dialect=options.subcircuit_dialect,
+                                    bridge_file_name=options.bridge_file_name)
     else:
         netlister = SpiceNetlister(src, dest, file_type=options.file_type)
         

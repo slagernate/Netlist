@@ -37,6 +37,7 @@ class NetlistDialects(Enum):
     NGSPICE = "ngspice"
     XYCE = "xyce"
     CDL = "cdl"
+    XSCHEM = "xschem"
 
     @staticmethod
     def get(spec: "NetlistFormatSpec") -> "NetlistDialects":
@@ -851,6 +852,7 @@ class BinaryOperator(Enum):
     LT = "<"
     GE = ">="
     LE = "<="
+    EQ = "=="
 
     def __repr__(self):
         return f"BinaryOperator.{self.name}"

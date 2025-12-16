@@ -471,9 +471,9 @@ class DialectParser:
         return EndSubckt(name)
 
     def parse_expr0(self) -> Expr:
-        """expr0b ( (<|>|<=|>=) expr0b )?"""
+        """expr0b ( (<|>|<=|>=|==) expr0b )?"""
         e = self.parse_expr0b()
-        if self.match_any(Tokens.GT, Tokens.LT, Tokens.GE, Tokens.LE):
+        if self.match_any(Tokens.GT, Tokens.LT, Tokens.GE, Tokens.LE, Tokens.DUBEQUALS):
             tp = self.parse_binary_operator(self.cur.tp)
             right = self.parse_expr0b()
             return BinaryOp(tp=tp, left=e, right=right)
@@ -580,6 +580,7 @@ class DialectParser:
             Tokens.LT: BinaryOperator.LT,
             Tokens.GE: BinaryOperator.GE,
             Tokens.LE: BinaryOperator.LE,
+            Tokens.DUBEQUALS: BinaryOperator.EQ,
         }
         if tp in the_map:
             return the_map[tp]
