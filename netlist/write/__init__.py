@@ -192,18 +192,21 @@ def netlist(src, dest, options):
     if options.fmt == NetlistDialects.XYCE:
         netlister = XyceNetlister(src, dest, file_type=options.file_type, 
                                   includes=options.includes, model_file=options.model_file,
-                                  model_level_mapping=options.model_level_mapping)
+                                  model_level_mapping=options.model_level_mapping,
+                                  options=options)
     elif options.fmt == NetlistDialects.NGSPICE:
         netlister = NgspiceNetlister(src, dest, file_type=options.file_type, 
                                      includes=options.includes, model_file=options.model_file,
-                                     model_level_mapping=options.model_level_mapping)
+                                     model_level_mapping=options.model_level_mapping,
+                                     options=options)
     elif options.fmt == NetlistDialects.XSCHEM:
         netlister = XschemNetlister(src, dest, file_type=options.file_type,
                                     primitive_config_file=options.primitive_config_file,
                                     subcircuit_dialect=options.subcircuit_dialect,
-                                    bridge_file_name=options.bridge_file_name)
+                                    bridge_file_name=options.bridge_file_name,
+                                    options=options)
     else:
-        netlister = SpiceNetlister(src, dest, file_type=options.file_type)
+        netlister = SpiceNetlister(src, dest, file_type=options.file_type, options=options)
         
     netlister.netlist()
     

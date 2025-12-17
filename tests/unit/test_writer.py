@@ -35,6 +35,7 @@ from netlist import (
     ModelFamily,
     ModelVariant,
     LibSectionDef,
+    UseLibSection,
     Library,
     Expr,
 )
@@ -47,7 +48,7 @@ from netlist.write import WriteOptions
 # but in the previous turn I edited netlist/write/spice.py and it seems to still be there?
 # Let's check if I actually moved it. I see it in `netlist/write/spice.py` content I read.
 # So I will import from `netlist.write.spice` for now.
-from netlist.write.spice import apply_statistics_variations, debug_find_all_param_refs
+from netlist.write.spice import apply_statistics_variations, debug_find_all_param_refs, expr_references_param
 from netlist.dialects.spectre import SpectreDialectParser
 from netlist.write.spice import NgspiceNetlister
 
@@ -611,6 +612,200 @@ def test_process_variation_finds_param_in_library_section():
     assert param_pos > endl_pos
 
 
+def test_library_wrapper_omission_warning():
+    """Test that library wrappers are omitted and warnings are logged for Xyce output"""
+    
+    # Create a library with sections
+    section1 = LibSectionDef(
+        name=Ident("tt_section"),
+        entries=[
+            ParamDecls(params=[ParamDecl(name=Ident("param1"), default=Float(1.0), distr=None, comment=None)], comment=None)
+        ]
+    )
+    section2 = LibSectionDef(
+        name=Ident("ff_section"),
+        entries=[
+            ParamDecls(params=[ParamDecl(name=Ident("param2"), default=Float(2.0), distr=None, comment=None)], comment=None)
+        ]
+    )
+    
+    library = Library(name=Ident("testlib"), sections=[section1, section2])
+    program = Program(files=[SourceFile(path="test", contents=[library])])
+    
+    from netlist.write.xyce import XyceNetlister
+    
+    output = StringIO()
+    netlister = XyceNetlister(program, output, file_type="library")
+    netlister.netlist()
+    
+    output_str = output.getvalue()
+    warnings = netlister.get_warnings()
+    
+    # Verify library wrapper was omitted (no library wrapper syntax in output)
+    assert "library" not in output_str.lower() or "library testlib" not in output_str.lower()
+    assert "endlibrary" not in output_str.lower()
+    
+    # Verify sections were written
+    assert ".lib tt_section" in output_str
+    assert ".lib ff_section" in output_str
+    assert ".endl tt_section" in output_str
+    assert ".endl ff_section" in output_str
+    
+    # Verify warning was logged
+    assert len(warnings) > 0
+    warning_found = any("library wrapper" in msg.lower() and "testlib" in msg.lower() for msg, _ in warnings)
+    assert warning_found, f"Expected library wrapper warning, got: {warnings}"
+    
+    # Verify warning has context about number of sections
+    context_found = any("2 section" in ctx.lower() if ctx else False for _, ctx in warnings)
+    assert context_found, f"Expected context about 2 sections, got: {warnings}"
+
+
+def test_library_wrapper_no_comments_in_output():
+    """Test that no comments about omitted libraries appear in the output"""
+    
+    section = LibSectionDef(
+        name=Ident("test_section"),
+        entries=[
+            ModelDef(name=Ident("test_model"), mtype=Ident("nmos"), args=[], params=[])
+        ]
+    )
+    
+    library = Library(name=Ident("mylib"), sections=[section])
+    program = Program(files=[SourceFile(path="test", contents=[library])])
+    
+    from netlist.write.xyce import XyceNetlister
+    
+    output = StringIO()
+    netlister = XyceNetlister(program, output, file_type="library")
+    netlister.netlist()
+    
+    output_str = output.getvalue()
+    
+    # Verify no comments about omitted library wrappers
+    assert "omitted" not in output_str.lower() or "library" not in output_str.lower() or "no Xyce equivalent" not in output_str
+    
+    # Verify sections are written normally
+    assert ".lib test_section" in output_str
+    assert ".endl test_section" in output_str
+
+
+def test_library_wrapper_with_multiple_sections():
+    """Test library wrapper with many sections"""
+    
+    sections = []
+    for i in range(10):
+        section = LibSectionDef(
+            name=Ident(f"section_{i}"),
+            entries=[
+                ParamDecls(params=[ParamDecl(name=Ident(f"param_{i}"), default=Float(float(i)), distr=None, comment=None)], comment=None)
+            ]
+        )
+        sections.append(section)
+    
+    library = Library(name=Ident("biglib"), sections=sections)
+    program = Program(files=[SourceFile(path="test", contents=[library])])
+    
+    from netlist.write.xyce import XyceNetlister
+    
+    output = StringIO()
+    netlister = XyceNetlister(program, output, file_type="library")
+    netlister.netlist()
+    
+    output_str = output.getvalue()
+    warnings = netlister.get_warnings()
+    
+    # Verify all sections were written
+    for i in range(10):
+        assert f".lib section_{i}" in output_str
+        assert f".endl section_{i}" in output_str
+    
+    # Verify warning mentions correct number of sections
+    warning_found = any("10 section" in ctx.lower() if ctx else False for _, ctx in warnings)
+    assert warning_found, f"Expected context about 10 sections, got: {warnings}"
+
+
+def test_library_wrapper_empty_library():
+    """Test library wrapper with no sections"""
+    
+    library = Library(name=Ident("emptylib"), sections=[])
+    program = Program(files=[SourceFile(path="test", contents=[library])])
+    
+    from netlist.write.xyce import XyceNetlister
+    
+    output = StringIO()
+    netlister = XyceNetlister(program, output, file_type="library")
+    netlister.netlist()
+    
+    output_str = output.getvalue()
+    warnings = netlister.get_warnings()
+    
+    # Verify warning was still logged even for empty library
+    assert len(warnings) > 0
+    warning_found = any("library wrapper" in msg.lower() and "emptylib" in msg.lower() for msg, _ in warnings)
+    assert warning_found, f"Expected library wrapper warning for empty library, got: {warnings}"
+
+
+def test_library_wrapper_comment_preservation():
+    """Test that comments are preserved when library wrappers are omitted"""
+    from netlist.data import Comment
+    
+    # Create a library with sections that contain comments
+    section1 = LibSectionDef(
+        name=Ident("tt_section"),
+        entries=[
+            Comment(text="Comment before param in section 1", position="standalone"),
+            ParamDecls(params=[ParamDecl(name=Ident("param1"), default=Float(1.0), distr=None, comment=None)], comment=None),
+            Comment(text="Comment after param in section 1", position="standalone"),
+        ]
+    )
+    section2 = LibSectionDef(
+        name=Ident("ff_section"),
+        entries=[
+            Comment(text="Comment in section 2", position="standalone"),
+            ModelDef(name=Ident("test_model"), mtype=Ident("nmos"), args=[], params=[])
+        ]
+    )
+    
+    library = Library(name=Ident("testlib"), sections=[section1, section2])
+    
+    # Add comments before and after the library (these should be preserved)
+    comment_before = Comment(text="Comment before library wrapper", position="standalone")
+    comment_after = Comment(text="Comment after library wrapper", position="standalone")
+    
+    program = Program(files=[SourceFile(path="test", contents=[comment_before, library, comment_after])])
+    
+    from netlist.write.xyce import XyceNetlister
+    
+    output = StringIO()
+    netlister = XyceNetlister(program, output, file_type="library")
+    netlister.netlist()
+    
+    output_str = output.getvalue()
+    
+    # Verify comments within sections are preserved
+    assert "Comment before param in section 1" in output_str
+    assert "Comment after param in section 1" in output_str
+    assert "Comment in section 2" in output_str
+    
+    # Verify comments before/after library wrapper are preserved
+    # (library wrapper is omitted, but comments should still appear)
+    assert "Comment before library wrapper" in output_str
+    assert "Comment after library wrapper" in output_str
+    
+    # Verify sections are written correctly
+    assert ".lib tt_section" in output_str
+    assert ".lib ff_section" in output_str
+    assert ".endl tt_section" in output_str
+    assert ".endl ff_section" in output_str
+    
+    # Verify comments use Xyce comment syntax (;)
+    lines = output_str.split('\n')
+    comment_lines = [line for line in lines if 'Comment' in line]
+    for line in comment_lines:
+        assert line.strip().startswith(';'), f"Comment should start with ';', got: {line}"
+
+
 def test_spectre_statistics_param_generation():
     """Test that Spectre statistics blocks generate correct .param declarations for Xyce"""
 
@@ -652,6 +847,157 @@ def test_spectre_statistics_param_generation():
 
     assert len(lnorm_params) == 2
     assert len(mismatch_params) == 2
+
+
+def test_xyce_statistics_in_lib_section_with_includes_local_param_variation():
+    """
+    Corner-case:
+    - StatisticsBlock appears *inside* a LibSectionDef
+    - Section includes other sections via UseLibSection before/after statistics
+    - Parameters in the including section reference the varied parameter
+
+    Ensure:
+    - statistics gets transformed (process param generated)
+    - references are rewritten to __process__
+    - no ParamDecls are inserted at the file top-level (library validation)
+    - XyceNetlister can write the library without validation errors
+    """
+    from io import StringIO
+    from netlist.write.xyce import XyceNetlister
+
+    # Simulate:
+    # section mc_section
+    #   include setup_section
+    #   parameters mc_delta=0
+    #   parameters derived=mc_delta * 2.0
+    #   parameters scale=1 + 0.02*derived
+    #   statistics { process { vary mc_delta ... } }
+    #   include base_section
+    # endsection
+    mc_section = LibSectionDef(
+        name=Ident("mc_section"),
+        entries=[
+            UseLibSection(path=Path("pdk.scs"), section=Ident("setup_section")),
+            ParamDecls(params=[
+                ParamDecl(name=Ident("mc_delta"), default=Float(0.0), distr=None, comment=None),
+                # derived = mc_delta * 2.0
+                ParamDecl(
+                    name=Ident("derived"),
+                    default=BinaryOp(
+                        tp=BinaryOperator.MUL,
+                        left=Ref(ident=Ident("mc_delta")),
+                        right=Float(2.0),
+                    ),
+                    distr=None,
+                    comment=None
+                ),
+                # scale = 1.0 + 0.02*derived
+                ParamDecl(
+                    name=Ident("scale"),
+                    default=BinaryOp(
+                        tp=BinaryOperator.ADD,
+                        left=Float(1.0),
+                        right=BinaryOp(
+                            tp=BinaryOperator.MUL,
+                            left=Float(0.02),
+                            right=Ref(ident=Ident("derived")),
+                        ),
+                    ),
+                    distr=None,
+                    comment=None
+                ),
+            ]),
+            StatisticsBlock(
+                process=[Variation(name=Ident("mc_delta"), dist="gauss", std=Float(0.3333333333), mean=None)],
+                mismatch=None
+            ),
+            UseLibSection(path=Path("pdk.scs"), section=Ident("base_section")),
+        ]
+    )
+
+    program = Program(files=[SourceFile(path=Path("test.scs"), contents=[mc_section])])
+    apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
+
+    # Ensure library top-level entries remain library-safe
+    assert all(isinstance(e, (LibSectionDef,)) for e in program.files[0].contents)
+
+    # Ensure StatisticsBlock is gone from the section and process param exists
+    section_entries = program.files[0].contents[0].entries
+    assert not any(isinstance(e, StatisticsBlock) for e in section_entries)
+
+    # Find generated __process__ param declaration
+    process_params = []
+    for e in section_entries:
+        if isinstance(e, ParamDecls):
+            process_params.extend([p for p in e.params if p.name.name == "mc_delta__process__"])
+    assert len(process_params) == 1
+    # Nominal mc_delta=0 should NOT collapse to always-0 after variation.
+    # Expect absolute perturbation form containing gauss() and std multiplier, not self-multiplication.
+    out_abs = StringIO()
+    XyceNetlister(program, out_abs, file_type="library").netlist()
+    out_str_abs = out_abs.getvalue()
+    assert "mc_delta__process__" in out_str_abs
+    assert "gauss" in out_str_abs
+    assert "mc_delta*(1" not in out_str_abs
+
+    # Ensure derived references __process__ (not original)
+    derived_decl = None
+    for e in section_entries:
+        if isinstance(e, ParamDecls):
+            for p in e.params:
+                if p.name.name == "derived":
+                    derived_decl = p
+                    break
+    assert derived_decl is not None
+    assert expr_references_param(derived_decl.default, "mc_delta__process__")
+    assert not expr_references_param(derived_decl.default, "mc_delta")
+
+    # Ensure Xyce library writer doesn't reject file-level ParamDecls
+    out = StringIO()
+    XyceNetlister(program, out, file_type="library").netlist()
+    out_str = out.getvalue()
+    assert ".lib mc_section" in out_str
+    assert "mc_delta__process__" in out_str
+
+
+def test_xyce_mismatch_param_inserted_inside_lib_section_not_file_level():
+    """
+    Corner-case: mismatch functions created from StatisticsBlock inside LibSectionDef
+    must be inserted into the LibSectionDef, not file.contents, otherwise Xyce library
+    validation fails.
+    """
+    from io import StringIO
+    from netlist.write.xyce import XyceNetlister
+
+    sec = LibSectionDef(
+        name=Ident("stat_mis_demo"),
+        entries=[
+            ParamDecls(params=[
+                ParamDecl(name=Ident("parX"), default=Float(1.0), distr=None, comment=None),
+            ]),
+            StatisticsBlock(
+                process=None,
+                mismatch=[Variation(name=Ident("parX"), dist="gauss", std=Float(0.1), mean=None)]
+            ),
+        ]
+    )
+    program = Program(files=[SourceFile(path=Path("test.scs"), contents=[sec])])
+    apply_statistics_variations(program, output_format=NetlistDialects.XYCE)
+
+    # No file-level ParamDecls should exist in a library program
+    assert not any(isinstance(e, ParamDecls) for e in program.files[0].contents)
+
+    # Mismatch function should have been inserted inside the section
+    mismatch_func_names = []
+    for e in program.files[0].contents[0].entries:
+        if isinstance(e, ParamDecls):
+            mismatch_func_names.extend([p.name.name for p in e.params if "mismatch" in p.name.name])
+    assert any("parX__mismatch__" in n for n in mismatch_func_names)
+
+    # Library writer should succeed
+    out = StringIO()
+    XyceNetlister(program, out, file_type="library").netlist()
+    assert "parX__mismatch__" in out.getvalue()
 
 
 def test_primitive_instance_no_params_keyword():

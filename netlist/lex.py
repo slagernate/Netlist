@@ -195,18 +195,21 @@ class Lexer:
                 comment_text += token.val
                 token = self.nxt()
             
-            # Store the comment (strip the comment markers and whitespace)
+            # Store the comment, preserving whitespace (only remove comment markers)
             if comment_text:
-                # Remove leading comment markers and any whitespace
+                # Remove only the comment markers, preserve all whitespace
                 cleaned_text = comment_text
                 if comment_type == "//":
-                    cleaned_text = comment_text[2:].strip() if len(comment_text) >= 2 else ""
+                    cleaned_text = comment_text[2:] if len(comment_text) >= 2 else ""  # Preserve whitespace after //
                 elif comment_type == "$":
-                    cleaned_text = comment_text[1:].strip() if len(comment_text) >= 1 else ""
+                    cleaned_text = comment_text[1:] if len(comment_text) >= 1 else ""  # Preserve whitespace after $
                 elif comment_type == "*":
-                    cleaned_text = comment_text[1:].strip() if len(comment_text) >= 1 else ""
+                    cleaned_text = comment_text[1:] if len(comment_text) >= 1 else ""  # Preserve whitespace after *
                 
-                if cleaned_text:  # Only store non-empty comments
+                # Remove only trailing newline, preserve all other whitespace
+                cleaned_text = cleaned_text.rstrip('\n\r')
+                
+                if cleaned_text or cleaned_text == "":  # Store even empty comments to preserve structure
                     self.current_line_comments.append((cleaned_text, comment_type))
                     # Also add to persistent queue
                     self.comment_queue.append((cleaned_text, comment_type, self.line_num))

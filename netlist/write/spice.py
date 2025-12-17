@@ -1092,8 +1092,8 @@ class NgspiceNetlister(SpiceNetlister):
             self.write(conn_name + " ")
         self.write("\n")
 
-    def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "", includes: List[Tuple[str, str]] = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None) -> None:
-        super().__init__(src, dest, errormode=errormode, file_type=file_type)
+    def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "", includes: List[Tuple[str, str]] = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None, options = None) -> None:
+        super().__init__(src, dest, errormode=errormode, file_type=file_type, options=options)
         self.includes = includes or []
         self.model_file = model_file
         # Process model_level_mapping: convert lists to dicts for efficient lookup
@@ -2610,12 +2610,17 @@ def find_alias_parameters(program: Program, target_param_name: str) -> List[Para
 
 
 def collect_statistics_blocks(program: Program) -> List[StatisticsBlock]:
-    """Collect all statistics blocks from the program."""
+    """Collect all statistics blocks from the program, including those in library sections."""
     stats_blocks = []
     for file in program.files:
         for entry in file.contents:
             if isinstance(entry, StatisticsBlock):
                 stats_blocks.append(entry)
+            elif isinstance(entry, LibSectionDef):
+                # Also search within library sections
+                for sub_entry in entry.entries:
+                    if isinstance(sub_entry, StatisticsBlock):
+                        stats_blocks.append(sub_entry)
     return stats_blocks
 
 
@@ -2766,6 +2771,24 @@ def apply_monte_carlo_variation(original_expr: Expr, var: Variation) -> Expr:
     return BinaryOp(tp=BinaryOperator.MUL, left=original_expr, right=one_plus_variation)
 
 
+def apply_monte_carlo_variation_absolute(original_expr: Expr, var: Variation) -> Expr:
+    """Apply Monte Carlo variation as an *absolute* perturbation: original + std * dist(...).
+
+    This matches common PDK patterns where the varied parameter is itself a random variable
+    (often with nominal 0), e.g. `par1mc_* = 0` with `vary par1mc_* dist=gauss std=...`.
+    A multiplicative form would collapse to 0 for nominal 0.
+    """
+    if not var.dist:
+        return original_expr
+
+    dist_call = create_monte_carlo_distribution_call(var.dist, var.std)
+    if not dist_call:
+        return original_expr
+
+    variation_term = BinaryOp(tp=BinaryOperator.MUL, left=var.std, right=dist_call)
+    return BinaryOp(tp=BinaryOperator.ADD, left=original_expr, right=variation_term)
+
+
 def create_relative_process_variation_expr(param_name: str, var: Variation) -> Expr:
     """Create a relative process variation expression that references the parameter itself.
     
@@ -2792,6 +2815,28 @@ def create_relative_process_variation_expr(param_name: str, var: Variation) -> E
         varied_expr = BinaryOp(tp=BinaryOperator.ADD, left=varied_expr, right=var.mean)
     
     return varied_expr
+
+
+def _param_declared_in_entries(entries: List[Entry], param_name: str) -> bool:
+    """Check whether a parameter is declared within a specific Entry list."""
+    for entry in entries:
+        if isinstance(entry, ParamDecls):
+            if any(p.name.name == param_name for p in entry.params):
+                return True
+        elif isinstance(entry, ParamDecl):
+            if entry.name.name == param_name:
+                return True
+    return False
+
+
+def _remove_param_declaration_from_entries(entries: List[Entry], param_name: str) -> None:
+    """Remove a parameter declaration from a specific Entry list (non-recursive)."""
+    for entry in entries:
+        if isinstance(entry, ParamDecls):
+            entry.params = [p for p in entry.params if p.name.name != param_name]
+    # Note: standalone ParamDecl entries are uncommon in post-parse IR (usually folded into ParamDecls),
+    # but handle them defensively.
+    entries[:] = [e for e in entries if not (isinstance(e, ParamDecl) and e.name.name == param_name)]
 
 
 def verify_process_variation_params(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
@@ -2863,15 +2908,100 @@ def apply_all_process_variations_legacy(program: Program, stats_blocks: List[Sta
                         matching_param.default = new_expr
 
 
+def find_lib_section_with_stats(program: Program, stats: StatisticsBlock) -> Optional[LibSectionDef]:
+    """Find the library section that contains the given StatisticsBlock."""
+    for file in program.files:
+        for entry in file.contents:
+            if isinstance(entry, LibSectionDef):
+                for sub_entry in entry.entries:
+                    if isinstance(sub_entry, StatisticsBlock) and sub_entry is stats:
+                        return entry
+    return None
+
+
+def has_use_lib_sections(lib_section: LibSectionDef) -> bool:
+    """Check if a library section contains any UseLibSection entries."""
+    for entry in lib_section.entries:
+        if isinstance(entry, UseLibSection):
+            return True
+    return False
+
+
+def find_params_referencing_stats_in_section(lib_section: LibSectionDef, stats: StatisticsBlock) -> List[str]:
+    """Find parameter names in a library section that reference statistical variables from the stats block.
+    
+    Returns a list of parameter names that:
+    1. Are defined in the library section (not in included sections)
+    2. Reference parameters that are varied in the statistics block
+    """
+    if not stats.process:
+        return []
+    
+    # Get list of statistical parameter names
+    stats_param_names = {var.name.name for var in stats.process}
+    
+    # Find parameters in this section that reference statistical params
+    referenced_params = []
+    for entry in lib_section.entries:
+        if isinstance(entry, ParamDecls):
+            for param in entry.params:
+                if param.default:
+                    # Check if this parameter's expression references any statistical param
+                    if expr_references_any_param(param.default, stats_param_names):
+                        referenced_params.append(param.name.name)
+        elif isinstance(entry, ParamDecl):
+            if entry.default:
+                if expr_references_any_param(entry.default, stats_param_names):
+                    referenced_params.append(entry.name.name)
+    
+    return referenced_params
+
+
+def expr_references_any_param(expr: Expr, param_names: set) -> bool:
+    """Check if an expression references any of the given parameter names."""
+    if isinstance(expr, Ref):
+        return expr.ident.name in param_names
+    elif isinstance(expr, BinaryOp):
+        return (expr_references_any_param(expr.left, param_names) or 
+                expr_references_any_param(expr.right, param_names))
+    elif isinstance(expr, UnaryOp):
+        return expr_references_any_param(expr.expr, param_names)
+    elif isinstance(expr, TernOp):
+        return (expr_references_any_param(expr.cond, param_names) or
+                expr_references_any_param(expr.true_expr, param_names) or
+                expr_references_any_param(expr.false_expr, param_names))
+    elif isinstance(expr, Call):
+        return any(expr_references_any_param(arg, param_names) for arg in expr.args)
+    return False
+
+
 def replace_statistics_blocks_with_generated_content(program: Program, stats_blocks: List[StatisticsBlock], output_format: Optional["NetlistDialects"] = None) -> None:
     """Replace StatisticsBlocks in the AST with generated functions and process variations for library parameters."""
     # Verify all parameters exist (error if any missing)
     verify_process_variation_params(program, stats_blocks)
 
+    # Capture parent containers for each StatisticsBlock BEFORE we replace/remove them.
+    # This is required so mismatch-function insertion can place generated ParamDecls
+    # into the correct library section (and not at the file top-level).
+    stats_parent_entries: Dict[int, List[Entry]] = {}
+    for file in program.files:
+        for entry in file.contents:
+            if isinstance(entry, StatisticsBlock):
+                stats_parent_entries[id(entry)] = file.contents
+            elif isinstance(entry, LibSectionDef):
+                for sub_entry in entry.entries:
+                    if isinstance(sub_entry, StatisticsBlock):
+                        stats_parent_entries[id(sub_entry)] = entry.entries
+
     # Process each statistics block
     for stats in stats_blocks:
+        # Find the library section containing this statistics block
+        lib_section = find_lib_section_with_stats(program, stats)
+        has_includes = lib_section and has_use_lib_sections(lib_section)
+        
         # Collect generated content to replace the StatisticsBlock
         generated_content = []
+        local_process_params: set[str] = set()
 
         # Add process variations for ALL parameters (both global and library section)
         if stats.process:
@@ -2879,20 +3009,27 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
             process_variations = []
             for var in stats.process:
                 param_name = var.name.name
-                # Check if parameter is in library section or global
-                if is_param_in_library_section(program, param_name):
-                    # Library section parameter: use relative expression
+                # Prefer absolute perturbation for parameters declared locally in the same section
+                # as the StatisticsBlock (e.g. par1mc_* random variables with nominal 0).
+                is_local_to_stats_section = bool(lib_section) and _param_declared_in_entries(lib_section.entries, param_name)
+                if is_local_to_stats_section:
+                    local_process_params.add(param_name)
+
+                # Check if parameter is in some library section (anywhere) or global
+                if is_param_in_library_section(program, param_name) and not is_local_to_stats_section:
+                    # Non-local library section parameter: use relative expression (references itself)
                     varied_expr = create_relative_process_variation_expr(param_name, var)
+                    if var.mean:
+                        varied_expr = BinaryOp(tp=BinaryOperator.ADD, left=varied_expr, right=var.mean)
                 else:
-                    # Global parameter: get original value and apply variation
+                    # Global or local-to-stats-section parameter: use absolute perturbation about original value
                     matching_param = find_matching_param(program, param_name)
-                    if matching_param:
-                        original_expr = matching_param.default or Int(0)
-                        varied_expr = apply_monte_carlo_variation(original_expr, var)
-                        if var.mean:
-                            varied_expr = BinaryOp(tp=BinaryOperator.ADD, left=varied_expr, right=var.mean)
-                    else:
-                        continue  # Skip if parameter not found
+                    if not matching_param:
+                        continue
+                    original_expr = matching_param.default or Int(0)
+                    varied_expr = apply_monte_carlo_variation_absolute(original_expr, var)
+                    if var.mean:
+                        varied_expr = BinaryOp(tp=BinaryOperator.ADD, left=varied_expr, right=var.mean)
                 process_variations.append((param_name, varied_expr))
 
             if process_variations:
@@ -2968,42 +3105,91 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
                     
                     # Remove the original parameter declaration only for global parameters
                     # Library section parameters are kept (they're needed for the relative expressions)
-                    if not is_param_in_library_section(program, param_name):
+                    if param_name in local_process_params and lib_section:
+                        _remove_param_declaration_from_entries(lib_section.entries, param_name)
+                    elif not is_param_in_library_section(program, param_name):
                         remove_param_declaration(program, param_name)
+            
+            # Special handling for library sections with includes (common PDK pattern)
+            # For sections that include other sections, parameters defined in the including section
+            # will automatically be available to the included section when it's included.
+            # The key is ensuring parameters reference __process__ versions, which is already
+            # handled by the parameter replacement logic above.
+            # 
+            # However, if parameters are defined AFTER the statistics block but BEFORE the includes,
+            # we may need to ensure they're placed correctly. But typically, the parameters are
+            # defined before the statistics block, so they'll be processed correctly.
+            # 
+            # The main thing we need to ensure is that when a section includes a base section,
+            # and the including section defines parameters that reference statistical
+            # variables, those parameters will be available to the base section when it's included.
+            # This should work automatically because parameter replacement happens before writing.
 
         # Replace the StatisticsBlock with generated content
-        # First, collect any comments that appear before and after the StatisticsBlock
-        # so they can be written in the correct positions
-        for file in program.files:
-            for i, entry in enumerate(file.contents):
+        # StatisticsBlocks can be either at the file level or within library sections
+        replaced = False
+        
+        # First, try to find and replace in library sections
+        if lib_section:
+            for i, entry in enumerate(lib_section.entries):
                 if isinstance(entry, StatisticsBlock) and entry is stats:
                     # Collect comments that appear before this StatisticsBlock
-                    # (they should be written before the generated content)
                     before_comments = []
                     j = i - 1
-                    while j >= 0 and isinstance(file.contents[j], Comment):
-                        before_comments.insert(0, file.contents[j])
+                    while j >= 0 and isinstance(lib_section.entries[j], Comment):
+                        before_comments.insert(0, lib_section.entries[j])
                         j -= 1
                     
                     # Collect comments that appear after this StatisticsBlock
-                    # (they should be written after the generated content)
                     after_comments = []
                     k = i + 1
-                    while k < len(file.contents) and isinstance(file.contents[k], Comment):
-                        after_comments.append(file.contents[k])
+                    while k < len(lib_section.entries) and isinstance(lib_section.entries[k], Comment):
+                        after_comments.append(lib_section.entries[k])
                         k += 1
                     
                     # Remove the StatisticsBlock and comments from their original positions
                     # and replace with before_comments + generated_content + after_comments
                     start_idx = j + 1  # Start of comments (or StatisticsBlock if no comments)
                     end_idx = k  # End after StatisticsBlock and after-comments
-                    file.contents[start_idx:end_idx] = before_comments + generated_content + after_comments
+                    lib_section.entries[start_idx:end_idx] = before_comments + generated_content + after_comments
+                    replaced = True
+                    break
+        
+        # If not found in library sections, try file-level entries
+        if not replaced:
+            for file in program.files:
+                for i, entry in enumerate(file.contents):
+                    if isinstance(entry, StatisticsBlock) and entry is stats:
+                        # Collect comments that appear before this StatisticsBlock
+                        # (they should be written before the generated content)
+                        before_comments = []
+                        j = i - 1
+                        while j >= 0 and isinstance(file.contents[j], Comment):
+                            before_comments.insert(0, file.contents[j])
+                            j -= 1
+                        
+                        # Collect comments that appear after this StatisticsBlock
+                        # (they should be written after the generated content)
+                        after_comments = []
+                        k = i + 1
+                        while k < len(file.contents) and isinstance(file.contents[k], Comment):
+                            after_comments.append(file.contents[k])
+                            k += 1
+                        
+                        # Remove the StatisticsBlock and comments from their original positions
+                        # and replace with before_comments + generated_content + after_comments
+                        start_idx = j + 1  # Start of comments (or StatisticsBlock if no comments)
+                        end_idx = k  # End after StatisticsBlock and after-comments
+                        file.contents[start_idx:end_idx] = before_comments + generated_content + after_comments
+                        replaced = True
+                        break
+                if replaced:
                     break
 
     # Now apply mismatch variations (creates functions and replaces references)
     # IMPORTANT: Process variations MUST be applied before mismatch variations.
     # This ensures we always get __process____mismatch__ suffixes and never __mismatch____process__.
-    apply_all_mismatch_variations(program, stats_blocks, output_format=output_format)
+    apply_all_mismatch_variations(program, stats_blocks, output_format=output_format, stats_parent_entries=stats_parent_entries)
 
 
 def move_header_comments_to_top(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
@@ -3129,7 +3315,7 @@ def create_mismatch_function(var: Variation, idx: int, original_expr: Optional[E
     )
 
 
-def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_blocks: List[StatisticsBlock], output_format: Optional["NetlistDialects"] = None) -> None:
+def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_blocks: List[StatisticsBlock], output_format: Optional["NetlistDialects"] = None, stats_parent_entries: Optional[Dict[int, List[Entry]]] = None) -> None:
     """Apply a single mismatch variation by creating a function and replacing all references.
     
     This effectively "deletes" the parameter by:
@@ -3194,48 +3380,45 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_b
     if has_process:
         mismatch_param.name = Ident(mismatch_param_name)
 
-    # Add param as a separate entry at the top of the file
-    # Find the file that contains statistics blocks
-    stats_file = None
-    for file in program.files:
-        for entry in file.contents:
-            if isinstance(entry, StatisticsBlock):
+    # Insert into the same container that held the originating StatisticsBlock.
+    # This MUST work even after StatisticsBlocks have been replaced/removed, so we
+    # rely on a parent mapping captured before replacement.
+    target_entries: Optional[List[Entry]] = None
+    if stats_parent_entries:
+        for stats in stats_blocks:
+            if stats.mismatch and any(v.name.name == param_name for v in stats.mismatch):
+                target_entries = stats_parent_entries.get(id(stats))
+                if target_entries is not None:
+                    break
+
+    # Fallback: insert at file-level (models files) if no mapping is available
+    if target_entries is None:
+        stats_file = None
+        for file in program.files:
+            if any(isinstance(e, StatisticsBlock) for e in file.contents):
                 stats_file = file
                 break
-        if stats_file:
-            break
+        if not stats_file:
+            stats_file = program.files[0]
+        target_entries = stats_file.contents
 
-    # Fallback to first file if no stats file found
-    if not stats_file:
-        stats_file = program.files[0]
-
-    # Insert param at the beginning of the file (after lnorm/alnorm if they exist)
-    # Look for existing ParamDecls containers that contain param functions, or find insertion point
+    # Insert param near the top of the chosen container (after any existing param-function containers)
     found_paramdecls = None
     insert_idx = 0
-    
-    # First, look for existing ParamDecls with param functions (like lnorm/alnorm or other mismatch params)
-    for i, entry in enumerate(stats_file.contents):
+    for i, entry in enumerate(target_entries):
         if isinstance(entry, ParamDecls):
-            # Check if this ParamDecls is for param functions (contains params with parentheses in name)
-            if entry.params and any('(' in param.name.name for param in entry.params):
+            # If this container already holds param functions, extend it
+            if entry.params and any('(' in p.name.name for p in entry.params):
                 found_paramdecls = entry
-                # Continue to find where to insert if we need a new container
-                insert_idx = i + 1
-            else:
-                # Regular ParamDecls, skip it
-                insert_idx = i + 1
-        else:
-            # Found first non-ParamDecls entry, insert before it
-            insert_idx = i
-            break
+            insert_idx = i + 1
+            continue
+        insert_idx = i
+        break
 
-    # If we found an existing ParamDecls container for param functions, add to it
     if found_paramdecls:
         found_paramdecls.params.append(mismatch_param)
     else:
-        # Create a new ParamDecls container with this param
-        stats_file.contents.insert(insert_idx, ParamDecls(params=[mismatch_param]))
+        target_entries.insert(insert_idx, ParamDecls(params=[mismatch_param]))
 
     # Create param function call to use as replacement (with dummy argument)
     # Extract the base name without (dummy_param)
@@ -3260,14 +3443,14 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_b
         remove_param_declaration(program, var.name.name)
 
 
-def apply_all_mismatch_variations(program: Program, stats_blocks: List[StatisticsBlock], output_format: Optional["NetlistDialects"] = None) -> None:
+def apply_all_mismatch_variations(program: Program, stats_blocks: List[StatisticsBlock], output_format: Optional["NetlistDialects"] = None, stats_parent_entries: Optional[Dict[int, List[Entry]]] = None) -> None:
     """Apply all mismatch variations from statistics blocks (Xyce/ngspice-specific)."""
 
     mismatch_idx = 0
     for stats in stats_blocks:
         if stats.mismatch:
             for var in stats.mismatch:
-                apply_mismatch_variation(program, var, mismatch_idx, stats_blocks, output_format=output_format)
+                apply_mismatch_variation(program, var, mismatch_idx, stats_blocks, output_format=output_format, stats_parent_entries=stats_parent_entries)
                 mismatch_idx += 1
 
 

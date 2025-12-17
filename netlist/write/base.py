@@ -52,6 +52,7 @@ class Netlister:
         *,
         errormode: ErrorMode = ErrorMode.RAISE,
         file_type: str = "",
+        options = None,
     ) -> None:
         self.src = src
         self.dest = dest
@@ -60,6 +61,7 @@ class Netlister:
         self.file_type = file_type  # "models" or "library" (or empty for default)
         self.errors = []
         self._warnings = []  # List of (message, context) tuples for log file
+        self.options = options  # WriteOptions instance (optional, for accessing emit_library_comments, etc.)
 
     @property
     def enum(self):
@@ -190,6 +192,7 @@ class Netlister:
             EndProtectedSection,
             Comment,
             BlankLine,
+            Library,
         )
 
         if isinstance(entry, BlankLine):
@@ -222,6 +225,8 @@ class Netlister:
             return self.write_model_variant(entry)
         if isinstance(entry, FunctionDef):
             return self.write_function_def(entry)
+        if isinstance(entry, Library):
+            return self.write_library(entry)
         if isinstance(entry, (StartProtectedSection, EndProtectedSection)):
             # Skip protected section markers in output
             return
@@ -392,6 +397,19 @@ class Netlister:
 
     def write_use_lib(self, uselib) -> None:
         raise NotImplementedError
+    
+    def write_library(self, library) -> None:
+        """Write a Library object by extracting and writing its sections.
+        
+        Default implementation extracts sections and writes them.
+        Subclasses can override to log warnings about omitted library wrappers.
+        
+        Args:
+            library: Library object containing sections to write
+        """
+        # Extract sections from the library and write each one
+        for section in library.sections:
+            self.write_library_section(section)
     
     def write_function_def(self, func: FunctionDef) -> None:
         raise NotImplementedError

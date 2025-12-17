@@ -541,6 +541,7 @@ class HierarchyCollector:
         # FIXME: is this really a thing? Or are we always collecting a `LibSectionDef` at a time?
 
         sections = []
+        library_level_comments = []  # Collect comments before next section
         while True:
             stmt = self.nxt()
             if stmt is None:
@@ -554,16 +555,29 @@ class HierarchyCollector:
                 self.fail(msg)
             elif isinstance(stmt, StartLibSection):
                 s = self.collect_lib_section(start=stmt)
+                # Prepend any library-level comments to this section (not just the first)
+                # Comments between sections should appear at the start of the following section
+                if library_level_comments:
+                    from .data import LibSectionDef
+                    s = LibSectionDef(name=s.name, entries=library_level_comments + s.entries)
+                    library_level_comments = []  # Clear after using
                 sections.append(s)
             elif isinstance(stmt, Comment):
-                # Skip comments in library context
-                continue
+                # Collect comments to prepend to next section
+                library_level_comments.append(stmt)
             elif isinstance(stmt, BlankLine):
-                # Skip blank lines in library context
-                continue
+                # Collect blank lines to preserve formatting
+                library_level_comments.append(stmt)
             else:
                 msg = f"Invalid statement in library: {stmt}"
                 self.fail(msg)  # invalid type
+
+        # If we have leftover comments and no sections, create a dummy section (shouldn't happen normally)
+        if library_level_comments and not sections:
+            # This shouldn't happen, but handle gracefully
+            from .data import LibSectionDef, Ident
+            dummy_section = LibSectionDef(name=Ident("_comments"), entries=library_level_comments)
+            sections.append(dummy_section)
 
         return Library(name=start.name, sections=sections)
 

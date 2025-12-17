@@ -16,6 +16,7 @@ from ..data import (
     ParamDecls,
     SubcktDef,
     LibSectionDef,
+    Library,
     FunctionDef,
     Return,
     ParamVal,
@@ -46,8 +47,8 @@ from .spice import SpiceNetlister, apply_statistics_variations, debug_find_all_p
 class XyceNetlister(SpiceNetlister):
     """Xyce-Format Netlister"""
 
-    def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "", includes: List[Tuple[str, str]] = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None) -> None:
-        super().__init__(src, dest, errormode=errormode, file_type=file_type)
+    def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "", includes: List[Tuple[str, str]] = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None, options = None) -> None:
+        super().__init__(src, dest, errormode=errormode, file_type=file_type, options=options)
         self.includes = includes or []
         self.model_file = model_file
         self._last_entry_was_instance = False  # Track if last entry written was an instance
@@ -223,10 +224,12 @@ class XyceNetlister(SpiceNetlister):
         for source_file in self.src.files:
             for entry in source_file.contents:
                 if self.file_type == "library":
-                    # Library files should ONLY contain LibSectionDef and Comments (no subcircuits, no loose parameters)
-                    if not isinstance(entry, (LibSectionDef, Comment)):
+                    # Library files should contain LibSectionDef, Library objects, Comments, and BlankLines
+                    # Library objects will be handled by write_library() which extracts sections
+                    from ..data import BlankLine
+                    if not isinstance(entry, (LibSectionDef, Library, Comment, BlankLine)):
                         raise ValueError(f"Library file contains non-library content: {type(entry).__name__}. "
-                                       "Library files should only contain library sections and comments.")
+                                       "Library files should only contain library sections, library wrappers, comments, and blank lines.")
                 # For models files, allow anything (SubcktDef, ParamDecls, FunctionDef, FlatStatement, etc.)
                 # No validation needed for models files
 
@@ -238,6 +241,26 @@ class XyceNetlister(SpiceNetlister):
         for entry in section.entries:
             self.write_entry(entry)
         self.write(f".endl {self.format_ident(section.name)}\n\n")
+
+    def write_library(self, library) -> None:
+        """Write a Library object, logging a warning about the omitted library wrapper.
+        
+        Overrides base class implementation to log a warning when library wrappers are omitted.
+        Xyce has no equivalent to Spectre's library wrapper construct, so we omit it and log a warning.
+        
+        Args:
+            library: Library object containing sections to write
+        """
+        # Always log a warning when omitting library wrappers
+        library_name = self.format_ident(library.name)
+        self.log_warning(
+            f"Spectre library wrapper '{library_name}' omitted (no Xyce equivalent)",
+            context=f"Library contains {len(library.sections)} section(s)"
+        )
+        
+        # Extract sections from the library and write each one
+        for section in library.sections:
+            self.write_library_section(section)
 
     def write_module_params(self, params: List[ParamDecl]) -> None:
         """Write the parameter declarations for Module `module`.
@@ -711,8 +734,16 @@ class XyceNetlister(SpiceNetlister):
         """Xyce comments *kinda* support the Spice-typical `*` charater,
         but *only* as the first character in a line.
         Any mid-line-starting comments must use `;` instead.
-        So, just use it all the time."""
-        self.write(f"; {comment}\n")
+        So, just use it all the time.
+        
+        Preserves exact whitespace from comment text - if comment already has
+        leading whitespace, don't add an extra space after semicolon."""
+        # If comment starts with whitespace, preserve it exactly (don't add extra space)
+        if comment and comment[0].isspace():
+            self.write(f";{comment}\n")
+        else:
+            # No leading whitespace, add standard space after semicolon
+            self.write(f"; {comment}\n")
 
     def write_entry(self, entry) -> None:
         """Override write_entry to handle FunctionDef for Xyce and reset instance flag."""

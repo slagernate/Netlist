@@ -34,6 +34,7 @@ class XschemNetlister(Netlister):
         primitive_config_file: Optional[str] = None,
         subcircuit_dialect = None,
         bridge_file_name: Optional[str] = None,
+        options = None,
     ) -> None:
         """Initialize the xschem netlister.
         
@@ -45,8 +46,9 @@ class XschemNetlister(Netlister):
             primitive_config_file: Optional path to config file for primitive detection overrides
             subcircuit_dialect: Optional dialect for bridge file generation (NetlistDialects)
             bridge_file_name: Optional custom name for bridge file
+            options: WriteOptions instance (optional)
         """
-        super().__init__(src, dest, errormode=errormode, file_type=file_type)
+        super().__init__(src, dest, errormode=errormode, file_type=file_type, options=options)
         
         # Initialize primitive detector
         self.detector = PrimitiveDetector(config_file=primitive_config_file)
