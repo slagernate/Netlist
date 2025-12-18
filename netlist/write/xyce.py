@@ -53,6 +53,7 @@ class XyceNetlister(SpiceNetlister):
         self.model_file = model_file
         self._last_entry_was_instance = False  # Track if last entry written was an instance
         self._current_fet_subckt = None  # Track current FET subcircuit for parameter replacement
+        self._current_subckt = None  # Track current subcircuit being written
         # Track reserved parameter name mappings (reserved_name -> safe_name)
         self._reserved_param_map: Dict[str, str] = {}
         # Xyce reserved variable names (case-insensitive)
