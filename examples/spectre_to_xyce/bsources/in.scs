@@ -1,0 +1,13 @@
+simulator lang=spectre
+
+* Minimal bsource examples (Spectre) for Xyce translation
+* (no subckts; just direct instances)
+
+* bsource r=  (voltage-controlled resistor)
+r1 (in 0) bsource r=1k + 500*v(in,0)
+
+* bsource i=  (behavioral current source)
+i1 (in 0) bsource i=1m*sin(2*3.1415926535*1k*time)
+
+* bsource q=  (charge -> should become I=ddt(q))
+q1 (in 0) bsource q=1p*v(in,0)

@@ -1,0 +1,10 @@
+* Xyce smoke test for converted Spectre bsource primitives
+*
+* The converted 'out.cir' should directly contain Bsource_* elements.
+
+V1 in 0 1
+.include 'out.cir'
+
+.tran 1n 20n
+.print tran V(in)
+.end

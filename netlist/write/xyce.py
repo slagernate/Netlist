@@ -244,12 +244,74 @@ class XyceNetlister(SpiceNetlister):
         inst_count = 0
         node_count = 0  # Simple counter for net names
         
-        # Iterate definitions - only instantiate subcircuits, not models
-        definitions = []
+        # Iterate definitions - only instantiate subcircuits that are "reachable"
+        # from the sections included in this test netlist.
+        #
+        # This avoids instantiating subcircuits whose defining section isn't selected
+        # (e.g. rf_mos subckts when only 'tt' is included), which would otherwise
+        # cause "Subcircuit <X> has not been defined" errors in Xyce.
+        from ..data import LibSectionDef, Library, UseLibSection
+
+        # Build section graph (section -> referenced sections)
+        sections: dict[str, LibSectionDef] = {}
+        deps: dict[str, set[str]] = {}
+
+        def index_entry(entry) -> None:
+            if isinstance(entry, LibSectionDef):
+                sec_name = entry.name.name
+                sections[sec_name] = entry
+                sdeps = deps.setdefault(sec_name, set())
+                for e in entry.entries:
+                    if isinstance(e, UseLibSection):
+                        sdeps.add(e.section.name)
+                for e in entry.entries:
+                    index_entry(e)
+                return
+            if isinstance(entry, Library):
+                for sec in entry.sections:
+                    index_entry(sec)
+                return
+            if isinstance(entry, SubcktDef):
+                for e in entry.entries:
+                    index_entry(e)
+                return
+
         for file in self.src.files:
             for entry in file.contents:
-                if isinstance(entry, SubcktDef):
+                index_entry(entry)
+
+        # Compute closure of included sections
+        start_sections = {sec for _, sec in self.includes if sec}
+        allowed_sections: set[str] = set(start_sections)
+        queue = list(start_sections)
+        while queue:
+            s = queue.pop()
+            for d in deps.get(s, set()):
+                if d not in allowed_sections:
+                    allowed_sections.add(d)
+                    queue.append(d)
+
+        definitions: list[SubcktDef] = []
+
+        def collect(entry, current_section: str | None = None) -> None:
+            if isinstance(entry, LibSectionDef):
+                sec_name = entry.name.name
+                for e in entry.entries:
+                    collect(e, current_section=sec_name)
+                return
+            if isinstance(entry, Library):
+                for sec in entry.sections:
+                    collect(sec, current_section=current_section)
+                return
+            if isinstance(entry, SubcktDef):
+                # Include top-level subckts, and sectioned subckts that are reachable.
+                if current_section is None or current_section in allowed_sections:
                     definitions.append(entry)
+                return
+
+        for file in self.src.files:
+            for entry in file.contents:
+                collect(entry, current_section=None)
                     
         for defn in definitions:
             name = defn.name.name
@@ -727,6 +789,141 @@ class XyceNetlister(SpiceNetlister):
 
     def write_subckt_instance(self, pinst: Instance) -> None:
         """Write sub-circuit-instance `pinst`. Override to handle model instances without PARAMS:."""
+
+        # Spectre "bsource" (behavioral source) translation.
+        #
+        # In Spectre, constructs like:
+        #   r1 (nx 5) bsource r=<expr>
+        # appear frequently (e.g. ESD/RF diode models, RF MOS gate charge/ current).
+        #
+        # Our parser represents these as subckt instances with module name "bsource",
+        # but Xyce does NOT have a built-in "bsource" subckt.
+        #
+        # Translate the common forms into native Xyce primitives.
+        # All translated elements are named with the "Bsource_" prefix (starts with 'B'):
+        #   Bsource_<originalName> ...
+        #
+        # - r=<expr> : voltage-controlled resistor -> B-source current I = v(p,n)/r
+        # - i=<expr> : B-source current source (B element with I=<expr>)
+        # - v=<expr> : B-source voltage source (B element with V=<expr>)
+        # - q=<expr> : charge source -> current source I=ddt(q)
+        if isinstance(pinst.module, Ref) and pinst.module.ident.name.lower() == "bsource":
+            if len(pinst.conns) != 2:
+                self.log_warning(
+                    f"Unsupported bsource with {len(pinst.conns)} terminal(s); emitting as subckt instance",
+                    f"Instance: {pinst.name.name}",
+                )
+            else:
+                # Collect params by lowercase name.
+                pmap = {pv.name.name.lower(): pv for pv in (pinst.params or [])}
+
+                # Determine bsource "mode"
+                mode = None
+                if "r" in pmap:
+                    mode = "r"
+                elif "i" in pmap:
+                    mode = "i"
+                elif "v" in pmap:
+                    mode = "v"
+                elif "q" in pmap:
+                    mode = "q"
+
+                if mode is None:
+                    self.log_warning(
+                        "Unsupported bsource (no r/i/v/q parameter found); emitting as subckt instance",
+                        f"Instance: {pinst.name.name}",
+                    )
+                else:
+                    # Ensure a stable naming convention for all translated bsource primitives.
+                    base_name = self.format_ident(pinst.name)
+                    elem_name = base_name if base_name.lower().startswith("bsource_") else f"Bsource_{base_name}"
+
+                    # Write element header and connections.
+                    self.write(elem_name + " \n")
+                    self.write_instance_conns(pinst)
+
+                    if mode == "r":
+                        # Voltage-controlled resistor modeled as current source:
+                        #   I = V(p,n) / r
+                        #
+                        # This matches the common Spectre usage in our PDK where "bsource r=<expr>"
+                        # represents a 2-terminal element with an effective resistance.
+                        #
+                        # Note: If additional bsource params exist, they are ignored for now.
+                        from ..data import BinaryOp, BinaryOperator
+
+                        rval = pmap["r"].val
+
+                        # Build v(p,n) call from the two connection nodes.
+                        def _conn_ident_name(c) -> Optional[str]:
+                            if isinstance(c, Ident):
+                                return c.name
+                            if isinstance(c, Ref):
+                                return c.ident.name
+                            return None
+
+                        n1 = _conn_ident_name(pinst.conns[0])
+                        n2 = _conn_ident_name(pinst.conns[1])
+                        if not n1 or not n2:
+                            self.log_warning(
+                                "bsource r= translation requires two named nodes; emitting as subckt instance",
+                                f"Instance: {pinst.name.name}",
+                            )
+                        else:
+                            vcall = Call(
+                                func=Ref(ident=Ident("v")),
+                                args=[Ref(ident=Ident(n1)), Ref(ident=Ident(n2))],
+                            )
+                            i_expr = BinaryOp(tp=BinaryOperator.DIV, left=vcall, right=rval)
+                            self.write("+ I=" + self.format_expr(i_expr) + " \n")
+
+                            extra = sorted(k for k in pmap.keys() if k not in {"r"})
+                            if extra:
+                                self.log_warning(
+                                    "Ignoring unsupported bsource parameter(s) for r= translation: " + ", ".join(extra),
+                                    f"Instance: {pinst.name.name}",
+                                )
+                        self.write("\n")
+                        return
+
+                    # Behavioral B-source
+                    if mode == "i":
+                        ival = pmap["i"].val
+                        self.write("+ I=" + self.format_expr(ival) + " \n")
+                        extra = sorted(k for k in pmap.keys() if k not in {"i"})
+                        if extra:
+                            self.log_warning(
+                                "Ignoring unsupported bsource parameter(s) for i= translation: " + ", ".join(extra),
+                                f"Instance: {pinst.name.name}",
+                            )
+                        self.write("\n")
+                        return
+
+                    if mode == "v":
+                        vval = pmap["v"].val
+                        self.write("+ V=" + self.format_expr(vval) + " \n")
+                        extra = sorted(k for k in pmap.keys() if k not in {"v"})
+                        if extra:
+                            self.log_warning(
+                                "Ignoring unsupported bsource parameter(s) for v= translation: " + ", ".join(extra),
+                                f"Instance: {pinst.name.name}",
+                            )
+                        self.write("\n")
+                        return
+
+                    if mode == "q":
+                        # Charge Q(V) -> current source I = ddt(Q)
+                        qval = pmap["q"].val
+                        i_expr = Call(func=Ref(ident=Ident("ddt")), args=[qval])
+                        self.write("+ I=" + self.format_expr(i_expr) + " \n")
+                        extra = sorted(k for k in pmap.keys() if k not in {"q"})
+                        if extra:
+                            self.log_warning(
+                                "Ignoring unsupported bsource parameter(s) for q= translation: " + ", ".join(extra),
+                                f"Instance: {pinst.name.name}",
+                            )
+                        self.write("\n")
+                        return
         
         # Check if the module being instantiated is a Model (not a Subckt)
         mtype = None
@@ -2962,6 +3159,51 @@ class XyceNetlister(SpiceNetlister):
             return item[0].default
         return item.default
 
+    def _filter_diode_level1_unsupported_model_params(
+        self, params: List[ParamDecl], *, model_name: str
+    ) -> List[ParamDecl]:
+        """Drop diode model parameters which Xyce Level 1 does not recognize.
+
+        This is intentionally conservative: we only drop parameters we *know* Xyce
+        rejects (producing noisy warnings), and we log a single warning per model.
+        """
+        # These are the exact params we see Xyce warning about in practice.
+        # Keep the list uppercase for easy case-insensitive matching.
+        unsupported = {
+            "ISW",
+            "PJ",
+            "MJ",
+            "AREA",
+            "TLEVC",
+            "CTA",
+            "CTP",
+            "TLEV",
+            "PTA",
+            "PTP",
+            "NZ",
+            "IMAX",
+            "MINR",
+            "ALLOW_SCALING",
+        }
+
+        kept: List[ParamDecl] = []
+        dropped: List[str] = []
+        for p in params:
+            name_upper = p.name.name.upper()
+            if name_upper in unsupported:
+                dropped.append(p.name.name)
+                continue
+            kept.append(p)
+
+        if dropped:
+            self.log_warning(
+                "Dropping unsupported Xyce diode (Level 1) model parameters: "
+                + ", ".join(sorted({d.upper() for d in dropped})),
+                f"Model: {model_name}",
+            )
+
+        return kept
+
     def write_model_def(self, model: ModelDef) -> None:
         """Write a model definition in Xyce format, handling BSIM4 conversions."""
         # Helper to get param name safely whether it's a ParamDecl or (ParamDecl, ...) tuple
@@ -3223,6 +3465,32 @@ class XyceNetlister(SpiceNetlister):
         
         # Map to Xyce model type equivalent
         xyce_mtype = xyce_mtype_map.get(mtype, mtype)
+
+        # If this is a diode model targeting Xyce's diode model (D), drop the
+        # Spectre/PDK extension parameters Xyce rejects to avoid warning spam.
+        #
+        # Apply only for Level 1 diodes (including those explicitly mapped to level=1).
+        if str(xyce_mtype).upper() == "D":
+            # Determine diode model level (default to 1 if not specified)
+            diode_level = 1
+            for p in params_to_write:
+                if isinstance(p, tuple):
+                    p_obj = p[0]
+                else:
+                    p_obj = p
+                if p_obj.name.name.lower() == "level":
+                    lvl = self._get_param_default(p_obj)
+                    if isinstance(lvl, (Int, Float)):
+                        diode_level = int(float(lvl.val) if hasattr(lvl, "val") else float(lvl))
+                    elif isinstance(lvl, MetricNum):
+                        diode_level = int(float(lvl.val))
+                    break
+
+            if diode_level == 1:
+                # Only filter ParamDecl objects (diode path does not use the tuple form)
+                decls = [p[0] if isinstance(p, tuple) else p for p in params_to_write]
+                filtered = self._filter_diode_level1_unsupported_model_params(decls, model_name=mname)
+                params_to_write = filtered
         
         # Write model header
         if mtype.lower() == "bsim4":

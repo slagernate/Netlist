@@ -1,0 +1,22 @@
+Bsource_r1 
++ in 0 
++ I={v(in,0)/(1k+(500*v(in,0)))} 
+
+
+
+
+; Minimal bsource examples (Spectre) for Xyce translation
+; (no subckts; just direct instances)
+; bsource r=  (voltage-controlled resistor)
+Bsource_i1 
++ in 0 
++ I={1m*sin(2*(3.1415926535*(1k*time)))} 
+
+
+
+; bsource i=  (behavioral current source)
+Bsource_q1 
++ in 0 
++ I={ddt(1p*v(in,0))} 
+
+
