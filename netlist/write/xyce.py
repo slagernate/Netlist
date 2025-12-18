@@ -52,12 +52,47 @@ class XyceNetlister(SpiceNetlister):
         self.includes = includes or []
         self.model_file = model_file
         self._last_entry_was_instance = False  # Track if last entry written was an instance
+        self._current_fet_subckt = None  # Track current FET subcircuit for parameter replacement
         # Track reserved parameter name mappings (reserved_name -> safe_name)
         self._reserved_param_map: Dict[str, str] = {}
         # Xyce reserved variable names (case-insensitive)
         self._reserved_names = {'vt', 'temp', 'time', 'freq', 'omega', 'pi', 'e'}
         # Collect all parameter names from the AST to only rename actual parameters
         self._param_names = self._collect_param_names(src)
+        # Collect user-defined function names (from FunctionDef nodes) so we don't
+        # mis-classify them as unsupported built-ins during expression validation.
+        self._defined_function_names = self._collect_function_names(src)
+        # Expression-function compatibility (Spectre -> Xyce).
+        # Xyce does not support all Spectre function names (e.g. round()) in .param expressions.
+        # We apply a safe alias-map and fail-fast on unsupported built-in functions.
+        self._xyce_func_alias_map: Dict[str, str] = {
+            "round": "nint",
+        }
+        self._xyce_func_alias_counts: Dict[str, int] = {}
+        # Xyce built-in function allowlist (lowercased).
+        # Includes UG arithmetic functions + commonly used functions in our models (e.g. gauss).
+        self._xyce_builtin_funcs = {
+            # Arithmetic / misc
+            "abs", "m", "min", "max", "ceil", "floor", "int", "nint", "sgn", "sign",
+            "sqrt", "fmod", "if", "limit", "stp", "uramp", "pwr", "pow", "pwrs",
+            "ddt", "ddx", "sdt",
+            # Circuit accessors (B-source style)
+            "v", "i",
+            # Compat helper functions (defined by this netlister when needed)
+            "lnorm", "alnorm",
+            "mm_z1__mismatch__", "mm_z2__mismatch__",
+            # Table / interpolation
+            "table", "fasttable", "spline", "akima", "cubic", "wodicka", "bli", "tablefile",
+            # Complex helpers
+            "db", "img", "ph", "r", "re",
+            # Exponential / log / trig
+            "exp", "ln", "log", "log10",
+            "sin", "sinh", "cos", "cosh", "tan", "tanh",
+            "asin", "asinh", "acos", "acosh",
+            "atan", "atanh", "atan2", "arctan",
+            # Random distributions
+            "gauss", "agauss", "unif", "aunif", "rand",
+        }
         # Process model_level_mapping: convert lists to dicts for efficient lookup
         self._model_level_mapping: Dict[str, Dict[int, int]] = {}
         if model_level_mapping:
@@ -98,6 +133,29 @@ class XyceNetlister(SpiceNetlister):
                 collect_from_entry(entry)
         
         return param_names
+
+    def _collect_function_names(self, program: Optional[Program]) -> set:
+        """Collect all user-defined function names (FunctionDef) from the program AST."""
+        fn_names = set()
+
+        if program is None:
+            return fn_names
+
+        def collect_from_entry(entry):
+            if isinstance(entry, FunctionDef):
+                fn_names.add(entry.name.name.lower())
+            elif isinstance(entry, SubcktDef):
+                for sub_entry in entry.entries:
+                    collect_from_entry(sub_entry)
+            elif isinstance(entry, LibSectionDef):
+                for sub_entry in entry.entries:
+                    collect_from_entry(sub_entry)
+
+        for file in program.files:
+            for entry in file.contents:
+                collect_from_entry(entry)
+
+        return fn_names
     
     def format_ident(self, ident_or_ref: Union[Ident, Ref]) -> str:
         """Format an identifier or reference, renaming reserved Xyce parameter names."""
@@ -140,6 +198,17 @@ class XyceNetlister(SpiceNetlister):
 
         # Call parent implementation to do the actual writing
         super().netlist()
+
+        # Summarize any function-alias mappings applied during netlisting.
+        if self._xyce_func_alias_counts:
+            parts = []
+            for src_name, dst_name in self._xyce_func_alias_map.items():
+                n = self._xyce_func_alias_counts.get(src_name, 0)
+                if n:
+                    parts.append(f"{src_name}->{dst_name} ({n}x)")
+            if parts:
+                self.log_warning("Applied Xyce function aliases: " + ", ".join(parts))
+
 
     def write_test_netlist(self) -> None:
         """Write a sanity check netlist."""
@@ -315,13 +384,27 @@ class XyceNetlister(SpiceNetlister):
         """Write the parameter declarations for Module `module`.
         Parameter declaration format:
         .SUBCKT <name> <ports>
-        + PARAMS: name1=val1 name2=val2 name3=val3 \n
+        + PARAMS: name1=val1
+        + name2=val2
+        + name3=val3
+        Each parameter on its own line to avoid comment issues.
         """
-        self.write("+ PARAMS: ")  # <= Xyce-specific
-        for param in params:
-            self.write_param_decl(param)
-            self.write(" ")
+        if not params:
+            self.write("+ ")
+            self.write_comment("No parameters")
+            self.write("\n")
+            return
+            
+        # Write first parameter on PARAMS line
+        self.write("+ PARAMS: ")
+        self.write_param_decl(params[0])
         self.write("\n")
+        
+        # Write remaining parameters, each on its own continuation line
+        for param in params[1:]:
+            self.write("+ ")
+            self.write_param_decl(param)
+            self.write("\n")
 
     def _get_model_type(self, ref: Ref) -> Optional[str]:
         """Resolve a reference to a model and return its type (mtype)."""
@@ -548,16 +631,55 @@ class XyceNetlister(SpiceNetlister):
         if not pvals:  # Write a quick comment for no parameters
             return self.write_comment("No parameters")
 
-        # Filter deltox from instance parameters if this instance references a BSIM4 model
-        # (dtox is only valid in model definitions, not instance parameters)
+        # Filter unsupported parameters from instance parameters based on model type
+        # Xyce does not support certain parameters on instance lines for specific model types
         params_to_write = pvals
+        is_bsim4 = False
+        is_mos = False
+        is_resistor = False
+        
+        params_to_filter = []
+        
         if module_ref:
             is_bsim4 = self._is_bsim4_model_ref(module_ref)
+            is_mos = self._is_mos_model_ref(module_ref)
+            is_resistor = self._is_resistor_model_ref(module_ref)
+            
             if is_bsim4:
-                # Filter deltox AND dtox from instance parameters
+                # Filter deltox AND dtox from BSIM4 instance parameters
                 # Xyce does not support them on instance, they must be on the model.
                 # We handle moving them to the model in write_subckt_def, so here we just ensure they are gone.
-                params_to_write = [pval for pval in pvals if pval.name.name not in ("deltox", "dtox")]
+                params_to_filter.extend(["deltox", "dtox"])
+                # BSIM4 is a MOS model, so also filter MOS-specific parameters
+                # MULU0, MULVSAT, DELK1 are not supported on instance lines in Xyce
+                params_to_filter.extend(["mulu0", "mulvsat", "delk1"])
+            
+            if is_mos:
+                # Filter unsupported parameters for nmos/pmos models
+                # DELTOX, MULU0, MULVSAT, DELK1 are not supported on instance lines in Xyce
+                params_to_filter.extend(["deltox", "mulu0", "mulvsat", "delk1"])
+            
+            if is_resistor:
+                # Filter unsupported parameters for resistor models
+                # TC1R, TC2R are not supported on instance lines in Xyce (use tc1, tc2 instead)
+                params_to_filter.extend(["tc1r", "tc2r"])
+        
+        # Fallback: if model type detection failed (even with module_ref), check is_mos_like or parameter names
+        # This handles cases where models are defined in the current subcircuit being written
+        if not is_mos and not is_bsim4:
+            # Check if is_mos_like flag is set (from instance name heuristic in write_subckt_instance)
+            if is_mos_like:
+                params_to_filter.extend(["deltox", "mulu0", "mulvsat", "delk1"])
+            else:
+                # Additional fallback: check parameter names to detect MOS device
+                # (l, w, ad, as, pd, ps, nrd, nrs are typical MOS params)
+                param_names = [p.name.name.lower() for p in pvals] if pvals else []
+                has_mos_params = {'l', 'w'} <= set(param_names) and any(p in param_names for p in ['ad', 'as', 'pd', 'ps', 'nrd', 'nrs'])
+                if has_mos_params:
+                    params_to_filter.extend(["deltox", "mulu0", "mulvsat", "delk1"])
+        
+        if params_to_filter:
+            params_to_write = [pval for pval in pvals if pval.name.name.lower() not in [p.lower() for p in params_to_filter]]
 
         # Filter out default parameters (except m=1 which should always be written)
         # Only do this for test file type
@@ -607,7 +729,16 @@ class XyceNetlister(SpiceNetlister):
         
         # Check if the module being instantiated is a Model (not a Subckt)
         mtype = None
-        if isinstance(pinst.module, Ref):
+        # CRITICAL FIX: Check if module_ref resolves to a SubcktDef (not ModelDef)
+        # If it's a subcircuit, we must write it as a subcircuit instance (X prefix, PARAMS:)
+        # not as a primitive/model instance.
+        module_ref = pinst.module if isinstance(pinst.module, Ref) else None
+        module_def = self._get_module_definition(module_ref) if module_ref else None
+        from ..data import SubcktDef
+        is_subcircuit = isinstance(module_def, SubcktDef)
+        
+        mtype = None
+        if isinstance(pinst.module, Ref) and not is_subcircuit:
             mtype = self._get_model_type(pinst.module)
             
             # Fallback: Check for resistor/capacitor/inductor by name if model definition not found
@@ -620,7 +751,7 @@ class XyceNetlister(SpiceNetlister):
                 elif mod_name in ('inductor', 'ind'):
                     mtype = 'l'
         
-        is_model = mtype is not None
+        is_model = mtype is not None and not is_subcircuit
         
         prefix = "X"
         if is_model:
@@ -629,12 +760,13 @@ class XyceNetlister(SpiceNetlister):
             elif "res" in mtype or mtype == "r": prefix = "R"
             elif "cap" in mtype or mtype == "c": prefix = "C"
             elif "ind" in mtype or mtype == "l": prefix = "L"
-            elif "dio" in mtype or mtype == "d": prefix = "D"
+            # Note: Diodes don't need prefix prepending - just write on one line
             elif "pnp" in mtype or "npn" in mtype or mtype == "q": prefix = "Q"
             # Add more types as needed
         
         # Fallback heuristic for MOS if type not found but looks like MOS
-        if not is_model:
+        # BUT: Don't apply if it's actually a subcircuit (keep X prefix)
+        if not is_model and not is_subcircuit:
              # Detect if the instance looks like a MOS device (even if parsed as subcircuit instance)
             is_mos_like_heuristic = (
                 len(pinst.conns) == 4  # Exactly 4 ports (d, g, s, b)
@@ -686,40 +818,74 @@ class XyceNetlister(SpiceNetlister):
                 skip_model_name = True
 
         inst_name = self.format_ident(pinst.name)
-        if prefix and not inst_name.upper().startswith(prefix):
+        
+        # Check if this is a diode - diodes must be written on one line (no continuation lines)
+        is_diode = (isinstance(pinst.module, Ref) and pinst.module.ident.name.lower() in ("diode", "d"))
+        if isinstance(pinst.module, Ref):
+            mod_name = pinst.module.ident.name.lower()
+            is_diode = is_diode or ("dio" in mod_name and mod_name not in ("resistor", "res", "capacitor", "cap"))
+        
+        # Only prepend prefix for non-diodes
+        if not is_diode and prefix and not inst_name.upper().startswith(prefix):
             # If we're skipping model name (resistor/capacitor/inductor), use underscore separator
             if skip_model_name:
                 inst_name = f"{prefix}_{inst_name}"
             else:
                 inst_name = f"{prefix}{inst_name}"
+        
+        if is_diode:
+            # Write everything on one line for diodes
+            self.write(inst_name + " ")
+            # Write port connections (same logic as write_instance_conns but on same line)
+            if pinst.conns:
+                if isinstance(pinst.conns[0], tuple):
+                    for conn in pinst.conns:
+                        if isinstance(conn[0], Ident):
+                            self.write(self.format_ident(conn[0]) + " ")
+                        elif isinstance(conn[0], Ref):
+                            self.write(self.format_ident(conn[0].ident) + " ")
+                        else:
+                            self.write(self.format_expr(conn[0]) + " ")
+                else:
+                    for conn in pinst.conns:
+                        if isinstance(conn, Ident):
+                            self.write(self.format_ident(conn) + " ")
+                        elif isinstance(conn, Ref):
+                            self.write(self.format_ident(conn.ident) + " ")
+                        else:
+                            self.write(self.format_expr(conn) + " ")
+            # Write the sub-circuit/model name
+            if not skip_model_name:
+                self.write(self.format_ident(pinst.module.ident) + " ")
+        else:
+            # Original behavior: use continuation lines for non-diodes
+            # Write the instance name
+            self.write(inst_name + " \n")
 
-        # Write the instance name
-        self.write(inst_name + " \n")
+            # Write its port-connections
+            self.write_instance_conns(pinst)
 
-        # Write its port-connections
-        self.write_instance_conns(pinst)
+            # Write the sub-circuit/model name (skip for resistor/capacitor/inductor)
+            if not skip_model_name:
+                module_name = self.format_ident(pinst.module.ident)
+                module_ref = pinst.module if isinstance(pinst.module, Ref) else None
 
-        # Write the sub-circuit/model name (skip for resistor/capacitor/inductor)
-        if not skip_model_name:
-            module_name = self.format_ident(pinst.module.ident)
-            module_ref = pinst.module if isinstance(pinst.module, Ref) else None
+                # If this is a model reference, prefer the fully-qualified variant name (e.g. nch_rf.1)
+                # so instance model names match the emitted .model cards.
+                if module_ref is not None and is_model:
+                    from ..data import ModelVariant, ModelFamily, ModelDef
 
-            # If this is a model reference, prefer the fully-qualified variant name (e.g. nch_rf.1)
-            # so instance model names match the emitted .model cards.
-            if module_ref is not None and is_model:
-                from ..data import ModelVariant, ModelFamily, ModelDef
+                    resolved = self._get_module_definition(module_ref)
+                    if isinstance(resolved, ModelVariant):
+                        module_name = f"{resolved.model.name}.{resolved.variant.name}"
+                    elif isinstance(resolved, ModelFamily) and getattr(resolved, "variants", None):
+                        v0 = resolved.variants[0]
+                        if hasattr(v0, "model") and hasattr(v0, "variant"):
+                            module_name = f"{v0.model.name}.{v0.variant.name}"
+                    elif isinstance(resolved, ModelDef):
+                        module_name = resolved.name.name
 
-                resolved = self._get_module_definition(module_ref)
-                if isinstance(resolved, ModelVariant):
-                    module_name = f"{resolved.model.name}.{resolved.variant.name}"
-                elif isinstance(resolved, ModelFamily) and getattr(resolved, "variants", None):
-                    v0 = resolved.variants[0]
-                    if hasattr(v0, "model") and hasattr(v0, "variant"):
-                        module_name = f"{v0.model.name}.{v0.variant.name}"
-                elif isinstance(resolved, ModelDef):
-                    module_name = resolved.name.name
-
-            self.write("+ " + module_name + " \n")
+                self.write("+ " + module_name + " \n")
 
         # Check if instance parameter expressions reference 'm' and add m={m} if needed
         has_m_in_params = any(p.name.name == "m" for p in pinst.params)
@@ -749,8 +915,43 @@ class XyceNetlister(SpiceNetlister):
                 self.log_warning(f"Added m={{m}} parameter to instance {pinst.name.name} (referenced in expressions)", f"Instance: {pinst.name.name}")
 
         # Write its parameter values (pass is_model to skip PARAMS: for models, and module_ref for BSIM4 detection)
-        module_ref = pinst.module if isinstance(pinst.module, Ref) else None
-        self.write_instance_params(pinst.params, is_mos_like=is_model, module_ref=module_ref)
+        # module_ref already set above
+        if is_diode:
+            # Write parameters on same line for diodes
+            # For diodes, only area is supported as positional parameter (perim not supported in Level 3)
+            area_val = None
+            other_params = []
+            for pval in pinst.params:
+                param_name = pval.name.name.lower()
+                if param_name == "area":
+                    area_val = pval.val
+                # Note: perim is not supported for Level 3 diodes in Xyce, so we skip it
+                elif param_name != "perim":
+                    other_params.append(pval)
+            # Write area as positional parameter (just value, no name)
+            if area_val is not None:
+                self.write(self.format_expr(area_val) + " ")
+            # Write other parameters as named (if any)
+            for pval in other_params:
+                self.write_param_val(pval)
+                self.write(" ")
+            self.write("\n")
+        else:
+            # For subcircuit instances, check if the referenced module is a MOS model
+            # to apply parameter filtering (MULU0, MULVSAT, etc.)
+            is_mos_like_for_params = is_model
+            if not is_model and module_ref:
+                # Check if the referenced module is a MOS model (even if it's a subcircuit instance)
+                is_mos_ref = self._is_mos_model_ref(module_ref) if module_ref else False
+                is_bsim4_ref = self._is_bsim4_model_ref(module_ref) if module_ref else False
+                if is_mos_ref or is_bsim4_ref:
+                    is_mos_like_for_params = True
+                else:
+                    # Fallback: check if instance name suggests MOS device
+                    inst_name_lower = pinst.name.name.lower()
+                    if any(keyword in inst_name_lower for keyword in ['mos', 'fet', 'pmos', 'nmos', 'mnmos', 'mpmos']):
+                        is_mos_like_for_params = True
+            self.write_instance_params(pinst.params, is_mos_like=is_mos_like_for_params, module_ref=module_ref)
 
         # Add a blank line after each instance for spacing between instances
         # If next entry is a model, write_model_def will handle spacing (but won't add extra)
@@ -765,6 +966,47 @@ class XyceNetlister(SpiceNetlister):
         module_ref = None
         if pinst.args and isinstance(pinst.args[-1], Ref):
             module_ref = pinst.args[-1]
+        
+        # CRITICAL FIX: Check if module_ref resolves to a SubcktDef (not ModelDef)
+        # If it's a subcircuit, we must write it as a subcircuit instance (X prefix, PARAMS:)
+        # not as a primitive/model instance.
+        module_def = self._get_module_definition(module_ref) if module_ref else None
+        from ..data import SubcktDef, Ident
+        if isinstance(module_def, SubcktDef):
+            # This is actually a subcircuit instance, not a primitive/model
+            # Convert Primitive to Instance format and delegate to write_subckt_instance
+            from ..data import Instance as InstanceType
+            # Convert Primitive args/kwargs to Instance format
+            # conns must be List[Ident] or List[Tuple[Ident, Ident]]
+            conns = []
+            for arg in pinst.args[:-1]:  # All args except last (which is the module ref)
+                if isinstance(arg, Ident):
+                    conns.append(arg)
+                elif isinstance(arg, Ref):
+                    conns.append(arg.ident)  # Extract Ident from Ref
+                else:
+                    # For other types (expressions), create an Ident wrapper if possible
+                    # This shouldn't normally happen for ports, but handle gracefully
+                    if hasattr(arg, 'ident'):
+                        conns.append(arg.ident)
+                    else:
+                        # Fallback: try to create Ident from string representation
+                        # This is a safety net, but ports should be Ident/Ref
+                        self.log_warning(f"Unexpected port type {type(arg)} in Primitive {pinst.name.name}, treating as Ident", f"Instance: {pinst.name.name}")
+                        conns.append(Ident(name=str(arg)))
+            
+            # Convert kwargs to ParamVal list (already ParamVal objects)
+            params = pinst.kwargs
+            
+            # Create a synthetic Instance node
+            fake_instance = InstanceType(
+                name=pinst.name,
+                module=module_ref,
+                conns=conns,
+                params=params
+            )
+            # Delegate to subcircuit instance writer
+            return self.write_subckt_instance(fake_instance)
             
         # Determine model type
         mtype = self._get_model_type(module_ref) if module_ref else None
@@ -777,7 +1019,7 @@ class XyceNetlister(SpiceNetlister):
             elif "res" in mtype or mtype == "r": prefix = "R"
             elif "cap" in mtype or mtype == "c": prefix = "C"
             elif "ind" in mtype or mtype == "l": prefix = "L"
-            elif "dio" in mtype or mtype == "d": prefix = "D"
+            # Note: Diodes don't need prefix prepending - just write on one line
             elif "pnp" in mtype or "npn" in mtype or mtype == "q": prefix = "Q"
         
         # Fallback heuristic
@@ -826,44 +1068,137 @@ class XyceNetlister(SpiceNetlister):
 
         inst_name = inst_name_base
         
-        if prefix and not inst_name.upper().startswith(prefix):
+        # Check if this is a diode - diodes must be written on one line (no continuation lines)
+        # BUT: Only if it's actually a ModelDef, not a SubcktDef (already handled above)
+        is_diode = (model_name and model_name in ("diode", "d"))
+        if not is_diode and model_name:
+            is_diode = ("dio" in model_name and model_name not in ("resistor", "res", "capacitor", "cap"))
+        
+        # Only prepend prefix for non-diodes
+        if not is_diode and prefix and not inst_name.upper().startswith(prefix):
             # If we're skipping model name (resistor/capacitor/inductor), use underscore separator
             if skip_model_name:
                 inst_name = f"{prefix}_{inst_name}"
             else:
                 inst_name = f"{prefix}{inst_name}"
-        self.write(inst_name + " \n")
-
-        # Write ports (excluding last (model)) on a separate continuation line
-        self.write("+ ")
-        for arg in pinst.args[:-1]:  # Ports only (exclude the model)
-            if isinstance(arg, Ident):
-                self.write(self.format_ident(arg) + " ")
-            elif isinstance(arg, Ref):
-                # Ports are identifiers, not expressions - use format_ident to avoid braces
-                self.write(self.format_ident(arg.ident) + " ")
-            elif isinstance(arg, (Int, Float, MetricNum)):
-                self.write(self.format_number(arg) + " ")
-            else:
-                # For other expression types, still format as expression (but this shouldn't happen for ports)
-                self.write(self.format_expr(arg) + " ")
-        self.write("\n")
-        # Write the model (last arg) on another continuation line
-        # Skip model name for resistor, capacitor, and inductor (Xyce infers from prefix)
-        if not skip_model_name and pinst.args:
-            self.write("+ " + self.format_ident(pinst.args[-1]) + " \n")
-
-        # Filter deltox if referencing BSIM4 model
-        # (dtox is only valid in model definitions, not instance parameters)
-        kwargs_to_write = pinst.kwargs
-        if module_ref and self._is_bsim4_model_ref(module_ref):
-            # Filter deltox AND dtox from instance parameters
-            kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name not in ("deltox", "dtox")]
         
-        self.write("+ ")
-        for kwarg in kwargs_to_write:
-            self.write_param_val(kwarg)
-            self.write(" ")
+        if is_diode:
+            # Write everything on one line for diodes
+            self.write(inst_name + " ")
+            # Write ports (excluding last (model))
+            for arg in pinst.args[:-1]:  # Ports only (exclude the model)
+                if isinstance(arg, Ident):
+                    self.write(self.format_ident(arg) + " ")
+                elif isinstance(arg, Ref):
+                    self.write(self.format_ident(arg.ident) + " ")
+                elif isinstance(arg, (Int, Float, MetricNum)):
+                    self.write(self.format_number(arg) + " ")
+                else:
+                    self.write(self.format_expr(arg) + " ")
+            # Write the model (last arg)
+            if not skip_model_name and pinst.args:
+                self.write(self.format_ident(pinst.args[-1]) + " ")
+            # Write parameters on same line
+            # For diodes, only area is supported as positional parameter (perim not supported in Level 3)
+            area_val = None
+            other_kwargs = []
+            kwargs_to_write = pinst.kwargs
+            if module_ref:
+                is_bsim4 = self._is_bsim4_model_ref(module_ref)
+                is_mos = self._is_mos_model_ref(module_ref)
+                is_resistor = self._is_resistor_model_ref(module_ref)
+                
+                params_to_filter = []
+                if is_bsim4:
+                    params_to_filter.extend(["deltox", "dtox"])
+                if is_mos:
+                    params_to_filter.extend(["deltox", "mulu0", "mulvsat", "delk1"])
+                if is_resistor:
+                    params_to_filter.extend(["tc1r"])
+                
+                if params_to_filter:
+                    kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name.lower() not in [p.lower() for p in params_to_filter]]
+            for kwarg in kwargs_to_write:
+                param_name = kwarg.name.name.lower()
+                if param_name == "area":
+                    area_val = kwarg.val
+                # Note: perim is not supported for Level 3 diodes in Xyce, so we skip it
+                elif param_name != "perim":
+                    other_kwargs.append(kwarg)
+            # Write area as positional parameter (just value, no name)
+            if area_val is not None:
+                self.write(self.format_expr(area_val) + " ")
+            # Write other parameters as named (if any)
+            for kwarg in other_kwargs:
+                self.write_param_val(kwarg)
+                self.write(" ")
+            self.write("\n")
+        else:
+            # Original behavior: use continuation lines for non-diodes
+            self.write(inst_name + " \n")
+
+            # Write ports (excluding last (model)) on a separate continuation line
+            self.write("+ ")
+            for arg in pinst.args[:-1]:  # Ports only (exclude the model)
+                if isinstance(arg, Ident):
+                    self.write(self.format_ident(arg) + " ")
+                elif isinstance(arg, Ref):
+                    # Ports are identifiers, not expressions - use format_ident to avoid braces
+                    self.write(self.format_ident(arg.ident) + " ")
+                elif isinstance(arg, (Int, Float, MetricNum)):
+                    self.write(self.format_number(arg) + " ")
+                else:
+                    # For other expression types, still format as expression (but this shouldn't happen for ports)
+                    self.write(self.format_expr(arg) + " ")
+            self.write("\n")
+            # Write the model (last arg) on another continuation line
+            # Skip model name for resistor, capacitor, and inductor (Xyce infers from prefix)
+            if not skip_model_name and pinst.args:
+                self.write("+ " + self.format_ident(pinst.args[-1]) + " \n")
+
+            # Filter unsupported parameters based on model type
+            # (certain parameters are only valid in model definitions, not instance parameters)
+            kwargs_to_write = pinst.kwargs
+            params_to_filter = []
+            
+            is_bsim4 = False
+            is_mos = False
+            is_resistor = False
+            
+            if module_ref:
+                is_bsim4 = self._is_bsim4_model_ref(module_ref)
+                is_mos = self._is_mos_model_ref(module_ref)
+                is_resistor = self._is_resistor_model_ref(module_ref)
+                
+                if is_bsim4:
+                    params_to_filter.extend(["deltox", "dtox"])
+                if is_mos:
+                    params_to_filter.extend(["deltox", "mulu0", "mulvsat", "delk1"])
+                if is_resistor:
+                    params_to_filter.extend(["tc1r", "tc2r"])
+            
+            # Fallback: if model type detection failed, check if instance looks like MOS
+            # This handles cases where models are defined in the current subcircuit being written
+            if not is_mos and not is_bsim4:
+                inst_name_lower = pinst.name.name.lower()
+                if any(keyword in inst_name_lower for keyword in ['mos', 'fet', 'pmos', 'nmos', 'mnmos', 'mpmos']):
+                    params_to_filter.extend(["deltox", "mulu0", "mulvsat", "delk1"])
+            
+            if params_to_filter:
+                # Remove duplicates while preserving order
+                seen = set()
+                unique_params_to_filter = []
+                for p in params_to_filter:
+                    p_lower = p.lower()
+                    if p_lower not in seen:
+                        seen.add(p_lower)
+                        unique_params_to_filter.append(p)
+                kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name.lower() not in [p.lower() for p in unique_params_to_filter]]
+            
+            self.write("+ ")
+            for kwarg in kwargs_to_write:
+                self.write_param_val(kwarg)
+                self.write(" ")
 
         # Add a blank line after each instance for spacing between instances
         # If next entry is a model, write_model_def will handle spacing (but won't add extra)
@@ -980,7 +1315,22 @@ class XyceNetlister(SpiceNetlister):
             return f"({cond} ? {if_true} : {if_false})"
             
         if isinstance(expr, Call):
-            func = self.format_ident(expr.func)
+            raw = expr.func.ident.name
+            raw_l = raw.lower()
+            mapped_l = raw_l
+
+            # If this call resolves to a user-defined function, allow it without validation.
+            resolved = getattr(expr.func, "resolved", None)
+            if resolved is None and raw_l not in self._defined_function_names:
+                mapped_l = self._xyce_func_alias_map.get(raw_l, raw_l)
+                if raw_l in self._xyce_func_alias_map:
+                    self._xyce_func_alias_counts[raw_l] = self._xyce_func_alias_counts.get(raw_l, 0) + 1
+                if mapped_l not in self._xyce_builtin_funcs:
+                    self.handle_error(
+                        expr,
+                        f"Unsupported function '{raw}' in Xyce output (after mapping -> '{mapped_l}')",
+                    )
+            func = mapped_l
             args = [self._format_expr_inner(arg) for arg in expr.args]
             return f"{func}({','.join(args)})"
 
@@ -1045,52 +1395,253 @@ class XyceNetlister(SpiceNetlister):
         
         # Pre-process: Move deltox/dtox from instances to local BSIM4 models
         # Xyce requires dtox to be on the model card, not the instance.
+        # Also handle delvto by converting to dvth0 parameter and modifying vth0
         
-        # 1. Find local BSIM4 models
+        from ..data import ModelDef, ModelFamily, Instance, Ref, ParamVal, Ident, ParamDecl, Primitive, BinaryOp, BinaryOperator, Int, Float, MetricNum, Expr
+        
+        # 1. Find local BSIM4 models (check by mtype and level parameter)
         local_models = {}
+        has_delvto = False
+        
         for entry in module.entries:
             if isinstance(entry, ModelDef):
-                if entry.mtype.name.lower() == "bsim4":
+                is_bsim4 = entry.mtype.name.lower() == "bsim4"
+                # Also check for level=14 or 54 in params (for nmos/pmos with level)
+                if not is_bsim4:
+                    for param in entry.params:
+                        if param.name.name == "level":
+                            if isinstance(param.default, (Int, Float)):
+                                level_val = param.default.val if hasattr(param.default, 'val') else float(param.default)
+                                if level_val in (14, 54):
+                                    is_bsim4 = True
+                                    break
+                if is_bsim4:
                     local_models[entry.name.name] = entry
             elif isinstance(entry, ModelFamily):
                 if entry.mtype.name.lower() == "bsim4":
                     local_models[entry.name.name] = entry
+            
+            # Check for delvto parameters
+            if isinstance(entry, Instance):
+                for pval in entry.params:
+                    if pval.name.name == "delvto":
+                        has_delvto = True
+                        break
+            elif isinstance(entry, Primitive):
+                for kwarg in entry.kwargs:
+                    if kwarg.name.name == "delvto":
+                        has_delvto = True
+                        break
+        
+        # Also check if entries reference BSIM4 models (global models)
+        # We need to detect BSIM4 models even if they're not local to convert delvto
+        has_global_bsim4 = False
+        if not local_models:
+            for entry in module.entries:
+                model_ref = None
+                if isinstance(entry, Instance) and isinstance(entry.module, Ref):
+                    model_ref = entry.module
+                elif isinstance(entry, Primitive) and len(entry.args) > 0 and isinstance(entry.args[-1], Ref):
+                    model_ref = entry.args[-1]
+                
+                if model_ref:
+                    if self._is_bsim4_model_ref(model_ref):
+                        # Found BSIM4 model reference, but it's not local
+                        # We'll handle delvto conversion but can't modify the model
+                        has_global_bsim4 = True
+                        break
+        
+        # If we found delvto but not BSIM4 model, assume BSIM4 (delvto is only used with BSIM4)
+        has_bsim4_model = len(local_models) > 0 or has_global_bsim4 or has_delvto
                     
-        # 2. Find instances using these models and extract deltox
-        for entry in module.entries:
-            if isinstance(entry, Instance) and isinstance(entry.module, Ref):
-                model_name = entry.module.ident.name
-                if model_name in local_models:
-                    # Found instance of local BSIM4 model
-                    dtox_val = None
-                    params_to_keep = []
-                    # Check params for deltox or dtox
+        # 2. Process delvto and deltox if subcircuit has BSIM4 model OR has delvto
+        # (delvto is only used with BSIM4, so if we find it, we should convert it)
+        needs_dvth0_param = False
+        delvto_entries = []  # Track entries with delvto for processing
+        
+        # Process all entries to find delvto/deltox, regardless of model detection
+        # This ensures we convert delvto even if model detection fails
+        if has_bsim4_model or has_delvto:
+            for entry in module.entries:
+                dtox_val = None
+                delvto_val = None
+                params_to_keep = []
+                kwargs_to_keep = []
+                
+                # Check Instance entries
+                if isinstance(entry, Instance) and isinstance(entry.module, Ref):
+                    model_name = entry.module.ident.name
+                    is_bsim4_instance = model_name in local_models or self._is_bsim4_model_ref(entry.module)
+                    
+                    # Check for delvto/deltox in any instance (delvto indicates BSIM4)
                     for pval in entry.params:
                         if pval.name.name in ("deltox", "dtox"):
                             dtox_val = pval.val
+                        elif pval.name.name == "delvto":
+                            delvto_val = pval.val
+                            needs_dvth0_param = True
+                            delvto_entries.append((entry, delvto_val, "params"))
                         else:
                             params_to_keep.append(pval)
                     
-                    if dtox_val is not None:
-                        # Remove from instance (modify in place)
+                    # Update entry params (remove deltox/dtox/delvto) if found
+                    if dtox_val is not None or delvto_val is not None:
                         entry.params = params_to_keep
                         
-                        # Add to model (modify in place)
-                        model = local_models[model_name]
-                        
-                        # Helper to add dtox to a param list
-                        def add_dtox(params_list, val):
-                            # Remove existing dtox/deltox
-                            new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
-                            # Add new dtox
-                            new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
-                            return new_params
+                        # Handle deltox -> dtox for local models only
+                        # BUT: Only if dtox_val doesn't reference instance parameters (m, l, w)
+                        # Model parameters can't reference instance parameters in Xyce
+                        if dtox_val is not None and model_name in local_models:
+                            # Check if dtox_val references instance parameters
+                            # expr_references_param is imported from spice module at top level (line 43)
+                            references_instance_params = False
+                            if isinstance(dtox_val, Expr):
+                                # Check for m, l, w references
+                                for param_name in ['m', 'l', 'w']:
+                                    if expr_references_param(dtox_val, param_name):
+                                        references_instance_params = True
+                                        break
+                            
+                            if not references_instance_params:
+                                model = local_models[model_name]
+                                
+                                # Helper to add dtox to a param list
+                                def add_dtox(params_list, val):
+                                    # Remove existing dtox/deltox
+                                    new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
+                                    # Add new dtox
+                                    new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
+                                    return new_params
 
-                        if isinstance(model, ModelDef):
-                            model.params = add_dtox(model.params, dtox_val)
-                        elif isinstance(model, ModelFamily):
-                            for variant in model.variants:
-                                variant.params = add_dtox(variant.params, dtox_val)
+                                if isinstance(model, ModelDef):
+                                    model.params = add_dtox(model.params, dtox_val)
+                                elif isinstance(model, ModelFamily):
+                                    for variant in model.variants:
+                                        variant.params = add_dtox(variant.params, dtox_val)
+                            # else: dtox references instance parameters - can't move to model
+                            # It will be filtered out by parameter filtering (deltox/dtox are filtered)
+                
+                # Check Primitive entries
+                elif isinstance(entry, Primitive) and len(entry.args) > 0 and isinstance(entry.args[-1], Ref):
+                    model_ref = entry.args[-1]
+                    model_name = model_ref.ident.name
+                    is_bsim4_primitive = model_name in local_models or self._is_bsim4_model_ref(model_ref)
+                    
+                    # Check for delvto/deltox in any primitive (delvto indicates BSIM4)
+                    for kwarg in entry.kwargs:
+                        if kwarg.name.name in ("deltox", "dtox"):
+                            dtox_val = kwarg.val
+                        elif kwarg.name.name == "delvto":
+                            delvto_val = kwarg.val
+                            needs_dvth0_param = True
+                            delvto_entries.append((entry, delvto_val, "kwargs"))
+                        else:
+                            kwargs_to_keep.append(kwarg)
+                    
+                    # Update entry kwargs (remove deltox/dtox/delvto) if found
+                    if dtox_val is not None or delvto_val is not None:
+                        entry.kwargs = kwargs_to_keep
+                        
+                        # Handle deltox -> dtox for local models only
+                        # BUT: Only if dtox_val doesn't reference instance parameters (m, l, w)
+                        # Model parameters can't reference instance parameters in Xyce
+                        if dtox_val is not None and model_name in local_models:
+                            # Check if dtox_val references instance parameters
+                            # expr_references_param is imported from spice module at top level (line 43)
+                            references_instance_params = False
+                            if isinstance(dtox_val, Expr):
+                                # Check for m, l, w references
+                                for param_name in ['m', 'l', 'w']:
+                                    if expr_references_param(dtox_val, param_name):
+                                        references_instance_params = True
+                                        break
+                            
+                            if not references_instance_params:
+                                model = local_models[model_name]
+                                
+                                # Helper to add dtox to a param list
+                                def add_dtox(params_list, val):
+                                    # Remove existing dtox/deltox
+                                    new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
+                                    # Add new dtox
+                                    new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
+                                    return new_params
+
+                                if isinstance(model, ModelDef):
+                                    model.params = add_dtox(model.params, dtox_val)
+                                elif isinstance(model, ModelFamily):
+                                    for variant in model.variants:
+                                        variant.params = add_dtox(variant.params, dtox_val)
+                            # else: dtox references instance parameters - can't move to model
+                            # It will be filtered out by parameter filtering (deltox/dtox are filtered)
+        
+        # 3. Add dvth0 parameter to subcircuit if needed, and modify model vth0
+        if needs_dvth0_param:
+            # Check if dvth0 already exists in subcircuit params
+            has_dvth0 = any(p.name.name == "dvth0" for p in module.params)
+            if not has_dvth0:
+                # Add dvth0 parameter with default 0
+                dvth0_param = ParamDecl(name=Ident("dvth0"), default=Float(0.0), distr=None)
+                module.params.append(dvth0_param)
+            
+            # Modify model's vth0 parameter to include dvth0 (only for local models)
+            for model_name, model in local_models.items():
+                # Helper to modify vth0 to include dvth0
+                def modify_vth0(params_list):
+                    new_params = []
+                    vth0_found = False
+                    dvth0_ref = Ref(ident=Ident("dvth0"))
+                    
+                    for p in params_list:
+                        if p.name.name == "vth0":
+                            vth0_found = True
+                            # Modify vth0 to be vth0 + dvth0
+                            if isinstance(p.default, (Int, Float, MetricNum)):
+                                # If vth0 is a literal, create expression: vth0 + dvth0
+                                vth0_expr = BinaryOp(
+                                    tp=BinaryOperator.ADD,
+                                    left=p.default,
+                                    right=dvth0_ref
+                                )
+                                new_params.append(ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment))
+                            elif isinstance(p.default, Expr):
+                                # If vth0 is already an expression, wrap it: (vth0_expr) + dvth0
+                                vth0_expr = BinaryOp(
+                                    tp=BinaryOperator.ADD,
+                                    left=p.default,
+                                    right=dvth0_ref
+                                )
+                                new_params.append(ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment))
+                            else:
+                                # Fallback: just add dvth0
+                                vth0_expr = BinaryOp(
+                                    tp=BinaryOperator.ADD,
+                                    left=Float(0.0),
+                                    right=dvth0_ref
+                                )
+                                new_params.append(ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment))
+                        else:
+                            new_params.append(p)
+                    
+                    # If vth0 not found, add it as dvth0 (so it's just dvth0)
+                    if not vth0_found:
+                        new_params.append(ParamDecl(name=Ident("vth0"), default=dvth0_ref, distr=None))
+                    
+                    return new_params
+                
+                if isinstance(model, ModelDef):
+                    model.params = modify_vth0(model.params)
+                elif isinstance(model, ModelFamily):
+                    for variant in model.variants:
+                        variant.params = modify_vth0(variant.params)
+            
+            # Update entries (instances or primitives) to use dvth0 instead of delvto
+            # Note: For Xyce, we don't add dvth0 to instance parameters because:
+            # 1. dvth0 is a subcircuit parameter (already added above)
+            # 2. The model's vth0 expression references dvth0 from subcircuit scope
+            # 3. Xyce doesn't support dvth0 as an instance parameter
+            # The delvto value is already incorporated into the model's vth0 expression,
+            # so we just remove delvto from instances (already done above) and don't add dvth0
 
         # Reset instance flag at start of subcircuit
         self._last_entry_was_instance = False
@@ -1178,17 +1729,41 @@ class XyceNetlister(SpiceNetlister):
                         break
         
         # Check for BJT-specific parameters in params list
+        # But exclude 'm' from this check since 'm' is common to many subcircuits
         if not is_bjt_subckt and module.params:
             for param in module.params:
-                if param.name.name.lower() in bjt_param_names:
+                param_name_lower = param.name.name.lower()
+                if param_name_lower in bjt_param_names and param_name_lower != 'm':
                     is_bjt_subckt = True
                     break
 
-        # For BJT subcircuits, separate parameters into:
-        # 1. Instance-specific params (m) -> keep in PARAMS:
-        # 2. Model-accessed params (dkisnpn1x1, dkbfnpn1x1, var_is, var_bf) -> write as .param statements
+        # Check if this is a FET/MOS subcircuit - detect by checking for FET-specific parameters
+        # that are used in model definitions (swx_nrds, swx_vth)
+        # These need to be accessible to models, but also settable from outside
+        is_fet_subckt = False
+        fet_model_param_names = {'swx_nrds', 'swx_vth'}  # Parameters used in model definitions
+        
+        # Check if subcircuit has FET model parameters in PARAMS
+        if module.params:
+            for param in module.params:
+                param_name_lower = param.name.name.lower()
+                if param_name_lower in fet_model_param_names:
+                    is_fet_subckt = True
+                    # FET parameters are kept in PARAMS only - models can access them directly
+                    break
+        
+        # For BJT and FET subcircuits, separate parameters into:
+        # 1. Instance-specific params (m, l, w, etc.) -> keep in PARAMS:
+        # 2. Model-accessed params (dkisnpn1x1, swx_nrds, swx_vth) -> write as .param statements
         params_for_params_line = []
         params_for_param_statements = []
+        
+        # Debug: log state before parameter separation
+        if is_fet_subckt:
+            self.log_warning(
+                f"DEBUG: is_fet_subckt={is_fet_subckt}, is_bjt_subckt={is_bjt_subckt}, has_params={bool(module.params)}, num_params={len(module.params) if module.params else 0}",
+                f"Subcircuit: {module_name}"
+            )
         
         if is_bjt_subckt and module.params:
             for param in module.params:
@@ -1199,8 +1774,14 @@ class XyceNetlister(SpiceNetlister):
                 else:
                     # Instance-specific or other parameter -> keep in PARAMS:
                     params_for_params_line.append(param)
+        elif is_fet_subckt and module.params:
+            # For FET subcircuits: keep all parameters in PARAMS only
+            # Models can access PARAMS directly, no need for .param statements
+            for param in module.params:
+                # All parameters go to PARAMS line only
+                params_for_params_line.append(param)
         else:
-            # Not a BJT subcircuit, or no params -> use normal behavior
+            # Not a BJT/FET subcircuit, or no params -> use normal behavior
             params_for_params_line = module.params
 
         # Start the sub-circuit definition header with inline ports
@@ -1220,16 +1801,43 @@ class XyceNetlister(SpiceNetlister):
         # End the header with a blank line
         self.write("\n")
 
-        # For BJT subcircuits, write .param statements for model-accessed parameters
-        if is_bjt_subckt and params_for_param_statements:
-            self.write_comment("BJT parameters moved from PARAMS: to .param statements for model access")
+        # For BJT and FET subcircuits, write .param statements for model-accessed parameters
+        if (is_bjt_subckt or is_fet_subckt) and params_for_param_statements:
+            if is_bjt_subckt:
+                self.write_comment("BJT parameters moved from PARAMS: to .param statements for model access")
+            else:
+                self.write_comment("FET parameters: kept in PARAMS (for external setting) and also as .param (for model access)")
             self.write("\n")
             for param in params_for_param_statements:
                 self.write(".param ")
-                self.write_param_decl(param)
-                self.write("\n")
+                # For FET: write the expression directly (evaluates it), not a circular reference
+                # For BJT: use the parameter's default value directly
+                if is_fet_subckt and param.name.name.lower() in fet_model_param_names:
+                    # Write .param with the expression from PARAMS default
+                    # This evaluates the expression, making it accessible to models
+                    # Note: If external user sets swx_nrds via PARAMS, that value is used for instance params
+                    # but model will use the .param value (evaluated expression)
+                    # For true inheritance, we'd need .param swx_nrds={swx_nrds} but that's circular in Xyce
+                    param_name = self.format_ident(param.name)
+                    self.write(f"{param_name}=")
+                    if param.default:
+                        # Use the expression from PARAMS default
+                        expr_inner = self._format_expr_inner(param.default)
+                        self.write(f"{{{expr_inner}}}\n")
+                    else:
+                        self.write("0\n")
+                else:
+                    # For BJT: use the parameter's default value directly
+                    self.write_param_decl(param)
+                    self.write("\n")
             self.write("\n")
 
+        # Store FET subcircuit info for model parameter replacement
+        if is_fet_subckt:
+            self._current_fet_subckt = module
+        else:
+            self._current_fet_subckt = None
+        
         # Write internal content
         for entry in module.entries:
             self.write_entry(entry)
@@ -1241,6 +1849,7 @@ class XyceNetlister(SpiceNetlister):
         self.write(".ENDS\n\n")
         # Clear current subcircuit context
         self._current_subckt = None
+        self._current_fet_subckt = None
 
     def write_function_def(self, func: FunctionDef) -> None:
         """Write a Xyce .FUNC definition for FunctionDef `func`.
@@ -1560,6 +2169,56 @@ class XyceNetlister(SpiceNetlister):
         
         return False
 
+    def _is_mos_model_ref(self, ref: Ref) -> bool:
+        """Check if a Ref points to an nmos or pmos model definition.
+        
+        Args:
+            ref: A Ref object pointing to a model name
+            
+        Returns:
+            True if the reference points to an nmos or pmos model, False otherwise
+        """
+        if not isinstance(ref, Ref):
+            return False
+        
+        mtype = self._get_model_type(ref)
+        if mtype:
+            return mtype in ("nmos", "pmos")
+        
+        # Fallback: heuristic check based on model name
+        # If _get_model_type fails (e.g., model defined in current subcircuit being written),
+        # check if model name suggests it's a MOS model
+        model_name_lower = ref.ident.name.lower()
+        if "nmos" in model_name_lower or "pmos" in model_name_lower or "mos" in model_name_lower:
+            # Additional check: exclude obvious non-MOS models
+            if "res" not in model_name_lower and "cap" not in model_name_lower and "ind" not in model_name_lower:
+                return True
+        
+        return False
+
+    def _is_resistor_model_ref(self, ref: Ref) -> bool:
+        """Check if a Ref points to a resistor model definition.
+        
+        Args:
+            ref: A Ref object pointing to a model name
+            
+        Returns:
+            True if the reference points to a resistor model, False otherwise
+        """
+        if not isinstance(ref, Ref):
+            return False
+        
+        mtype = self._get_model_type(ref)
+        if mtype:
+            return mtype in ("r", "res", "resistor")
+        
+        # Fallback: heuristic check based on model name
+        model_name_lower = ref.ident.name.lower()
+        if "res" in model_name_lower or "rpoly" in model_name_lower or "r_" in model_name_lower:
+            return True
+        
+        return False
+
     def _clamp_param_value(self, expr: Expr, min_val: Optional[float], max_val: Optional[float], 
                           min_exclusive: bool = False, max_exclusive: bool = False, preserve_zero: bool = False) -> Expr:
         """Clamp a parameter value expression to valid range.
@@ -1672,7 +2331,7 @@ class XyceNetlister(SpiceNetlister):
             # Transit time parameters
             'TF', 'TR',
             # Temperature parameters
-            'TREF', 'EG', 'XTI', 'XTB',
+            'TNOM', 'EG', 'XTI', 'XTB',  # Note: TREF is mapped to TNOM, not kept as-is
             # Noise parameters
             'AF', 'KF',
         }
@@ -1739,20 +2398,169 @@ class XyceNetlister(SpiceNetlister):
                 # But exclude TREF, TF, TR which are valid
                 if param_name_upper not in ('TREF', 'TF', 'TR'):
                     dropped_params.append(param.name.name)
+            elif param_name_upper == 'LEVEL':
+                # Level parameter is handled separately by level mapping system, drop it here
+                # (it will be added back with the correct output level)
+                dropped_params.append(param.name.name)
+            elif param_name_upper == 'NS':
+                # NS (substrate emission coefficient) - not in Xyce Level 1, drop it
+                dropped_params.append(param.name.name)
+            elif param_name_upper == 'TREF':
+                # TREF (reference temperature) - map to TNOM in Xyce
+                from ..data import Ident
+                renamed_param = ParamDecl(
+                    name=Ident('TNOM'),
+                    default=param.default,
+                    distr=param.distr
+                )
+                filtered_params.append((renamed_param, "TREF -> TNOM (Xyce standard)", False))
+                kept_params.append("TREF -> TNOM")
             else:
-                # Unknown parameter - keep it but log a warning
+                # Unknown parameter - drop it with warning (don't keep unknown params)
                 self.log_warning(
-                    f"BJT Level 1 parameter '{param.name.name}' not in known supported/dropped list. Keeping it.",
+                    f"BJT Level 1 parameter '{param.name.name}' not recognized. Dropping it (not in Xyce Level 1 standard).",
                     f"Model: {model_name}"
                 )
-                filtered_params.append((param, None, False))
-                kept_params.append(param.name.name)
+                dropped_params.append(param.name.name)
         
         # Log summary
         context = f"Model: {model_name}" if model_name else "BJT conversion"
         if dropped_params:
             self.log_warning(
                 f"BJT Level 1 -> Level 1 conversion: {len(dropped_params)} parameter(s) dropped (not supported in Xyce Level 1): {', '.join(dropped_params)}",
+                context
+            )
+        
+        return filtered_params
+
+    def _map_diode_level3_to_level1_params(self, params: List[ParamDecl], model_name: str = "") -> List[Tuple[ParamDecl, Optional[str], bool]]:
+        """Map diode Level 3 parameters to Level 1 parameters.
+        
+        Filters out Level 3-specific parameters and keeps only Level 1 supported ones.
+        
+        Args:
+            params: List of ParamDecl objects with level 3 parameter names
+            model_name: Name of the model being converted (for warning context)
+            
+        Returns:
+            List of (ParamDecl, comment, commented_out) tuples
+        """
+        # Track warnings for this conversion
+        dropped_params = []
+        kept_params = []
+        
+        # Level 1 diode parameters (based on SPICE3f5 standard)
+        # Standard Level 1 params: IS, N, RS, CJO, VJ, M, TT, EG, XTI, KF, AF, FC, BV, IBV, TNOM
+        # Note: AREA is an instance parameter, not a model parameter in Level 1
+        supported_level1_params = {
+            'IS', 'N', 'RS', 'CJO', 'VJ', 'M', 'TT', 'EG', 'XTI', 'KF', 'AF', 'FC', 'BV', 'IBV', 'TNOM'
+        }
+        
+        # Level 3 specific parameters to drop (not supported in Level 1)
+        unsupported_params = {
+            # Level 3 geometry parameters
+            'XW', 'W', 'L', 'DEFW', 'DELL', 'LM', 'LP', 'WM', 'WP', 'XM', 'XL', 'XP', 'XOI', 'XOM',
+            # Level 3 temperature parameters
+            'TLEVC', 'TLEV', 'GAP1', 'GAP2', 'TCV', 'TREF',
+            # Level 3 advanced parameters
+            'TTT1', 'TTT2', 'TM1', 'TM2', 'CTA', 'CTP', 'TPB', 'TPHP', 'TTPB', 'TTPHP',
+            # Sidewall capacitance parameters (not in Level 1)
+            'CJSW', 'MJSW', 'PHP', 'JSW',
+            # Current parameters (IK/IKR are BJT params, not diode Level 1)
+            'IK', 'IKR',
+            # AREA is instance-level only in Level 1, not a model parameter
+            'AREA',
+            # TRS (temperature coefficient of RS) - drop if RS already exists, otherwise could map to RS
+            # But to avoid conflicts, just drop TRS
+            'TRS',
+        }
+        
+        # Parameter name mappings (Level 3 -> Level 1)
+        # These need to be renamed to Level 1 standard names
+        # Keys are lowercase to match param_name_lower check
+        param_name_mapping = {
+            'cj': 'CJO',   # Zero-bias junction capacitance
+            'pb': 'VJ',    # Junction potential (built-in potential)
+            'mj': 'M',     # Grading coefficient
+            'js': 'IS',    # Saturation current (if used as model param)
+            'vb': 'BV',    # Breakdown voltage
+            # Note: 'trs' -> 'RS' mapping removed - if both RS and TRS exist, keep RS and drop TRS
+        }
+        
+        # Process each parameter
+        filtered_params = []
+        # Track which output parameter names we've already added (to avoid duplicates)
+        seen_output_params = set()
+        
+        for param_item in params:
+            # Handle both ParamDecl and tuple formats
+            if isinstance(param_item, tuple):
+                param = param_item[0]
+            else:
+                param = param_item
+            
+            param_name_upper = param.name.name.upper()
+            param_name_lower = param.name.name.lower()
+            
+            # First check if parameter should be renamed (mapping takes priority)
+            if param_name_lower in param_name_mapping:
+                new_name = param_name_mapping[param_name_lower]
+                if new_name is None:
+                    # Drop this parameter
+                    dropped_params.append(param.name.name)
+                    continue
+                # Check if we already have this output parameter name
+                if new_name.upper() in seen_output_params:
+                    # Skip duplicate - keep the first one, drop this one
+                    self.log_warning(
+                        f"Diode Level 3 parameter '{param.name.name}' maps to '{new_name}' which already exists. Dropping duplicate.",
+                        f"Model: {model_name}"
+                    )
+                    dropped_params.append(param.name.name)
+                    continue
+                # Rename parameter
+                from ..data import Ident
+                renamed_param = ParamDecl(
+                    name=Ident(new_name),
+                    default=param.default,
+                    distr=param.distr
+                )
+                filtered_params.append((renamed_param, f"{param.name.name} -> {new_name} (Level 3 -> Level 1)", False))
+                kept_params.append(f"{param.name.name} -> {new_name}")
+                seen_output_params.add(new_name.upper())
+                continue
+            
+            # Check if parameter is in unsupported list (drop it)
+            if param_name_upper in unsupported_params:
+                dropped_params.append(param.name.name)
+                continue
+            
+            # Check if parameter is supported in Level 1 (keep as-is)
+            if param_name_upper in supported_level1_params:
+                # Check for duplicates
+                if param_name_upper in seen_output_params:
+                    self.log_warning(
+                        f"Diode Level 3 parameter '{param.name.name}' is duplicate. Dropping it.",
+                        f"Model: {model_name}"
+                    )
+                    dropped_params.append(param.name.name)
+                else:
+                    filtered_params.append((param, None, False))
+                    kept_params.append(param.name.name)
+                    seen_output_params.add(param_name_upper)
+            else:
+                # Unknown parameter - drop it with warning (don't keep unknown params)
+                self.log_warning(
+                    f"Diode Level 3 parameter '{param.name.name}' not recognized. Dropping it (not in Level 1 standard).",
+                    f"Model: {model_name}"
+                )
+                dropped_params.append(param.name.name)
+        
+        # Log summary
+        context = f"Model: {model_name}" if model_name else "Diode conversion"
+        if dropped_params:
+            self.log_warning(
+                f"Diode Level 3 -> Level 1 conversion: {len(dropped_params)} parameter(s) dropped (not supported in Xyce Level 1): {', '.join(dropped_params)}",
                 context
             )
         
@@ -2172,6 +2980,62 @@ class XyceNetlister(SpiceNetlister):
             self.write("\n")
             self._last_entry_was_instance = False
         
+        # Check if we're in a subcircuit and if this model should have its suffix removed
+        # Rule: If there's only one model, remove any numeric suffix (.0, .1, .2, etc.)
+        #       If there are multiple models, remove suffix from the first variant (lowest number)
+        # (Xyce doesn't match numeric variant suffixes when instances reference base name)
+        from ..data import ModelDef, ModelFamily, Ident
+        import re
+        model_name = model.name.name
+        if self._current_subckt is not None:
+            # Check if model name ends with a numeric suffix (e.g., .0, .1, .2, .28)
+            suffix_match = re.match(r'^(.+)\.(\d+)$', model_name)
+            if suffix_match:
+                model_base = suffix_match.group(1)
+                suffix_num = int(suffix_match.group(2))
+                
+                # Find all models with the same base name and their suffix numbers
+                # Include the current model in the count
+                variant_suffixes = []
+                for entry in self._current_subckt.entries:
+                    if isinstance(entry, ModelDef):
+                        entry_name = entry.name.name
+                        entry_base = entry_name.split('.')[0]
+                        if entry_base == model_base:
+                            # Extract suffix number if present
+                            entry_suffix_match = re.match(r'^.+\.(\d+)$', entry_name)
+                            if entry_suffix_match:
+                                entry_suffix_num = int(entry_suffix_match.group(1))
+                                variant_suffixes.append(entry_suffix_num)
+                            else:
+                                # No suffix - this means suffix was already removed
+                                # Don't count it as a variant
+                                pass
+                    elif isinstance(entry, ModelFamily):
+                        # ModelFamily: check if base name matches
+                        family_base = entry.name.name.split('.')[0]
+                        if family_base == model_base:
+                            # For ModelFamily, we need to check variants
+                            # This is more complex - for now, just count them
+                            variant_suffixes.extend([i+1 for i in range(len(entry.variants))])
+                
+                # Also include the current model's suffix in the list
+                variant_suffixes.append(suffix_num)
+                
+                # Remove duplicates and sort to find the lowest suffix number
+                variant_suffixes = sorted(set(variant_suffixes))
+                
+                # If there's only one model, remove its suffix
+                # If there are multiple models, remove suffix from the first one (lowest number)
+                if len(variant_suffixes) == 1:
+                    # Only one model - remove suffix
+                    model_name = model_base
+                    model.name = Ident(name=model_name)
+                elif len(variant_suffixes) > 1 and suffix_num == variant_suffixes[0]:
+                    # Multiple models - remove suffix from the first one (lowest number)
+                    model_name = model_base
+                    model.name = Ident(name=model_name)
+        
         mname = self.format_ident(model.name)
         mtype = self.format_ident(model.mtype).lower()
         
@@ -2238,6 +3102,15 @@ class XyceNetlister(SpiceNetlister):
                         )
                         # Map level 1 BJT parameters to MEXTRAM (level 504)
                         params_to_write = self._map_bjt_level1_to_mextram_params(params_to_write, model_name=mname)
+                    elif mtype_lower in ("diode", "d") and current_level == 3 and output_level == 1:
+                        # Convert diode Level 3 to Level 1
+                        self.log_warning(
+                            f"Converting diode model '{mname}' from Level 3 to Level 1. "
+                            "Level 3-specific parameters will be dropped. "
+                            "Level 1 supports area but not perim as instance parameters.",
+                            f"Model: {mname}"
+                        )
+                        params_to_write = self._map_diode_level3_to_level1_params(params_to_write, model_name=mname)
                     
                     # Update or add level parameter
                     if has_level:
@@ -2271,14 +3144,22 @@ class XyceNetlister(SpiceNetlister):
             # Check if level parameter already exists
             has_level = any(self._get_param_name(p) == "level" for p in params_to_write)
             
-            # Map deltox to dtox instead of filtering
+            # Map deltox to dtox and drop TYPE parameter (Spectre-specific, not in Xyce)
             mapped_params = []
             for p in params_to_write:
-                if self._get_param_name(p) == "deltox":
+                param_name = self._get_param_name(p)
+                if param_name == "deltox":
                     # Create new ParamDecl with name "dtox" and same value
                     p_default = self._get_param_default(p)
                     p_distr = p[0].distr if isinstance(p, tuple) else p.distr
                     mapped_params.append(ParamDecl(name=Ident("dtox"), default=p_default, distr=p_distr))
+                elif param_name.upper() == "TYPE":
+                    # TYPE is Spectre-specific parameter, drop it (not in Xyce)
+                    self.log_warning(
+                        f"BSIM4 parameter 'TYPE' dropped (Spectre-specific, not in Xyce BSIM4)",
+                        f"Model: {mname}"
+                    )
+                    # Don't add to mapped_params (effectively drops it)
                 else:
                     mapped_params.append(p)
             params_to_write = mapped_params
@@ -2355,6 +3236,10 @@ class XyceNetlister(SpiceNetlister):
             for arg in model.args:
                 self.write(self.format_expr(arg) + " ")
             self.write("\n")
+        
+        # If we're in a FET subcircuit, models can now access swx_nrds/swx_vth via .param aliases
+        # No need to replace references - the .param aliases reference PARAMS, so models can use the same names
+        # The .param statements (e.g., .param swx_nrds={swx_nrds}) create aliases that models can access
         
         # Write parameters using the filtered list
         for item in params_to_write:
