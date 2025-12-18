@@ -76,8 +76,18 @@ class Netlister:
             
         for file in self.src.files:
             entries = file.contents
+            pbar = None
+            if self.options is not None and getattr(self.options, "show_progress", False):
+                # Lazy import so tqdm is optional unless enabled.
+                try:
+                    from tqdm import tqdm  # type: ignore
+                    desc = getattr(self.options, "progress_desc", None) or f"netlist:{self.file_type or 'default'}"
+                    pbar = tqdm(total=len(entries), desc=desc, unit="entry", mininterval=0.2)
+                except Exception:
+                    pbar = None
             i = 0
             while i < len(entries):
+                prev_i = i
                 entry = entries[i]
                 
                 # Special handling for ParamDecls: collect all "after" comments that follow
@@ -105,12 +115,16 @@ class Netlister:
                     if inline_comments:
                         self.write_param_decls_with_inline_comments(entry, inline_comments)
                         i = j  # Skip ParamDecls and all inline comments
+                        if pbar is not None:
+                            pbar.update(i - prev_i)
                         continue
                     else:
                         # No additional inline comments, but params might have comments stored
                         # Write normally (write_param_decls will handle inline comments from ParamDecl.comment)
                         self.write_entry(entry)
                         i += 1
+                        if pbar is not None:
+                            pbar.update(i - prev_i)
                         continue
                 
                 # Skip comments that match inline comments already stored in ParamDecl.comment fields
@@ -128,6 +142,8 @@ class Netlister:
                     if is_duplicate:
                         # Skip this duplicate comment (it's already written inline with its parameter)
                         i += 1
+                        if pbar is not None:
+                            pbar.update(i - prev_i)
                         continue
                 
                 # Check if next entry is a comment that should be inline
@@ -141,11 +157,17 @@ class Netlister:
                             # Write entry with inline comment
                             self.write_entry_with_inline_comment(entry, next_entry)
                             i += 2  # Skip both entry and comment
+                            if pbar is not None:
+                                pbar.update(i - prev_i)
                             continue
                 
                 # Normal entry writing
                 self.write_entry(entry)
                 i += 1
+                if pbar is not None:
+                    pbar.update(i - prev_i)
+            if pbar is not None:
+                pbar.close()
         self.dest.flush()
     
     def write_entry_with_inline_comment(self, entry, comment: "Comment") -> None:

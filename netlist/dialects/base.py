@@ -593,21 +593,23 @@ class DialectParser:
             Tokens.DOLLAR,
         ) or (self.are_stars_comments_now() and tok.tp in (Tokens.DUBSTAR, Tokens.STAR))
 
-    def collect_before_comments(self) -> List["Comment"]:
+    def collect_before_comments(self) -> List["Statement"]:
         """Collect any line-starting comments before current statement.
         Checks the lexer for comments that were captured on previous lines."""
-        comments = []
+        comments: List[Statement] = []
         # Get comments from queue up to current line
         queued_comments = self.lex.get_queued_comments(up_to_line=self.lex.line_num - 1)
         for comment_text, comment_type, line_num in queued_comments:
             # Line-starting comments can be "*" or "//" type
             if comment_type in ("*", "//"):
-                comments.append(Comment(text=comment_text, position="before"))
+                # Preserve even empty comment-only lines (e.g. `//`) as comments, not blank lines.
+                # This allows mapping `//` -> `;` in Xyce output.
+                comments.append(Comment(text=comment_text or "", position="before"))
         # Also check current line comments
         line_comments = self.lex.get_line_comments()
         for comment_text, comment_type in line_comments:
             if comment_type in ("*", "//"):
-                comments.append(Comment(text=comment_text, position="before"))
+                comments.append(Comment(text=comment_text or "", position="before"))
         return comments
 
     def collect_inline_comment(self) -> Optional["Comment"]:
@@ -622,16 +624,16 @@ class DialectParser:
                     return Comment(text=comment_text, position="inline")
         return None
 
-    def collect_after_comments(self) -> List["Comment"]:
+    def collect_after_comments(self) -> List["Statement"]:
         """Collect comments after current statement.
         This should be called after a statement is complete."""
-        comments = []
+        comments: List[Statement] = []
         # Check lexer for any remaining comments on the current line
         line_comments = self.lex.get_line_comments()
         for comment_text, comment_type in line_comments:
             # Inline comments (//) are typically "after" the statement content
             if comment_type == "//":
-                comments.append(Comment(text=comment_text, position="after"))
+                comments.append(Comment(text=comment_text or "", position="after"))
         return comments
 
     def parse_quote_string(self) -> str:

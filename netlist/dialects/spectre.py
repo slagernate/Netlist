@@ -218,7 +218,11 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
             self.expect(Tokens.NEWLINE)
             # Multi-Variant Model Family
             vars = []
-            while not self.match(Tokens.RBRACKET):
+            while True:
+                # Allow blank lines inside model-family brackets (common in PDK decks).
+                self.eat_blanks()
+                if self.match(Tokens.RBRACKET):
+                    break
                 self.expect(Tokens.IDENT, Tokens.INT)
                 vname = Ident(str(self.cur.val))
                 self.expect(Tokens.COLON)
@@ -258,7 +262,11 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
         self.expect(Tokens.LBRACKET)
         self.expect(Tokens.NEWLINE)
         vars = []
-        while not self.match(Tokens.RBRACKET):
+        while True:
+            # Allow blank lines inside variation brackets.
+            self.eat_blanks()
+            if self.match(Tokens.RBRACKET):
+                break
             self.expect(Tokens.IDENT)
             if self.cur.val != "vary":
                 self.fail()
@@ -310,7 +318,11 @@ class SpectreDialectParser(SpectreMixin, DialectParser):
         process = None
         mismatch = None
 
-        while not self.match(Tokens.RBRACKET):
+        while True:
+            # Allow blank lines inside statistics blocks.
+            self.eat_blanks()
+            if self.match(Tokens.RBRACKET):
+                break
             self.expect(Tokens.IDENT)
             if self.cur.val == "process":
                 if process is not None:

@@ -101,7 +101,7 @@ class ReportCollector:
 
 class WriteOptions:
     """Options for writing a netlist"""
-    def __init__(self, fmt, file_type: str = "", includes: list = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None, log_file: Optional[str] = None, report_collector: Optional[ReportCollector] = None, primitive_config_file: Optional[str] = None, subcircuit_dialect = None, bridge_file_name: Optional[str] = None):
+    def __init__(self, fmt, file_type: str = "", includes: list = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None, log_file: Optional[str] = None, report_collector: Optional[ReportCollector] = None, primitive_config_file: Optional[str] = None, subcircuit_dialect = None, bridge_file_name: Optional[str] = None, show_progress: bool = False, progress_desc: Optional[str] = None, apply_statistics: bool = True):
         self.fmt = fmt
         self.file_type = file_type
         self.includes = includes or []  # List of (file, section) tuples for .lib statements
@@ -112,6 +112,9 @@ class WriteOptions:
         self.primitive_config_file = primitive_config_file  # Optional path to config file for primitive detection overrides (xschem)
         self.subcircuit_dialect = subcircuit_dialect  # Optional dialect for bridge file generation (xschem)
         self.bridge_file_name = bridge_file_name  # Optional custom name for bridge file (xschem)
+        self.show_progress = show_progress  # Enable progress bar during netlisting (requires tqdm)
+        self.progress_desc = progress_desc  # Optional progress bar description
+        self.apply_statistics = apply_statistics  # Apply statistics variations in netlister (Xyce); disable if already applied upstream
 
 def _write_log_file(warnings: List[Tuple[str, Optional[str]]], log_path: str, src_info: Optional[str] = None, dest_info: Optional[str] = None) -> None:
     """Write collected warnings to a log file.

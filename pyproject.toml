@@ -8,6 +8,7 @@ authors = ["Dan Fritchman <dan@fritch.mn>", "Nathan Slager <slagernate@gmail.com
 python = ">=3.10,<3.13"
 pydantic = "^1.7.3"
 packaging = "^22.0"
+tqdm = "^4.67.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.1"

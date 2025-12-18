@@ -269,8 +269,14 @@ class FileParser:
                     # Add BlankLine entries for each blank line
                     # BlankLine is already imported via "from .data import *"
                     for i in range(blank_count):
+                        ln = si.line - blank_count + i
+                        # Don't emit BlankLine for physical lines that were full-line comments.
+                        # Those are represented as Comment entries (including empty `//` lines).
+                        if hasattr(self.dialect_parser, "lex") and hasattr(self.dialect_parser.lex, "full_line_comment_lines"):
+                            if ln in self.dialect_parser.lex.full_line_comment_lines:
+                                continue
                         blank_line = BlankLine()
-                        blank_line.source_info = SourceInfo(line=si.line - blank_count + i, dialect=si.dialect)
+                        blank_line.source_info = SourceInfo(line=ln, dialect=si.dialect)
                         stmts.append(blank_line)
 
             try:  # Catch errors in primary parsing routines
@@ -313,66 +319,37 @@ class FileParser:
                             stmts.append(comment)
                         pending_comments.remove((stmt, after_comments))
 
-        # Add any remaining standalone comments from the comment queue
-        # But first, collect all comments that were already added as "before" or "after" comments
-        # to avoid duplicates. Use text content as the key since line numbers might differ
-        # due to how comments are associated with statements
-        already_added_comment_texts = set()
+        # Add any remaining standalone comments / blank lines from the lexer queue.
+        #
+        # Important: do NOT dedupe by comment text alone; real decks often repeat identical
+        # header lines (copyright, licensing, etc.) and also use empty `//` lines for spacing.
+        #
+        # We only skip exact duplicates by (source line, text) when we can determine them.
+        already_added = set()
         for stmt in stmts:
+            if getattr(stmt, "source_info", None) is None:
+                continue
+            si = stmt.source_info
             if isinstance(stmt, Comment):
-                # Use just the text as the key to catch duplicates even if line numbers differ
-                already_added_comment_texts.add(stmt.text)
-        
+                already_added.add((si.line, "comment", stmt.text))
+            elif isinstance(stmt, BlankLine):
+                already_added.add((si.line, "blank", ""))
+
         remaining_comments = self.dialect_parser.lex.get_queued_comments()
         for comment_text, comment_type, line_num in remaining_comments:
-            # Skip if this comment text was already added (regardless of line number)
-            if comment_text not in already_added_comment_texts:
-                comment = Comment(text=comment_text, position="standalone")
-                comment.source_info = SourceInfo(line=line_num, dialect=self.dialect_parser.enum)
-                stmts.append(comment)
-                already_added_comment_texts.add(comment_text)  # Mark as added
+            si = SourceInfo(line=line_num, dialect=self.dialect_parser.enum)
 
-        # Deduplicate comments in stmts list (remove consecutive duplicate comment sequences)
-        # This handles cases where the same comments were collected as "before" for multiple statements
-        # We look for sequences of consecutive comments and remove duplicate sequences
-        deduplicated_stmts = []
-        i = 0
-        while i < len(stmts):
-            stmt = stmts[i]
-            if isinstance(stmt, Comment):
-                # Check if this starts a sequence of comments that we've seen before
-                # Look ahead to find the end of this comment sequence
-                comment_seq = []
-                j = i
-                while j < len(stmts) and isinstance(stmts[j], Comment):
-                    comment_seq.append(stmts[j].text)
-                    j += 1
-                
-                # Check if we've seen this exact sequence before (as consecutive comments)
-                if len(comment_seq) > 0:
-                    # Check previous entries for the same sequence
-                    found_duplicate = False
-                    if len(deduplicated_stmts) >= len(comment_seq):
-                        # Check if the last len(comment_seq) entries are comments matching this sequence
-                        prev_seq = [s.text for s in deduplicated_stmts[-len(comment_seq):] 
-                                   if isinstance(s, Comment)]
-                        if len(prev_seq) == len(comment_seq) and prev_seq == comment_seq:
-                            found_duplicate = True
-                    
-                    if found_duplicate:
-                        # Skip this duplicate sequence
-                        i = j
-                        continue
-                
-                # Add this comment (or sequence)
-                deduplicated_stmts.append(stmt)
-                i += 1
-            else:
-                # Always add non-comment statements
-                deduplicated_stmts.append(stmt)
-                i += 1
+            # Preserve comment-only lines (including `//`) as Comment entries.
+            txt = comment_text or ""
+            key = (line_num, "comment", txt)
+            if key in already_added:
+                continue
+            comment = Comment(text=txt, position="standalone")
+            comment.source_info = si
+            stmts.append(comment)
+            already_added.add(key)
 
-        return deduplicated_stmts
+        return stmts
 
     def parse(self, path: Path) -> Tuple[Path, List[Statement]]:
         """Parse the netlist `SourceFile` at `path`."""

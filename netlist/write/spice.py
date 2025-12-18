@@ -59,6 +59,7 @@ from ..data import (
     ModelVariant,
     ModelDef,
     LibSectionDef,
+    Library,
     Comment,
     Include,
     UseLibSection,
@@ -2207,6 +2208,13 @@ def find_matching_param(program: Program, param_name: str) -> Optional[ParamDecl
                         for param in sub_entry.params:
                             if param.name.name == param_name:
                                 return param
+            elif isinstance(entry, Library):
+                for section in entry.sections:
+                    for sub_entry in section.entries:
+                        if isinstance(sub_entry, ParamDecls):
+                            for param in sub_entry.params:
+                                if param.name.name == param_name:
+                                    return param
     
     return None
 
@@ -2457,6 +2465,138 @@ def replace_param_ref_in_expr(expr: Expr, param_name: str, replacement: Expr) ->
     return expr
 
 
+def replace_param_refs_in_expr(expr: Expr, replacements: Dict[str, Expr]) -> Expr:
+    """Recursively replace Ref nodes whose name is in `replacements`.
+
+    This is a bulk version of `replace_param_ref_in_expr`, designed so callers can
+    build a replacement-map and traverse the AST once instead of N passes.
+    """
+    if not replacements:
+        return expr
+
+    # Handle Ref nodes
+    if isinstance(expr, Ref):
+        repl = replacements.get(expr.ident.name)
+        return repl if repl is not None else expr
+
+    # Handle Call nodes
+    if isinstance(expr, Call):
+        changed = False
+        new_args = []
+        for arg in expr.args:
+            new_arg = replace_param_refs_in_expr(arg, replacements)
+            changed = changed or (new_arg is not arg)
+            new_args.append(new_arg)
+        if changed:
+            return Call(func=expr.func, args=new_args)
+        return expr
+
+    # Handle BinaryOp
+    if isinstance(expr, BinaryOp):
+        new_left = replace_param_refs_in_expr(expr.left, replacements)
+        new_right = replace_param_refs_in_expr(expr.right, replacements)
+        if new_left is not expr.left or new_right is not expr.right:
+            return BinaryOp(tp=expr.tp, left=new_left, right=new_right)
+        return expr
+
+    # Handle UnaryOp
+    if isinstance(expr, UnaryOp):
+        new_targ = replace_param_refs_in_expr(expr.targ, replacements)
+        if new_targ is not expr.targ:
+            return UnaryOp(tp=expr.tp, targ=new_targ)
+        return expr
+
+    # Handle TernOp
+    if isinstance(expr, TernOp):
+        new_cond = replace_param_refs_in_expr(expr.cond, replacements)
+        new_if_true = replace_param_refs_in_expr(expr.if_true, replacements)
+        new_if_false = replace_param_refs_in_expr(expr.if_false, replacements)
+        if (
+            new_cond is not expr.cond
+            or new_if_true is not expr.if_true
+            or new_if_false is not expr.if_false
+        ):
+            return TernOp(cond=new_cond, if_true=new_if_true, if_false=new_if_false)
+        return expr
+
+    return expr
+
+
+def replace_param_refs_in_entry_bulk(entry: Entry, replacements: Dict[str, Expr]) -> None:
+    """Bulk replace parameter references in a single Entry."""
+    if not replacements:
+        return
+
+    if isinstance(entry, ParamDecls):
+        for param in entry.params:
+            if param.default is not None:
+                param.default = replace_param_refs_in_expr(param.default, replacements)
+
+    elif isinstance(entry, SubcktDef):
+        for param in entry.params:
+            if param.default is not None:
+                param.default = replace_param_refs_in_expr(param.default, replacements)
+        for sub_entry in entry.entries:
+            replace_param_refs_in_entry_bulk(sub_entry, replacements)
+
+    elif isinstance(entry, ModelDef):
+        for param in entry.params:
+            if param.default is not None:
+                param.default = replace_param_refs_in_expr(param.default, replacements)
+
+    elif isinstance(entry, ModelVariant):
+        for param in entry.params:
+            if param.default is not None:
+                param.default = replace_param_refs_in_expr(param.default, replacements)
+
+    elif isinstance(entry, ModelFamily):
+        for variant in entry.variants:
+            for param in variant.params:
+                if param.default is not None:
+                    param.default = replace_param_refs_in_expr(param.default, replacements)
+
+    elif isinstance(entry, FunctionDef):
+        for stmt in entry.stmts:
+            if isinstance(stmt, Return):
+                stmt.val = replace_param_refs_in_expr(stmt.val, replacements)
+
+    elif isinstance(entry, Instance):
+        for param_val in entry.params:
+            param_val.val = replace_param_refs_in_expr(param_val.val, replacements)
+
+    elif isinstance(entry, Primitive):
+        for param_val in entry.kwargs:
+            param_val.val = replace_param_refs_in_expr(param_val.val, replacements)
+
+    elif isinstance(entry, Options):
+        for option in entry.vals:
+            if not isinstance(option.val, QuotedString):
+                option.val = replace_param_refs_in_expr(option.val, replacements)
+
+    elif isinstance(entry, LibSectionDef):
+        for sub_entry in entry.entries:
+            replace_param_refs_in_entry_bulk(sub_entry, replacements)
+
+    elif isinstance(entry, Library):
+        for section in entry.sections:
+            for sub_entry in section.entries:
+                replace_param_refs_in_entry_bulk(sub_entry, replacements)
+
+    else:
+        # Entry types that don't contain parameter references: Include, AhdlInclude, UseLibSection,
+        # DialectChange, Unknown, End, StatisticsBlock, Comment, BlankLine, etc.
+        return
+
+
+def replace_param_refs_in_program_bulk(program: Program, replacements: Dict[str, Expr]) -> None:
+    """Bulk replace parameter references across the entire Program in one traversal."""
+    if not replacements:
+        return
+    for file in program.files:
+        for entry in file.contents:
+            replace_param_refs_in_entry_bulk(entry, replacements)
+
+
 def replace_param_refs_in_entry(entry: Entry, param_name: str, replacement: Expr) -> None:
     """Replace parameter references in a single Entry."""
     # ParamDecls - replace in each param's default
@@ -2520,6 +2660,12 @@ def replace_param_refs_in_entry(entry: Entry, param_name: str, replacement: Expr
     elif isinstance(entry, LibSectionDef):
         for sub_entry in entry.entries:
             replace_param_refs_in_entry(sub_entry, param_name, replacement)
+
+    # Library - recurse into all sections
+    elif isinstance(entry, Library):
+        for section in entry.sections:
+            for sub_entry in section.entries:
+                replace_param_refs_in_entry(sub_entry, param_name, replacement)
     
     # Catch-all for unhandled entry types
     else:
@@ -2566,17 +2712,36 @@ def replace_param_refs_in_program(program: Program, param_name: str, replacement
                 warn(f"  {entry_type}: {count} entries, {replacements} replacements")
 
 
+def remove_param_declarations_bulk(program: Program, param_names: set[str]) -> None:
+    """Remove parameter declarations for all names in `param_names` in one traversal."""
+    if not param_names:
+        return
+
+    def _filter_entry(e: Entry) -> None:
+        if isinstance(e, ParamDecls):
+            e.params = [p for p in e.params if p.name.name not in param_names]
+        elif isinstance(e, LibSectionDef):
+            for sub in e.entries:
+                _filter_entry(sub)
+        elif isinstance(e, Library):
+            for sec in e.sections:
+                for sub in sec.entries:
+                    _filter_entry(sub)
+        elif isinstance(e, SubcktDef):
+            # SubcktDef.params are formal params; leave them alone.
+            for sub in e.entries:
+                _filter_entry(sub)
+        else:
+            return
+
+    for f in program.files:
+        for e in f.contents:
+            _filter_entry(e)
+
+
 def remove_param_declaration(program: Program, param_name: str) -> None:
-    """Remove the parameter declaration from global ParamDecls and library sections."""
-    for file in program.files:
-        for entry in file.contents:
-            if isinstance(entry, ParamDecls):
-                entry.params = [p for p in entry.params if p.name.name != param_name]
-            elif isinstance(entry, LibSectionDef):
-                # Also remove from library sections
-                for sub_entry in entry.entries:
-                    if isinstance(sub_entry, ParamDecls):
-                        sub_entry.params = [p for p in sub_entry.params if p.name.name != param_name]
+    """Remove a single parameter declaration (compat wrapper)."""
+    remove_param_declarations_bulk(program, {param_name})
 
 
 def find_alias_parameters(program: Program, target_param_name: str) -> List[ParamDecl]:
@@ -2606,6 +2771,15 @@ def find_alias_parameters(program: Program, target_param_name: str) -> List[Para
                                 if isinstance(param.default, Ref):
                                     if param.default.ident.name == target_param_name:
                                         aliases.append(param)
+            elif isinstance(entry, Library):
+                for section in entry.sections:
+                    for sub_entry in section.entries:
+                        if isinstance(sub_entry, ParamDecls):
+                            for param in sub_entry.params:
+                                if param.default is not None:
+                                    if isinstance(param.default, Ref):
+                                        if param.default.ident.name == target_param_name:
+                                            aliases.append(param)
     return aliases
 
 
@@ -2621,6 +2795,12 @@ def collect_statistics_blocks(program: Program) -> List[StatisticsBlock]:
                 for sub_entry in entry.entries:
                     if isinstance(sub_entry, StatisticsBlock):
                         stats_blocks.append(sub_entry)
+            elif isinstance(entry, Library):
+                # Also search within Spectre `library` wrappers
+                for section in entry.sections:
+                    for sub_entry in section.entries:
+                        if isinstance(sub_entry, StatisticsBlock):
+                            stats_blocks.append(sub_entry)
     return stats_blocks
 
 
@@ -2889,6 +3069,13 @@ def is_param_in_library_section(program: Program, param_name: str) -> bool:
                         for param in sub_entry.params:
                             if param.name.name == param_name:
                                 return True
+            elif isinstance(entry, Library):
+                for section in entry.sections:
+                    for sub_entry in section.entries:
+                        if isinstance(sub_entry, ParamDecls):
+                            for param in sub_entry.params:
+                                if param.name.name == param_name:
+                                    return True
     return False
 
 
@@ -2916,6 +3103,11 @@ def find_lib_section_with_stats(program: Program, stats: StatisticsBlock) -> Opt
                 for sub_entry in entry.entries:
                     if isinstance(sub_entry, StatisticsBlock) and sub_entry is stats:
                         return entry
+            elif isinstance(entry, Library):
+                for section in entry.sections:
+                    for sub_entry in section.entries:
+                        if isinstance(sub_entry, StatisticsBlock) and sub_entry is stats:
+                            return section
     return None
 
 
@@ -2992,6 +3184,11 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
                 for sub_entry in entry.entries:
                     if isinstance(sub_entry, StatisticsBlock):
                         stats_parent_entries[id(sub_entry)] = entry.entries
+            elif isinstance(entry, Library):
+                for section in entry.sections:
+                    for sub_entry in section.entries:
+                        if isinstance(sub_entry, StatisticsBlock):
+                            stats_parent_entries[id(sub_entry)] = section.entries
 
     # Process each statistics block
     for stats in stats_blocks:
@@ -3065,50 +3262,35 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
                 # Replace all references to original parameters with __process__ version
                 # Note: Process variations are applied BEFORE mismatch variations (see line 1496),
                 # ensuring we always get __process____mismatch__ and never __mismatch____process__
+                # Bulk replacement (single traversal) for all process-varied params and their aliases.
+                # This avoids O(N * program_size) passes for large PDK decks.
+                process_replacements: Dict[str, Expr] = {}
+                alias_names_to_remove: List[str] = []
                 for param_name, _ in process_variations:
-                    # Find alias parameters BEFORE doing replacement (they reference the original param name)
-                    # For example, if sw_tox_lv = sw_tox_lv_corner, then sw_tox_lv is an alias
-                    # When sw_tox_lv_corner is replaced with sw_tox_lv_corner__process__,
-                    # we should also replace all uses of sw_tox_lv with sw_tox_lv_corner__process__
-                    alias_params = find_alias_parameters(program, param_name)
-                    alias_names = [alias.name.name for alias in alias_params]
-                    
-                    # Replace all references to the original parameter with the __process__ version
-                    # This applies to both global and library section parameters
                     process_param_ref = Ref(ident=Ident(f"{param_name}__process__"))
-                    replace_param_refs_in_program(program, param_name, process_param_ref)
-                    
-                    # Verify replacement was successful
-                    remaining_refs = debug_find_all_param_refs(program, param_name)
-                    if remaining_refs:
-                        warn(f"WARNING: {len(remaining_refs)} references to {param_name} still exist after replacement")
-                        # Log first few locations for debugging
-                        for loc, expr in remaining_refs[:5]:
-                            warn(f"  Unreplaced reference at: {loc}")
-                        if len(remaining_refs) > 5:
-                            warn(f"  ... and {len(remaining_refs) - 5} more locations")
-                    
-                    # Now handle alias parameters: replace all uses of aliases with the __process__ version
-                    for alias_name in alias_names:
-                        # Replace all uses of the alias with the __process__ version
-                        replace_param_refs_in_program(program, alias_name, process_param_ref)
-                        
-                        # Verify alias replacement was successful
-                        remaining_alias_refs = debug_find_all_param_refs(program, alias_name)
-                        if remaining_alias_refs:
-                            warn(f"WARNING: {len(remaining_alias_refs)} references to {alias_name} still exist after replacement")
-                            for loc, expr in remaining_alias_refs[:5]:
-                                warn(f"  Unreplaced alias reference at: {loc}")
-                        
-                        # Remove the alias parameter declaration
-                        remove_param_declaration(program, alias_name)
-                    
-                    # Remove the original parameter declaration only for global parameters
-                    # Library section parameters are kept (they're needed for the relative expressions)
+                    process_replacements[param_name] = process_param_ref
+
+                    # Alias parameters are simple refs to the target; replace their uses too.
+                    for alias in find_alias_parameters(program, param_name):
+                        alias_name = alias.name.name
+                        process_replacements[alias_name] = process_param_ref
+                        alias_names_to_remove.append(alias_name)
+
+                replace_param_refs_in_program_bulk(program, process_replacements)
+
+                # Remove alias parameter declarations in a single traversal.
+                remove_param_declarations_bulk(program, set(alias_names_to_remove))
+
+                # Remove the original parameter declaration only for global parameters.
+                # Library section parameters are kept (they're needed for the relative expressions).
+                global_param_names_to_remove: set[str] = set()
+                for param_name, _ in process_variations:
                     if param_name in local_process_params and lib_section:
                         _remove_param_declaration_from_entries(lib_section.entries, param_name)
                     elif not is_param_in_library_section(program, param_name):
-                        remove_param_declaration(program, param_name)
+                        global_param_names_to_remove.add(param_name)
+
+                remove_param_declarations_bulk(program, global_param_names_to_remove)
             
             # Special handling for library sections with includes (common PDK pattern)
             # For sections that include other sections, parameters defined in the including section
@@ -3289,16 +3471,19 @@ def create_mismatch_function(var: Variation, idx: int, original_expr: Optional[E
     base_expr = original_expr if original_expr is not None else Int(0)
     enable_mismatch_ref = Ref(ident=Ident("enable_mismatch"))
     mismatch_factor_ref = Ref(ident=Ident("mismatch_factor"))
+    # Scale each variation's sigma by the global mismatch_factor:
+    # sigma = mismatch_factor * var.std
+    sigma_expr = BinaryOp(tp=BinaryOperator.MUL, left=mismatch_factor_ref, right=var.std)
 
     if 'gauss' in dist_type_lower:
         dist_call = Call(
             func=Ref(ident=Ident("gauss")),
-            args=[Int(0), mismatch_factor_ref]
+            args=[Int(0), sigma_expr]
         )
     elif 'lnorm' in dist_type_lower:
         dist_call = Call(
             func=Ref(ident=Ident("lnorm")),
-            args=[Int(0), mismatch_factor_ref]
+            args=[Int(0), sigma_expr]
         )
     else:
         return None
@@ -3357,18 +3542,16 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_b
         else:
             # Process param not found, fall back to original
             matching_param = find_matching_param(program, param_name)
-            if not matching_param:
-                warn(f"Process variation parameter '{process_param_name}' not found for mismatch variation '{param_name}'. Skipping.")
-                return
-            original_expr = matching_param.default or Int(0)
+            # If the parameter isn't declared anywhere, treat it as a pure random variable
+            # with nominal 0 (common Spectre `statistics mismatch { vary <name> ... }` pattern).
+            original_expr = matching_param.default if (matching_param and matching_param.default is not None) else Int(0)
             mismatch_param_name = f"{param_name}__mismatch__(dummy_param)"
     else:
         # No process variation - use original parameter
         matching_param = find_matching_param(program, param_name)
-        if not matching_param:
-            warn(f"No matching parameter found for mismatch variation '{param_name}'. Skipping.")
-            return
-        original_expr = matching_param.default or Int(0)
+        # If the parameter isn't declared anywhere, treat it as a pure random variable
+        # with nominal 0 (common Spectre `statistics mismatch { vary <name> ... }` pattern).
+        original_expr = matching_param.default if (matching_param and matching_param.default is not None) else Int(0)
         mismatch_param_name = f"{param_name}__mismatch__(dummy_param)"
 
     # Create mismatch function with the correct name
@@ -3445,13 +3628,102 @@ def apply_mismatch_variation(program: Program, var: Variation, idx: int, stats_b
 
 def apply_all_mismatch_variations(program: Program, stats_blocks: List[StatisticsBlock], output_format: Optional["NetlistDialects"] = None, stats_parent_entries: Optional[Dict[int, List[Entry]]] = None) -> None:
     """Apply all mismatch variations from statistics blocks (Xyce/ngspice-specific)."""
-
     mismatch_idx = 0
+
+    # Build replacement-map and deletion-set, then apply each in a single traversal.
+    replacements: Dict[str, Expr] = {}
+    param_names_to_remove: set[str] = set()
+
     for stats in stats_blocks:
-        if stats.mismatch:
-            for var in stats.mismatch:
-                apply_mismatch_variation(program, var, mismatch_idx, stats_blocks, output_format=output_format, stats_parent_entries=stats_parent_entries)
-                mismatch_idx += 1
+        if not stats.mismatch:
+            continue
+
+        # Find the container that held this StatisticsBlock (captured before replacement).
+        target_entries: Optional[List[Entry]] = None
+        if stats_parent_entries is not None:
+            target_entries = stats_parent_entries.get(id(stats))
+        if target_entries is None:
+            # Fallback: choose the first file containing any StatisticsBlock, else first file.
+            stats_file = None
+            for f in program.files:
+                if any(isinstance(e, StatisticsBlock) for e in f.contents):
+                    stats_file = f
+                    break
+            if stats_file is None:
+                stats_file = program.files[0]
+            target_entries = stats_file.contents
+
+        for var in stats.mismatch:
+            param_name = var.name.name
+            has_process = is_param_in_process_variations(stats_blocks, param_name)
+
+            # Determine the "base" expression for mismatch. If the parameter isn't declared,
+            # treat it as a pure random variable with nominal 0 (common Spectre PDK pattern).
+            original_expr: Expr
+            mismatch_param_name = f"{param_name}__mismatch__(dummy_param)"
+            if has_process:
+                process_param_name = f"{param_name}__process__"
+                process_param = find_matching_param(program, process_param_name)
+                if process_param and process_param.default is not None:
+                    original_expr = process_param.default
+                    mismatch_param_name = f"{param_name}__process____mismatch__(dummy_param)"
+                else:
+                    matching_param = find_matching_param(program, param_name)
+                    original_expr = matching_param.default if (matching_param and matching_param.default is not None) else Int(0)
+            else:
+                matching_param = find_matching_param(program, param_name)
+                original_expr = matching_param.default if (matching_param and matching_param.default is not None) else Int(0)
+
+            mismatch_param = create_mismatch_function(
+                var,
+                mismatch_idx,
+                original_expr=original_expr,
+                output_format=output_format,
+            )
+            mismatch_idx += 1
+            if not mismatch_param:
+                continue
+
+            # Update name if it has process variation
+            if has_process:
+                mismatch_param.name = Ident(mismatch_param_name)
+
+            # Insert the generated param function near the top of the chosen container
+            found_paramdecls = None
+            insert_idx = 0
+            for i, entry in enumerate(target_entries):
+                if isinstance(entry, ParamDecls):
+                    # If this container already holds param functions, extend it
+                    if entry.params and any('(' in p.name.name for p in entry.params):
+                        found_paramdecls = entry
+                    insert_idx = i + 1
+                    continue
+                insert_idx = i
+                break
+
+            if found_paramdecls:
+                found_paramdecls.params.append(mismatch_param)
+            else:
+                target_entries.insert(insert_idx, ParamDecls(params=[mismatch_param]))
+
+            # Build param function call used as replacement (with dummy argument)
+            base_name = mismatch_param.name.name.split('(')[0]
+            param_call = Call(func=Ref(ident=Ident(base_name)), args=[Int(0)])
+
+            # Replace references:
+            # - If the parameter has process variation, process ran first and replaced uses of
+            #   `param_name` with `param_name__process__`, so mismatch must replace the __process__ name.
+            # - Otherwise replace the original.
+            target_name = f"{param_name}__process__" if has_process else param_name
+            replacements[target_name] = param_call
+            param_names_to_remove.add(target_name)
+            if has_process:
+                # Also remove the original parameter declaration (it was updated to reference __process__)
+                param_names_to_remove.add(param_name)
+
+    # Apply replacements once, then remove declarations once.
+    replace_param_refs_in_program_bulk(program, replacements)
+    remove_param_declarations_bulk(program, param_names_to_remove)
 
 
 def apply_statistics_variations(program: Program, output_format: Optional["NetlistDialects"] = None) -> None:

@@ -143,6 +143,9 @@ class Lexer:
         self.current_line_comments: List[Tuple[str, str]] = []  # (comment_text, comment_type)
         # Persistent queue of comments that haven't been retrieved yet
         self.comment_queue: List[Tuple[str, str, int]] = []  # (comment_text, comment_type, line_num)
+        # Track line numbers which were *full-line* comments (comment began before any non-whitespace token).
+        # Used to prevent these lines from also being treated as blank lines downstream.
+        self.full_line_comment_lines: set[int] = set()
         # Track if current line ends with backslash (for continuation)
         self.current_line_ends_with_backslash = False
 
@@ -210,6 +213,10 @@ class Lexer:
                 cleaned_text = cleaned_text.rstrip('\n\r')
                 
                 if cleaned_text or cleaned_text == "":  # Store even empty comments to preserve structure
+                    # If we haven't lexed any non-whitespace token on this line yet, this was a full-line comment.
+                    # Mark it so the parser won't also emit a BlankLine for the same physical line.
+                    if not self.lexed_nonwhite_on_this_line:
+                        self.full_line_comment_lines.add(self.line_num)
                     self.current_line_comments.append((cleaned_text, comment_type))
                     # Also add to persistent queue
                     self.comment_queue.append((cleaned_text, comment_type, self.line_num))
@@ -274,23 +281,26 @@ class Lexer:
                 # Clear current_line_comments for next line, but keep in queue
                 self.current_line_comments.clear()
 
-                # Loop until a non-blank-line, non-comment, non-continuation token
+                # Pull the next token (potentially skipping whitespace/comments), but
+                # DO NOT collapse multiple NEWLINEs into one. We want the parser to
+                # see each physical newline so it can preserve blank lines and
+                # comment-only lines accurately.
                 token = self.eat_idle(self.nxt())
-                while token and token.tp in (
-                    Tokens.NEWLINE,
-                    Tokens.WHITE,
-                ):
+
+                # Skip whitespace on the *next* line to detect plus-continuations,
+                # but do not skip NEWLINE tokens (those represent real blank lines).
+                while token and token.tp == Tokens.WHITE:
                     token = self.eat_idle(self.nxt())
 
                 if token and token.tp == Tokens.PLUS:
-                    # Cancelled newline; skip to next token
+                    # Cancelled newline; skip the PLUS and continue on the same statement.
                     self.lexed_nonwhite_on_this_line = True
                     token = self.nxt()
-                else:
-                    # Non-cancelled newline; yield the (already-passed) NEWLINE
-                    # Next loop-pass will get the first token on the next line
-                    yield Token(Tokens.NEWLINE, "\n")
-                continue  # Either way, restart this loop body
+                    continue
+
+                # Non-cancelled newline; yield this NEWLINE and continue parsing.
+                yield Token(Tokens.NEWLINE, "\n")
+                continue
 
             self.lexed_nonwhite_on_this_line = True
             yield token

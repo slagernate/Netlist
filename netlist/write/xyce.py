@@ -135,7 +135,8 @@ class XyceNetlister(SpiceNetlister):
 
         # Apply statistics variations with XYCE format before writing
         # This modifies the AST directly, replacing StatisticsBlocks with generated content
-        apply_statistics_variations(self.src, output_format=NetlistDialects.XYCE)
+        if self.options is None or getattr(self.options, "apply_statistics", True):
+            apply_statistics_variations(self.src, output_format=NetlistDialects.XYCE)
 
         # Call parent implementation to do the actual writing
         super().netlist()
@@ -218,6 +219,41 @@ class XyceNetlister(SpiceNetlister):
         self.write(".print tran V(*)\n")
         self.write(".end\n")
 
+    def write_use_lib(self, uselib) -> None:
+        """Write a sectioned library-usage (.lib <file> <section>).
+
+        Many Spectre PDK decks self-reference their source file via:
+          include "<thisfile>.scs" section=<name>
+        which parses to `UseLibSection(path=<thisfile>.scs, section=<name>)`.
+
+        When converting 1:1 into `<thisfile>.lib.cir`, those self-references must be
+        rewritten to point at the converted output, otherwise Xyce will try (and fail)
+        to include the original Spectre `.scs` file.
+        """
+        from pathlib import Path
+        from ..data import UseLibSection
+
+        if isinstance(uselib, UseLibSection):
+            src0 = None
+            if self.src.files:
+                try:
+                    src0 = Path(self.src.files[0].path)
+                except Exception:
+                    src0 = None
+
+            p = Path(uselib.path)
+            if src0 is not None and p.suffix == ".scs":
+                # Rewrite self-references (match by basename, and also tolerate relative paths).
+                if p.name == src0.name or p.stem == src0.stem:
+                    p = Path(p.name).with_suffix(".lib.cir")
+
+            # Use the same formatting as the base SpiceNetlister, but with our potentially rewritten path.
+            self.write(f".lib {str(p)} {self.format_ident(uselib.section)} \n\n")
+            return
+
+        # Fallback to base implementation for unexpected types
+        return super().write_use_lib(uselib)
+
     def _validate_content(self) -> None:
         """Validate that the program content matches the expected file_type."""
 
@@ -237,9 +273,22 @@ class XyceNetlister(SpiceNetlister):
     def write_library_section(self, section: LibSectionDef) -> None:
         """Write a Library Section definition."""
         # Write library section normally (no process variations here)
-        self.write(f".lib {self.format_ident(section.name)}\n")
+        section_name = self.format_ident(section.name)
+        self.write(f".lib {section_name}\n")
+        pbar = None
+        if self.options is not None and getattr(self.options, "show_progress", False):
+            try:
+                from tqdm import tqdm  # type: ignore
+                base_desc = getattr(self.options, "progress_desc", None) or "xyce:library"
+                pbar = tqdm(total=len(section.entries), desc=f"{base_desc}:{section_name}", unit="entry", mininterval=0.2, leave=False)
+            except Exception:
+                pbar = None
         for entry in section.entries:
             self.write_entry(entry)
+            if pbar is not None:
+                pbar.update(1)
+        if pbar is not None:
+            pbar.close()
         self.write(f".endl {self.format_ident(section.name)}\n\n")
 
     def write_library(self, library) -> None:
@@ -289,8 +338,8 @@ class XyceNetlister(SpiceNetlister):
              if hasattr(ref.resolved, 'variants') and ref.resolved.variants:
                  return ref.resolved.variants[0].mtype.name.lower()
         
-        # Search program
-        from ..data import ModelDef, ModelFamily, ModelVariant, LibSectionDef, SubcktDef
+        # Search program (must recurse into library sections and subcircuits)
+        from ..data import ModelDef, ModelFamily, ModelVariant, LibSectionDef, SubcktDef, Library
         
         def check_entry(entry):
             if isinstance(entry, ModelDef) and entry.name.name.lower() == model_name.lower():
@@ -302,20 +351,39 @@ class XyceNetlister(SpiceNetlister):
                      return entry.mtype.name.lower()
             return None
 
+        def visit(entry) -> Optional[str]:
+            mtype = check_entry(entry)
+            if mtype:
+                return mtype
+
+            if isinstance(entry, Library):
+                for sec in entry.sections:
+                    mtype = visit(sec)
+                    if mtype:
+                        return mtype
+                return None
+
+            if isinstance(entry, LibSectionDef):
+                for e in entry.entries:
+                    mtype = visit(e)
+                    if mtype:
+                        return mtype
+                return None
+
+            if isinstance(entry, SubcktDef):
+                for e in entry.entries:
+                    mtype = visit(e)
+                    if mtype:
+                        return mtype
+                return None
+
+            return None
+
         for file in self.src.files:
             for entry in file.contents:
-                mtype = check_entry(entry)
-                if mtype: return mtype
-                
-                if isinstance(entry, LibSectionDef):
-                    for e in entry.entries:
-                        mtype = check_entry(e)
-                        if mtype: return mtype
-                
-                if isinstance(entry, SubcktDef):
-                    for e in entry.entries:
-                        mtype = check_entry(e)
-                        if mtype: return mtype
+                mtype = visit(entry)
+                if mtype:
+                    return mtype
         return None
 
     def _get_module_definition(self, ref: Ref) -> Optional[Union[SubcktDef, ModelDef, ModelFamily, ModelVariant]]:
@@ -329,8 +397,8 @@ class XyceNetlister(SpiceNetlister):
             if isinstance(ref.resolved, (SubcktDef, ModelDef, ModelFamily, ModelVariant)):
                 return ref.resolved
         
-        # Search program
-        from ..data import ModelDef, ModelFamily, ModelVariant, LibSectionDef, SubcktDef
+        # Search program (must recurse into library sections and subcircuits)
+        from ..data import ModelDef, ModelFamily, ModelVariant, LibSectionDef, SubcktDef, Library
         module_name = ref.ident.name
         
         def find_entry(entry):
@@ -341,20 +409,39 @@ class XyceNetlister(SpiceNetlister):
                     return entry
             return None
 
+        def visit(entry):
+            result = find_entry(entry)
+            if result:
+                return result
+
+            if isinstance(entry, Library):
+                for sec in entry.sections:
+                    result = visit(sec)
+                    if result:
+                        return result
+                return None
+
+            if isinstance(entry, LibSectionDef):
+                for e in entry.entries:
+                    result = visit(e)
+                    if result:
+                        return result
+                return None
+
+            if isinstance(entry, SubcktDef):
+                for e in entry.entries:
+                    result = visit(e)
+                    if result:
+                        return result
+                return None
+
+            return None
+
         for file in self.src.files:
             for entry in file.contents:
-                result = find_entry(entry)
-                if result: return result
-                
-                if isinstance(entry, LibSectionDef):
-                    for e in entry.entries:
-                        result = find_entry(e)
-                        if result: return result
-                
-                if isinstance(entry, SubcktDef):
-                    for e in entry.entries:
-                        result = find_entry(e)
-                        if result: return result
+                result = visit(entry)
+                if result:
+                    return result
         return None
 
     def _is_default_param_value(self, pval: ParamVal, module_def: Optional[Union[SubcktDef, ModelDef, ModelFamily, ModelVariant]]) -> bool:
@@ -403,6 +490,42 @@ class XyceNetlister(SpiceNetlister):
         pval_str = self.format_expr(pval.val)
         default_str = self.format_expr(default_param.default)
         return pval_str == default_str
+
+    def write_param_decls(self, params: ParamDecls) -> None:
+        """Write parameter declarations for Xyce.
+
+        Xyce supports parameter *functions* via:
+          .func name(args) {expr}
+
+        Our statistics/mismatch flow represents these as ParamDecl where the formatted name
+        includes parentheses, e.g. `par1nrf__mismatch__(dummy_param)`.
+        """
+        for p in params.params:
+            param_name = self.format_ident(p.name)
+
+            # Param "functions" must be emitted as .func in Xyce.
+            if "(" in param_name and param_name.endswith(")"):
+                if p.default is None:
+                    default_str = "0"
+                else:
+                    if isinstance(p.default, str):
+                        default_str = p.default
+                    else:
+                        default_str = self.format_expr(p.default)
+
+                    # Strip outer braces/quotes if present so we can wrap in { }
+                    if (default_str.startswith("{") and default_str.endswith("}")) or (
+                        default_str.startswith("'") and default_str.endswith("'")
+                    ):
+                        default_str = default_str[1:-1]
+
+                self.write(f".func {param_name} {{{default_str}}}\n")
+                continue
+
+            # Normal parameters
+            self.write(".param ")
+            self.write_param_decl(p)
+            self.write("\n")
 
     def write_instance_params(self, pvals: List[ParamVal], is_mos_like: bool = False, module_ref: Optional[Ref] = None) -> None:
         """Write the parameter-values for Instance `pinst`.
@@ -578,7 +701,25 @@ class XyceNetlister(SpiceNetlister):
 
         # Write the sub-circuit/model name (skip for resistor/capacitor/inductor)
         if not skip_model_name:
-            self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
+            module_name = self.format_ident(pinst.module.ident)
+            module_ref = pinst.module if isinstance(pinst.module, Ref) else None
+
+            # If this is a model reference, prefer the fully-qualified variant name (e.g. nch_rf.1)
+            # so instance model names match the emitted .model cards.
+            if module_ref is not None and is_model:
+                from ..data import ModelVariant, ModelFamily, ModelDef
+
+                resolved = self._get_module_definition(module_ref)
+                if isinstance(resolved, ModelVariant):
+                    module_name = f"{resolved.model.name}.{resolved.variant.name}"
+                elif isinstance(resolved, ModelFamily) and getattr(resolved, "variants", None):
+                    v0 = resolved.variants[0]
+                    if hasattr(v0, "model") and hasattr(v0, "variant"):
+                        module_name = f"{v0.model.name}.{v0.variant.name}"
+                elif isinstance(resolved, ModelDef):
+                    module_name = resolved.name.name
+
+            self.write("+ " + module_name + " \n")
 
         # Check if instance parameter expressions reference 'm' and add m={m} if needed
         has_m_in_params = any(p.name.name == "m" for p in pinst.params)
@@ -738,8 +879,11 @@ class XyceNetlister(SpiceNetlister):
         
         Preserves exact whitespace from comment text - if comment already has
         leading whitespace, don't add an extra space after semicolon."""
+        # Empty comment-only line (e.g. `//`) => emit bare `;` line.
+        if comment == "":
+            self.write(";\n")
         # If comment starts with whitespace, preserve it exactly (don't add extra space)
-        if comment and comment[0].isspace():
+        elif comment and comment[0].isspace():
             self.write(f";{comment}\n")
         else:
             # No leading whitespace, add standard space after semicolon
