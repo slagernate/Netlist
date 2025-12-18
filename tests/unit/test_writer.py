@@ -1100,9 +1100,12 @@ def test_bsim4_deltox_filtering_in_subckt():
                  options=WriteOptions(fmt=NetlistDialects.XYCE))
     output_str = output.getvalue()
     instance_section = output_str.split("Mtest_pmos")[1].split("\n\n")[0]
+    # deltox and delvto should be removed from instance (converted to dtox on model and dvth0 as subcircuit param)
     assert "deltox=" not in instance_section and "dtox=" not in instance_section
+    assert "delvto=" not in instance_section
     assert "l=" in instance_section and "w=" in instance_section
-    assert "delvto=" in instance_section
+    # Check that dvth0 was added as a subcircuit parameter (should be in PARAMS: line)
+    assert "dvth0" in output_str, f"Expected dvth0 parameter in output, got: {output_str[:500]}"
 
 
 def test_xyce_parameter_reference_braces():
