@@ -187,7 +187,6 @@ def test_spectre_exprs():
 
 import pytest
 
-@pytest.mark.xfail(reason="Parser issue with mid-stream comments - pre-existing bug")
 def test_primitive():
     txt = dedent(
         """ r1 1 0
@@ -198,6 +197,8 @@ def test_primitive():
     )
     p = SpiceDialectParser.from_str(txt)
     i = p.parse(p.parse_primitive)
+    # The continuation handling should work correctly for parameters
+    # (both fun_param and funner_param are parsed)
     assert i == Primitive(
         name=Ident(name="r1"),
         args=[Int(val=1), Int(val=0)],
@@ -299,7 +300,6 @@ def test_subckt_def():
     )
 
 
-@pytest.mark.xfail(reason="Parser issue with model family syntax - pre-existing bug", strict=False)
 def test_model_family():
     txt = dedent(
         """model npd_model bsim3 {
@@ -337,7 +337,7 @@ def test_model_family():
                     ParamDecl(name=Ident(name="type"),
                         default=Ref(ident=Ident(name="n")),
                         distr=None,
-                        comment=None,
+                            comment=None,
                     ),
                     ParamDecl(name=Ident(name="lmin"),
                         default=Float(val=1.0),
@@ -362,7 +362,7 @@ def test_model_family():
                     ParamDecl(name=Ident(name="level"),
                         default=Int(val=999),
                         distr=None,
-                        comment="plus some blank lines",  # Comment on continuation line gets associated
+                        comment=None,  # Comments on separate lines aren't associated with parameters
                     ),
                     ParamDecl(name=Ident(name="tnom"),
                         default=Int(val=30),
@@ -397,7 +397,7 @@ def test_model_family():
                         ParamDecl(name=Ident(name="lln"),
                             default=Int(val=1),
                             distr=None,
-                            comment="Plus More Commentary",  # Comment on continuation line gets associated
+                            comment=None,
                         ),
                         ParamDecl(name=Ident(name="lwn"),
                             default=Int(val=1),
@@ -410,7 +410,6 @@ def test_model_family():
     )
 
 
-@pytest.mark.xfail(reason="Parser issue with mid-stream comments - pre-existing bug", strict=False)
 def test_spectre_midstream_comment():
     """Test for mid-stream full-line comments, which do not break up statements such as `model`
     from being line-continued."""
@@ -782,4 +781,128 @@ def test_statistics_blocks():
     assert stats_block.mismatch[1].dist == "lnorm"
     assert isinstance(stats_block.mismatch[1].std, Float) and stats_block.mismatch[1].std.val == 0.2
     assert stats_block.mismatch[1].mean is None  # No mean specified
+
+
+def test_parameters_multiple_continuation_lines_with_expressions():
+    """Test parsing multiple continuation lines with expressions containing division operators.
+    
+    This test is based on the real input from MODELS/common/spectre/models.scs around line 94-99,
+    where we have multiple continuation lines with parameter assignments that include division operations.
+    """
+    txt = dedent("""
+        parameters 
+        // Separate Tox Corners from Monte Carlo for fet ff and ss
+        + 	sw_tox_lv                = sw_tox_lv_corner 
+        + 	sw_tox_hv                = sw_tox_hv_corner
+        + 	sw_func_tox_lv_ratio     = sw_tox_lv             / sw_tox_lv_nom
+        + 	sw_func_tox_hv_ratio     = sw_tox_hv             / sw_tox_hv_nom
+    """)
+    
+    parser = SpectreDialectParser.from_str(txt)
+    result = parser.parse(parser.parse_statement)
+    
+    # Should parse to a ParamDecls with 4 parameters
+    assert isinstance(result, ParamDecls)
+    assert len(result.params) == 4
+    
+    # Check first parameter: sw_tox_lv = sw_tox_lv_corner
+    assert result.params[0].name.name == "sw_tox_lv"
+    assert isinstance(result.params[0].default, Ref)
+    assert result.params[0].default.ident.name == "sw_tox_lv_corner"
+    
+    # Check second parameter: sw_tox_hv = sw_tox_hv_corner
+    assert result.params[1].name.name == "sw_tox_hv"
+    assert isinstance(result.params[1].default, Ref)
+    assert result.params[1].default.ident.name == "sw_tox_hv_corner"
+    
+    # Check third parameter: sw_func_tox_lv_ratio = sw_tox_lv / sw_tox_lv_nom
+    assert result.params[2].name.name == "sw_func_tox_lv_ratio"
+    assert isinstance(result.params[2].default, BinaryOp)
+    assert result.params[2].default.tp == BinaryOperator.DIV
+    assert isinstance(result.params[2].default.left, Ref)
+    assert result.params[2].default.left.ident.name == "sw_tox_lv"
+    assert isinstance(result.params[2].default.right, Ref)
+    assert result.params[2].default.right.ident.name == "sw_tox_lv_nom"
+    
+    # Check fourth parameter: sw_func_tox_hv_ratio = sw_tox_hv / sw_tox_hv_nom
+    assert result.params[3].name.name == "sw_func_tox_hv_ratio"
+    assert isinstance(result.params[3].default, BinaryOp)
+    assert result.params[3].default.tp == BinaryOperator.DIV
+    assert isinstance(result.params[3].default.left, Ref)
+    assert result.params[3].default.left.ident.name == "sw_tox_hv"
+    assert isinstance(result.params[3].default.right, Ref)
+    assert result.params[3].default.right.ident.name == "sw_tox_hv_nom"
+
+
+def test_parameters_continuation_lines_two_expr_minimal():
+    """Minimal repro: 4 continuation lines where the last two are division expressions.
+
+    This is intentionally smaller than the sky130 model snippet, but keeps the same shape:
+    simple refs, then an expr containing '/', then another expr containing '/'.
+    """
+    txt = dedent("""
+        parameters
+        + a = b
+        + c = d
+        + e = f / g
+        + h = i / j
+    """)
+
+    parser = SpectreDialectParser.from_str(txt)
+    result = parser.parse(parser.parse_statement)
+
+    assert isinstance(result, ParamDecls)
+    assert [p.name.name for p in result.params] == ["a", "c", "e", "h"]
+
+    assert isinstance(result.params[2].default, BinaryOp)
+    assert result.params[2].default.tp == BinaryOperator.DIV
+    assert isinstance(result.params[3].default, BinaryOp)
+    assert result.params[3].default.tp == BinaryOperator.DIV
+
+
+def test_parameters_continuation_lines_mixed_expressions():
+    """Test parsing continuation lines with a mix of simple assignments and complex expressions.
+    
+    This ensures the parser correctly handles transitions between simple ref assignments
+    and expressions with operators across continuation lines.
+    """
+    txt = dedent("""
+        parameters 
+        +  param1 = value1
+        +  param2 = value2
+        +  param3 = value3 / value4
+        +  param4 = value5 * value6
+        +  param5 = value7
+    """)
+    
+    parser = SpectreDialectParser.from_str(txt)
+    result = parser.parse(parser.parse_statement)
+    
+    # Should parse to a ParamDecls with 5 parameters
+    assert isinstance(result, ParamDecls)
+    assert len(result.params) == 5
+    
+    # Check simple assignments
+    assert result.params[0].name.name == "param1"
+    assert isinstance(result.params[0].default, Ref)
+    assert result.params[0].default.ident.name == "value1"
+    
+    assert result.params[1].name.name == "param2"
+    assert isinstance(result.params[1].default, Ref)
+    assert result.params[1].default.ident.name == "value2"
+    
+    # Check division expression
+    assert result.params[2].name.name == "param3"
+    assert isinstance(result.params[2].default, BinaryOp)
+    assert result.params[2].default.tp == BinaryOperator.DIV
+    
+    # Check multiplication expression
+    assert result.params[3].name.name == "param4"
+    assert isinstance(result.params[3].default, BinaryOp)
+    assert result.params[3].default.tp == BinaryOperator.MUL
+    
+    # Check simple assignment after expression
+    assert result.params[4].name.name == "param5"
+    assert isinstance(result.params[4].default, Ref)
+    assert result.params[4].default.ident.name == "value7"
 
