@@ -193,6 +193,18 @@ class XyceNetlister(SpiceNetlister):
         # Get the base name
         if isinstance(ident_or_ref, Ref):
             name = ident_or_ref.ident.name
+            # IMPORTANT:
+            # If a `foo__process__` parameter exists, downstream references should prefer
+            # `foo__process__` over `foo` so process variation actually propagates.
+            #
+            # But when *defining* `foo__process__ = f(foo, ...)`, we must *not* rewrite
+            # the inner `foo` reference, or we create a self-reference loop.
+            if (
+                not getattr(self, "_disable_process_ref_map", False)
+                and not name.endswith("__process__")
+                and f"{name.lower()}__process__" in getattr(self, "_param_names", set())
+            ):
+                name = f"{name}__process__"
         else:
             name = ident_or_ref.name
         
@@ -473,12 +485,14 @@ class XyceNetlister(SpiceNetlister):
         for section in library.sections:
             self.write_library_section(section)
 
-    def write_module_params(self, params: List[ParamDecl]) -> None:
+    def write_module_params(self, params: List[ParamDecl], *, inline: bool = False) -> None:
         """Write the parameter declarations for Module `module`.
         Parameter declaration format:
         .SUBCKT <name> <ports>
-        + PARAMS: name1=val1
-        + name2=val2 name3=val3 ...
+        [ PARAMS: name1=val1 ]  (inline if requested)
+        + name2=val2
+        + name3=val3
+        Each parameter on its own line to avoid comment issues.
         """
         if not params:
             self.write("+ ")
@@ -486,12 +500,44 @@ class XyceNetlister(SpiceNetlister):
             self.write("\n")
             return
 
-        # Unit tests expect subcircuit parameters to appear on the PARAMS line.
+        if inline:
+            # Xyce: put *all* subckt params on the `.SUBCKT ... PARAMS:` line.
+            # Do NOT emit inline comments on this line, as they would comment-out trailing params.
+            self.write(" PARAMS: ")
+            for i, param in enumerate(params):
+                if i:
+                    self.write(" ")
+                # Many S130 subckts use microns for L/W, but some Spectre defaults come through as
+                # metric-suffixed values (e.g. w=60u). For Xyce/BSIM4 here we want unitless microns,
+                # so strip the 'u' suffix for L/W defaults in subckt headers.
+                p = param
+                if p.name.name.lower() in ("l", "w") and isinstance(p.default, MetricNum) and str(p.default.val).lower().endswith("u"):
+                    try:
+                        p = ParamDecl(
+                            name=p.name,
+                            default=Float(float(str(p.default.val)[:-1])),
+                            distr=p.distr,
+                            comment=p.comment,
+                        )
+                    except Exception:
+                        # If parsing fails, fall back to original value.
+                        p = param
+                self.write_param_decl(p, include_comment=False)
+            self.write("\n")
+            # Preserve any parameter comments as standalone lines (won't affect PARAMS parsing).
+            for param in params:
+                if param.comment:
+                    self.write_comment(param.comment)
+            return
+
+        # Non-inline (legacy): each param on its own continuation line
         self.write("+ PARAMS: ")
-        for param in params:
-            self.write_param_decl(param)
-            self.write(" ")
+        self.write_param_decl(params[0])
         self.write("\n")
+        for param in params[1:]:
+            self.write("+ ")
+            self.write_param_decl(param)
+            self.write("\n")
 
     def _get_model_type(self, ref: Ref) -> Optional[str]:
         """Resolve a reference to a model and return its type (mtype)."""
@@ -804,6 +850,23 @@ class XyceNetlister(SpiceNetlister):
         # Models (primitives) instances should NOT have PARAMS: keyword
         if not is_mos_like:
             self.write("PARAMS: ")  # <= Xyce-specific for subcircuits
+
+        # For MOS/BSIM4-style model instances, normalize key geometry parameter names.
+        # (Xyce can be picky about these spellings; keep them canonical.)
+        if is_mos_like:
+            mos_params = {"l", "w", "ad", "as", "pd", "ps", "nrd", "nrs", "sa", "sb", "sd", "nf", "m"}
+            normalized: List[ParamVal] = []
+            for pval in params_to_write:
+                nm = pval.name.name
+                mapped = nm.upper() if nm.lower() in mos_params else nm
+                if mapped != nm:
+                    # Preserve comment if present on ParamVal
+                    comment = getattr(pval, "comment", None)
+                    normalized.append(ParamVal(name=Ident(mapped), val=pval.val, comment=comment))
+                else:
+                    normalized.append(pval)
+            params_to_write = normalized
+
         # And write them
         for pval in params_to_write:
             self.write_param_val(pval)
@@ -1110,6 +1173,9 @@ class XyceNetlister(SpiceNetlister):
                     elif isinstance(resolved, ModelDef):
                         module_name = resolved.name.name
 
+                    # Keep instance references consistent with emitted .model names.
+                    module_name = self._normalize_model_name_for_xyce(module_name)
+
                 self.write("+ " + module_name + " \n")
 
         # Check if instance parameter expressions reference 'm' and add m={m} if needed
@@ -1255,11 +1321,10 @@ class XyceNetlister(SpiceNetlister):
             # Note: Diodes don't need prefix prepending - just write on one line
             elif "pnp" in mtype or "npn" in mtype or mtype == "q": prefix = "Q"
         
-        # Fallback heuristic
+        # Fallback heuristic (also covers cases where model arg is an Ident, not a Ref)
         if not prefix:
             is_mos_like = (
                 len(pinst.args) == 5  # Exactly 4 ports + 1 model
-                and isinstance(pinst.args[-1], Ref)  # Last arg is the model reference
                 and {'l', 'w'} <= {p.name.name for p in pinst.kwargs}  # Has both 'l' and 'w' params
                 and any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet', 'pmos', 'nmos'])  # Instance name indicates MOS
             )
@@ -1428,8 +1493,24 @@ class XyceNetlister(SpiceNetlister):
                         unique_params_to_filter.append(p)
                 kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name.lower() not in [p.lower() for p in unique_params_to_filter]]
             
+            def _xyce_mos_param_name(name: str) -> str:
+                """Xyce is picky about some MOS instance parameter spellings.
+
+                In particular, BSIM4 instance geometry parameters need to be in the
+                canonical SPICE form (L/W/AD/AS/PD/PS/NRD/NRS/SA/SB/SD/NF).
+                """
+                mos_params = {
+                    "l", "w", "ad", "as", "pd", "ps", "nrd", "nrs", "sa", "sb", "sd", "nf", "m"
+                }
+                return name.upper() if name.lower() in mos_params else name
+
             self.write("+ ")
             for kwarg in kwargs_to_write:
+                # For MOS/BSIM4 primitives, normalize key geometry param names.
+                if prefix == "M" or is_mos or is_bsim4 or (not prefix and 'l' in {p.name.name.lower() for p in kwargs_to_write}):
+                    mapped = _xyce_mos_param_name(kwarg.name.name)
+                    if mapped != kwarg.name.name:
+                        kwarg = ParamVal(name=Ident(mapped), val=kwarg.val)
                 self.write_param_val(kwarg)
                 self.write(" ")
 
@@ -1476,6 +1557,59 @@ class XyceNetlister(SpiceNetlister):
         # Call parent implementation for other entries
         # This will call write_subckt_instance or write_primitive_instance which set the flag
         return super().write_entry(entry)
+
+    def _normalize_model_name_for_xyce(self, model_name: str) -> str:
+        """Normalize numeric model-variant names to match what Xyce will see.
+
+        Xyce has trouble with numeric model-variant suffixes in some contexts (e.g. .1),
+        and this netlister historically strips the numeric suffix from the *first* variant
+        within a subcircuit (or from the only variant).
+
+        This helper applies the same rule to *references* (instance model names), so they
+        stay consistent with emitted `.model` cards.
+        """
+        if self._current_subckt is None:
+            return model_name
+
+        import re
+        from ..data import ModelDef, ModelFamily, ModelVariant
+
+        m = re.match(r"^(.+)\.(\d+)$", model_name)
+        if not m:
+            return model_name
+
+        base = m.group(1)
+        suffix_num = int(m.group(2))
+
+        # Collect numeric suffixes for models with the same base-name in this subckt.
+        suffixes: list[int] = []
+        for entry in getattr(self._current_subckt, "entries", []) or []:
+            if isinstance(entry, ModelDef):
+                em = re.match(r"^(.+)\.(\d+)$", entry.name.name)
+                if em and em.group(1) == base:
+                    suffixes.append(int(em.group(2)))
+            elif isinstance(entry, ModelVariant):
+                # Standalone variant entry: model.variant
+                if entry.model.name == base and str(entry.variant.name).isdigit():
+                    suffixes.append(int(entry.variant.name))
+            elif isinstance(entry, ModelFamily):
+                # Family entry: variants live under entry.name
+                if entry.name.name == base:
+                    for v in getattr(entry, "variants", []) or []:
+                        # Variants in model-families use numeric names ("0", "1", ...)
+                        if str(v.variant.name).isdigit():
+                            suffixes.append(int(v.variant.name))
+
+        suffixes.append(suffix_num)
+        suffixes = sorted(set(suffixes))
+
+        # Match write_model_def's rule:
+        # - single variant => strip
+        # - multiple variants => strip the *lowest* numeric suffix
+        if len(suffixes) == 1 or suffix_num == suffixes[0]:
+            return base
+
+        return model_name
 
     def expression_delimiters(self) -> Tuple[str, str]:
         """Return the starting and closing delimiters for expressions."""
@@ -1633,13 +1767,55 @@ class XyceNetlister(SpiceNetlister):
         # Pre-process: Move deltox/dtox from instances to local BSIM4 models.
         # Xyce requires dtox to be on the model card, not the instance.
         #
-        # NOTE: We intentionally do *not* translate Spectre's instance-level `delvto`
-        # here. The Netlist unit tests expect `delvto` to be preserved on instances.
+        # Also handle delvto by converting it to a subckt parameter `dvth0` and
+        # folding it into the local model's `vth0` parameter.
         
-        from ..data import ModelDef, ModelFamily, Instance, Ref, ParamVal, Ident, ParamDecl, Primitive, BinaryOp, BinaryOperator, Int, Float, MetricNum, Expr
+        from ..data import (
+            ModelDef,
+            ModelFamily,
+            Instance,
+            Ref,
+            ParamVal,
+            Ident,
+            ParamDecl,
+            ParamDecls,
+            Primitive,
+            BinaryOp,
+            BinaryOperator,
+            Int,
+            Float,
+            MetricNum,
+            Expr,
+        )
+
+        # Xyce parses device geometry while reading the subckt body, before later `.param`
+        # statements inside the subckt are guaranteed to have executed. This matters for
+        # S130's DE_* subckts which define `hvnel_*` via `.param` but use it for MOSFET L.
+        #
+        # Lift `hvnel_*` param declarations into the subckt PARAMS list so the MOS instances
+        # can resolve them at parse time.
+        lifted_subckt_params: List[ParamDecl] = []
+        rewritten_entries: List[Entry] = []
+        for entry in module.entries:
+            if isinstance(entry, ParamDecls):
+                keep: List[ParamDecl] = []
+                for p in entry.params:
+                    pname = p.name.name
+                    if pname.lower().startswith("hvnel_"):
+                        lifted_subckt_params.append(p)
+                    else:
+                        keep.append(p)
+                if keep:
+                    entry.params = keep
+                    rewritten_entries.append(entry)
+                # If none kept, drop this ParamDecls entry entirely.
+            else:
+                rewritten_entries.append(entry)
+        module.entries = rewritten_entries
         
         # 1. Find local BSIM4 models (check by mtype and level parameter)
         local_models = {}
+        has_delvto = False
         
         for entry in module.entries:
             if isinstance(entry, ModelDef):
@@ -1658,8 +1834,17 @@ class XyceNetlister(SpiceNetlister):
             elif isinstance(entry, ModelFamily):
                 if entry.mtype.name.lower() == "bsim4":
                     local_models[entry.name.name] = entry
-            
-            # (delvto handling intentionally omitted)
+            # Check for delvto on instances/primitives in this subckt (implies BSIM4 usage)
+            if isinstance(entry, Instance):
+                for pval in entry.params:
+                    if pval.name.name == "delvto":
+                        has_delvto = True
+                        break
+            elif isinstance(entry, Primitive):
+                for kwarg in entry.kwargs:
+                    if kwarg.name.name == "delvto":
+                        has_delvto = True
+                        break
         
         # Also check if entries reference BSIM4 models (global models)
         # We need to detect BSIM4 models even if they're not local to convert delvto
@@ -1679,13 +1864,18 @@ class XyceNetlister(SpiceNetlister):
                         has_global_bsim4 = True
                         break
         
-        has_bsim4_model = len(local_models) > 0 or has_global_bsim4
+        # If we found delvto but not BSIM4 model, assume BSIM4 (delvto is only used with BSIM4)
+        has_bsim4_model = len(local_models) > 0 or has_global_bsim4 or has_delvto
                     
-        # 2. Process deltox/dtox if subcircuit has (or references) a BSIM4 model.
+        # 2. Process delvto/deltox/dtox if subcircuit has (or references) a BSIM4 model.
         
+        needs_dvth0_param = False
+        delvto_vals: List[Expr] = []
+
         if has_bsim4_model:
             for entry in module.entries:
                 dtox_val = None
+                delvto_val = None
                 params_to_keep = []
                 kwargs_to_keep = []
                 
@@ -1694,16 +1884,22 @@ class XyceNetlister(SpiceNetlister):
                     model_name = entry.module.ident.name
                     is_bsim4_instance = model_name in local_models or self._is_bsim4_model_ref(entry.module)
                     
-                    # Check for deltox/dtox in any instance
+                    # Check for delvto/deltox/dtox in any instance
                     for pval in entry.params:
                         if pval.name.name in ("deltox", "dtox"):
                             dtox_val = pval.val
+                        elif pval.name.name == "delvto":
+                            delvto_val = pval.val
+                            needs_dvth0_param = True
                         else:
                             params_to_keep.append(pval)
                     
-                    # Update entry params (remove deltox/dtox) if found
-                    if dtox_val is not None:
+                    # Update entry params (remove deltox/dtox/delvto) if found
+                    if dtox_val is not None or delvto_val is not None:
                         entry.params = params_to_keep
+
+                    if delvto_val is not None:
+                        delvto_vals.append(delvto_val)
                         
                         # Handle deltox -> dtox for local models only
                         # BUT: Only if dtox_val doesn't reference instance parameters (m, l, w)
@@ -1744,16 +1940,22 @@ class XyceNetlister(SpiceNetlister):
                     model_name = model_ref.ident.name
                     is_bsim4_primitive = model_name in local_models or self._is_bsim4_model_ref(model_ref)
                     
-                    # Check for deltox/dtox in any primitive
+                    # Check for delvto/deltox/dtox in any primitive
                     for kwarg in entry.kwargs:
                         if kwarg.name.name in ("deltox", "dtox"):
                             dtox_val = kwarg.val
+                        elif kwarg.name.name == "delvto":
+                            delvto_val = kwarg.val
+                            needs_dvth0_param = True
                         else:
                             kwargs_to_keep.append(kwarg)
                     
-                    # Update entry kwargs (remove deltox/dtox) if found
-                    if dtox_val is not None:
+                    # Update entry kwargs (remove deltox/dtox/delvto) if found
+                    if dtox_val is not None or delvto_val is not None:
                         entry.kwargs = kwargs_to_keep
+
+                    if delvto_val is not None:
+                        delvto_vals.append(delvto_val)
                         
                         # Handle deltox -> dtox for local models only
                         # BUT: Only if dtox_val doesn't reference instance parameters (m, l, w)
@@ -1788,7 +1990,49 @@ class XyceNetlister(SpiceNetlister):
                             # else: dtox references instance parameters - can't move to model
                             # It will be filtered out by parameter filtering (deltox/dtox are filtered)
         
-        # (delvto -> dvth0 conversion intentionally disabled; see note above)
+        # 3. Add dvth0 parameter to subcircuit if needed, and modify local model vth0.
+        if needs_dvth0_param:
+            # Prefer a single constant delvto value as dvth0 default if available.
+            dvth0_default: Expr = Float(0.0)
+            if delvto_vals:
+                # If multiple values were found, keep the first and warn.
+                if len(delvto_vals) > 1:
+                    self.log_warning(
+                        f"Multiple delvto values found in subckt '{module.name.name}'; using first as dvth0 default",
+                        context=f"Subckt: {module.name.name}",
+                    )
+                dvth0_default = delvto_vals[0]
+
+            # Ensure dvth0 exists as a subckt parameter
+            if not any(p.name.name == "dvth0" for p in module.params):
+                module.params.append(ParamDecl(name=Ident("dvth0"), default=dvth0_default, distr=None))
+
+            # Modify model's vth0 parameter to include dvth0 (only for local models).
+            dvth0_ref = Ref(ident=Ident("dvth0"))
+
+            def modify_vth0(params_list: List[ParamDecl]) -> List[ParamDecl]:
+                new_params: List[ParamDecl] = []
+                vth0_found = False
+                for p in params_list:
+                    if p.name.name == "vth0":
+                        vth0_found = True
+                        base = p.default if p.default is not None else Float(0.0)
+                        vth0_expr = BinaryOp(tp=BinaryOperator.ADD, left=base, right=dvth0_ref)
+                        new_params.append(
+                            ParamDecl(name=p.name, default=vth0_expr, distr=p.distr, comment=p.comment)
+                        )
+                    else:
+                        new_params.append(p)
+                if not vth0_found:
+                    new_params.append(ParamDecl(name=Ident("vth0"), default=dvth0_ref, distr=None))
+                return new_params
+
+            for model in local_models.values():
+                if isinstance(model, ModelDef):
+                    model.params = modify_vth0(model.params)
+                elif isinstance(model, ModelFamily):
+                    for variant in model.variants:
+                        variant.params = modify_vth0(variant.params)
 
         # Reset instance flag at start of subcircuit
         self._last_entry_was_instance = False
@@ -1956,17 +2200,27 @@ class XyceNetlister(SpiceNetlister):
             # Not a BJT/FET subcircuit, or no params -> use normal behavior
             params_for_params_line = module.params
 
+        # Append any lifted `.param hvnel_*` as subckt parameters (avoid duplicates by name).
+        if lifted_subckt_params:
+            existing = {p.name.name.lower() for p in params_for_params_line} if params_for_params_line else set()
+            for p in lifted_subckt_params:
+                if p.name.name.lower() not in existing:
+                    params_for_params_line.append(p)
+                    existing.add(p.name.name.lower())
+
         # Start the sub-circuit definition header with inline ports
+        # IMPORTANT: Xyce requires `PARAMS:` to appear on the `.SUBCKT` line (it does not
+        # reliably pick up `+ PARAMS:` as a continuation of the SUBCKT header).
         self.write(f".SUBCKT {module_name}")
         if module.ports:
             for port in module.ports:
                 self.write(f" {self.format_ident(port)}")
-        self.write("\n")
 
-        # Add parameters on a continuation line (only instance-specific params for BJT)
+        # Add parameters (only instance-specific params for BJT) inline on the SUBCKT line
         if params_for_params_line:
-            self.write_module_params(params_for_params_line)
+            self.write_module_params(params_for_params_line, inline=True)
         else:
+            self.write("\n")
             self.write("+ ")
             self.write_comment("No parameters")
 
@@ -2196,7 +2450,7 @@ class XyceNetlister(SpiceNetlister):
         # print(f"[DEBUG]   No default recovered for param {param_name}")
         return None
 
-    def write_param_decl(self, param: ParamDecl) -> str:
+    def write_param_decl(self, param: ParamDecl, *, include_comment: bool = True) -> str:
         """Format a parameter declaration, with special handling for param functions in Xyce."""
         if param.distr is not None:
             msg = f"Unsupported `distr` for parameter {param.name} will be ignored"
@@ -2205,70 +2459,88 @@ class XyceNetlister(SpiceNetlister):
             self.write_comment(msg)
             self.write("\n+ ")
 
-        param_name = self.format_ident(param.name)
+        # When defining `*_process__` params, don't rewrite inner refs to `__process__`,
+        # otherwise we create self-references like `foo__process__ = foo__process__ * ...`.
+        self._disable_process_ref_map = False
+        try:
+            raw_name = self.format_ident(param.name)
+            self._disable_process_ref_map = raw_name.endswith("__process__")
+            param_name = raw_name
 
-        # Check if this is a param function (name contains parentheses)
-        if '(' in param_name and param_name.endswith(')'):
+            # Check if this is a param function (name contains parentheses)
+            if '(' in param_name and param_name.endswith(')'):
             # This is a param function like lnorm(mu,sigma) or mm_z1__mismatch__(dummy_param)
-            if param.default is None:
-                msg = f"Required (non-default) param function {param.name} is not supported."
-                self.log_warning(msg, f"Parameter: {param.name.name}")
-                default = str(sys.float_info.max)
-            else:
-                # For param functions, use = for lnorm, ' quotes for mismatch
-                default = param.default
-                if isinstance(default, str):
-                    # Already formatted
-                    pass
-                else:
-                    default = self.format_expr(default)
-                # Remove outer braces/quotes if present
-                if (default.startswith('{') and default.endswith('}')) or (default.startswith("'") and default.endswith("'")):
-                    default = default[1:-1]
-
-                # Use single quotes for all param functions
-                self.write(f"{param_name}='{default}'")
-                return
-
-        # Normal parameter declaration
-        if param.default is None:
-            # Try to recover default from usage in current subcircuit
-            recovered_default = None
-            if getattr(self, '_current_subckt', None):
-                recovered_default = self._find_param_default_from_usage(param.name.name, self._current_subckt)
-
-            if recovered_default:
-                default = self.format_expr(recovered_default)
-            else:
-                # Safety net: Use common defaults for geometric parameters
-                # Adjust based on scale factor (defaults assume microns, i.e., scale=1e-6)
-                scale_factor = self._get_scale_factor()
-                # Default values in microns: l=1u, w=1u, perim=4u, area=1u^2
-                # Convert to the actual scale units
-                micron_to_scale = 1e-6 / scale_factor
-
-                common_defaults = {
-                    'l': Float(1.0 * micron_to_scale),  # length
-                    'w': Float(1.0 * micron_to_scale),  # width
-                    'perim': Float(4.0 * micron_to_scale),  # perimeter (typical for square)
-                    'area': Float(1.0 * micron_to_scale * micron_to_scale),  # area (scale^2)
-                }
-
-                if param.name.name.lower() in common_defaults:
-                    default = self.format_expr(common_defaults[param.name.name.lower()])
-                else:
-                    msg = f"Required (non-default) parameter {param.name} is not supported by {self.__class__.__name__}. "
-                    msg += f"Setting to maximum floating-point value {sys.float_info.max}, which almost certainly will not work if instantiated."
+                if param.default is None:
+                    msg = f"Required (non-default) param function {param.name} is not supported."
                     self.log_warning(msg, f"Parameter: {param.name.name}")
                     default = str(sys.float_info.max)
-        else:
-            default = self.format_expr(param.default)
+                else:
+                    # For param functions, use = for lnorm, ' quotes for mismatch
+                    default = param.default
+                    if isinstance(default, str):
+                        # Already formatted
+                        pass
+                    else:
+                        default = self.format_expr(default)
+                    # Remove outer braces/quotes if present
+                    if (default.startswith('{') and default.endswith('}')) or (default.startswith("'") and default.endswith("'")):
+                        default = default[1:-1]
 
-        self.write(f"{param_name}={default}")
-        
-        # Write inline comment if present
-        if param.comment:
-            self.write(f" ; {param.comment}")
+                    # Use single quotes for all param functions
+                    self.write(f"{param_name}='{default}'")
+                    return
+
+            # Normal parameter declaration
+            if param.default is None:
+                # Try to recover default from usage in current subcircuit
+                recovered_default = None
+                if getattr(self, '_current_subckt', None):
+                    recovered_default = self._find_param_default_from_usage(param.name.name, self._current_subckt)
+
+                if recovered_default:
+                    default = self.format_expr(recovered_default)
+                else:
+                    # Safety net: Use common defaults for geometric parameters
+                    # Adjust based on scale factor (defaults assume microns, i.e., scale=1e-6)
+                    scale_factor = self._get_scale_factor()
+                    # Default values in microns: l=1u, w=1u, perim=4u, area=1u^2
+                    # Convert to the actual scale units
+                    micron_to_scale = 1e-6 / scale_factor
+
+                    common_defaults = {
+                        'l': Float(1.0 * micron_to_scale),  # length
+                        'w': Float(1.0 * micron_to_scale),  # width
+                        'perim': Float(4.0 * micron_to_scale),  # perimeter (typical for square)
+                        'area': Float(1.0 * micron_to_scale * micron_to_scale),  # area (scale^2)
+                    }
+
+                    if param.name.name.lower() in common_defaults:
+                        default = self.format_expr(common_defaults[param.name.name.lower()])
+                    else:
+                        msg = f"Required (non-default) parameter {param.name} is not supported by {self.__class__.__name__}. "
+                        msg += f"Setting to maximum floating-point value {sys.float_info.max}, which almost certainly will not work if instantiated."
+                        self.log_warning(msg, f"Parameter: {param.name.name}")
+                        default = str(sys.float_info.max)
+            else:
+                default_expr = param.default
+                # S130 deck quirk: some geometry-related params (deltaw / hvnel_*) show up
+                # in SI meters after conversion (e.g. 9e-07, 2.95e-06) but are used in
+                # subcircuits where other geometry is in microns. Convert small SI-meter
+                # values back to unitless microns.
+                if param_name == "deltaw" or param_name.lower().startswith("hvnel_"):
+                    if isinstance(default_expr, (Int, Float)):
+                        v = float(default_expr.val)
+                        if 0 < abs(v) < 1e-3:
+                            default_expr = Float(v * 1e6)
+                default = self.format_expr(default_expr)
+
+            self.write(f"{param_name}={default}")
+            
+            # Write inline comment if present
+            if include_comment and param.comment:
+                self.write(f" ; {param.comment}")
+        finally:
+            self._disable_process_ref_map = False
 
     def _is_bsim4_model_ref(self, ref: Ref) -> bool:
         """Check if a Ref points to a BSIM4 model definition.
@@ -2770,7 +3042,9 @@ class XyceNetlister(SpiceNetlister):
             ('NF',   'SPECIAL_NF'),  # forward emission coeff -> PE + MLF
             ('NR',   'PC'),     # reverse emission coeff -> PC
             ('VAF',  'VEF', (0.01, None)),  # forward Early voltage -> VEF, range: [0.01, +inf)
-            # Reverse Early voltage -> VER. Clamp to >= 0.01 per unit-test expectations.
+            # Reverse Early voltage -> VER.
+            # Special case: VAR=0 means "infinite / unused" in many SPICE decks; we map that
+            # to a large VER value for numerical stability (see mapping loop below).
             ('VAR',  'VER', (0.01, None)),
             ('IKF',  'SPECIAL_IK'),  # forward knee -> IK (conflict with IKR)
             ('IKR',  'SPECIAL_IK'),  # reverse knee -> IK (conflict with IKF)
@@ -2979,6 +3253,16 @@ class XyceNetlister(SpiceNetlister):
                         # Map with warning/comment
                         # Check for range clamping / wrapping
                         default_val = param.default
+                        # Special handling: VAR=0 means infinite/unused in SPICE, set VER to large value (100000V).
+                        if name_upper == "VAR" and new_name == "VER" and self._is_number(default_val):
+                            try:
+                                v0 = float(default_val.val) if hasattr(default_val, "val") else float(default_val)
+                            except Exception:
+                                v0 = None
+                            if v0 is not None and abs(v0) < 1e-12:
+                                default_val = Float(100000.0)
+                                clamped_params.append(f"{param.name.name} (mapped to {new_name}=100000.0 because var=0 means infinite/unused)")
+
                         if name_upper in range_map:
                             range_info = range_map[name_upper]
                             if len(range_info) >= 2:
@@ -3000,12 +3284,7 @@ class XyceNetlister(SpiceNetlister):
                                         if isinstance(default_val, (Int, Float)) and isinstance(clamped, (Int, Float)):
                                             old_val = default_val.val if hasattr(default_val, 'val') else default_val
                                             new_val = clamped.val if hasattr(clamped, 'val') else clamped
-                                            # Special case: VER cannot be 0 in Xyce, use minimum 0.01 if clamped to 0
-                                            if name_upper == 'VAR' and new_name == 'VER' and abs(new_val) < 1e-12:
-                                                new_val = 0.01
-                                                clamped = Float(new_val)
-                                                clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val} - Xyce requires VER > 0)")
-                                            elif abs(old_val - new_val) >= 1e-12:
+                                            if abs(old_val - new_val) >= 1e-12:
                                                 clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val})")
                                             default_val = clamped
                                     else:
@@ -3034,6 +3313,16 @@ class XyceNetlister(SpiceNetlister):
                     
                     # Apply range clamping if range info exists
                     default_val = param.default
+                    # Special handling: VAR=0 means infinite/unused in SPICE, set VER to large value (100000V).
+                    if name_upper == "VAR" and new_name == "VER" and self._is_number(default_val):
+                        try:
+                            v0 = float(default_val.val) if hasattr(default_val, "val") else float(default_val)
+                        except Exception:
+                            v0 = None
+                        if v0 is not None and abs(v0) < 1e-12:
+                            default_val = Float(100000.0)
+                            clamped_params.append(f"{param.name.name} (mapped to {new_name}=100000.0 because var=0 means infinite/unused)")
+
                     if name_upper in range_map:
                         range_info = range_map[name_upper]
                         if len(range_info) >= 2:
@@ -3058,12 +3347,7 @@ class XyceNetlister(SpiceNetlister):
                                     if isinstance(default_val, (Int, Float)) and isinstance(clamped, (Int, Float)):
                                         old_val = default_val.val if hasattr(default_val, 'val') else default_val
                                         new_val = clamped.val if hasattr(clamped, 'val') else clamped
-                                        # Special case: VER cannot be 0 in Xyce, use minimum 0.01 if clamped to 0
-                                        if name_upper == 'VAR' and new_name == 'VER' and abs(new_val) < 1e-12:
-                                            new_val = 0.01
-                                            clamped = Float(new_val)
-                                            clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val} - Xyce requires VER > 0)")
-                                        elif abs(old_val - new_val) >= 1e-12:
+                                        if abs(old_val - new_val) >= 1e-12:
                                             clamped_params.append(f"{param.name.name} (clamped from {old_val} to {new_val})")
                                         default_val = clamped
                                 else:
@@ -3192,63 +3476,10 @@ class XyceNetlister(SpiceNetlister):
             self.write("\n")
             self._last_entry_was_instance = False
         
-        # Check if we're in a subcircuit and if this model should have its suffix removed
-        # Rule: If there's only one model, remove any numeric suffix (.0, .1, .2, etc.)
-        #       If there are multiple models, remove suffix from the first variant (lowest number)
-        # (Xyce doesn't match numeric variant suffixes when instances reference base name)
-        from ..data import ModelDef, ModelFamily, Ident
-        import re
-        model_name = model.name.name
-        if self._current_subckt is not None:
-            # Check if model name ends with a numeric suffix (e.g., .0, .1, .2, .28)
-            suffix_match = re.match(r'^(.+)\.(\d+)$', model_name)
-            if suffix_match:
-                model_base = suffix_match.group(1)
-                suffix_num = int(suffix_match.group(2))
-                
-                # Find all models with the same base name and their suffix numbers
-                # Include the current model in the count
-                variant_suffixes = []
-                for entry in self._current_subckt.entries:
-                    if isinstance(entry, ModelDef):
-                        entry_name = entry.name.name
-                        entry_base = entry_name.split('.')[0]
-                        if entry_base == model_base:
-                            # Extract suffix number if present
-                            entry_suffix_match = re.match(r'^.+\.(\d+)$', entry_name)
-                            if entry_suffix_match:
-                                entry_suffix_num = int(entry_suffix_match.group(1))
-                                variant_suffixes.append(entry_suffix_num)
-                            else:
-                                # No suffix - this means suffix was already removed
-                                # Don't count it as a variant
-                                pass
-                    elif isinstance(entry, ModelFamily):
-                        # ModelFamily: check if base name matches
-                        family_base = entry.name.name.split('.')[0]
-                        if family_base == model_base:
-                            # For ModelFamily, we need to check variants
-                            # This is more complex - for now, just count them
-                            variant_suffixes.extend([i+1 for i in range(len(entry.variants))])
-                
-                # Also include the current model's suffix in the list
-                variant_suffixes.append(suffix_num)
-                
-                # Remove duplicates and sort to find the lowest suffix number
-                variant_suffixes = sorted(set(variant_suffixes))
-                
-                # If there's only one model, remove its suffix
-                # If there are multiple models, remove suffix from the first one (lowest number)
-                if len(variant_suffixes) == 1:
-                    # Only one model - remove suffix
-                    model_name = model_base
-                    model.name = Ident(name=model_name)
-                elif len(variant_suffixes) > 1 and suffix_num == variant_suffixes[0]:
-                    # Multiple models - remove suffix from the first one (lowest number)
-                    model_name = model_base
-                    model.name = Ident(name=model_name)
-        
-        mname = self.format_ident(model.name)
+        # Normalize numeric model-variant naming so cards match instance references.
+        # IMPORTANT: Do not mutate the AST (`model.name`) while writing.
+        model_name_to_write = self._normalize_model_name_for_xyce(model.name.name)
+        mname = self.format_ident(Ident(name=model_name_to_write))
         mtype = self.format_ident(model.mtype).lower()
         
         # Map model types to Xyce equivalents

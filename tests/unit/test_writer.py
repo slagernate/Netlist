@@ -1105,7 +1105,7 @@ def test_bsim4_deltox_filtering_in_subckt():
     # deltox and delvto should be removed from instance (converted to dtox on model and dvth0 as subcircuit param)
     assert "deltox=" not in instance_section and "dtox=" not in instance_section
     assert "delvto=" not in instance_section
-    assert "l=" in instance_section and "w=" in instance_section
+    assert "L=" in instance_section and "W=" in instance_section
     # Check that dvth0 was added as a subcircuit parameter (should be in PARAMS: line)
     assert "dvth0" in output_str, f"Expected dvth0 parameter in output, got: {output_str[:500]}"
 
@@ -1148,8 +1148,8 @@ def test_xyce_parameter_reference_braces():
     output_str = output.getvalue()
     
     # Verify that parameters are wrapped in braces
-    assert "m={m}" in output_str
-    assert "l={l}" in output_str
+    assert "M={m}" in output_str
+    assert "L={l}" in output_str
 
 
 
@@ -1286,8 +1286,12 @@ def test_xyce_param_default_recovery_from_model():
     params_line = None
     for i, line in enumerate(lines):
         if line.startswith(".SUBCKT test_subckt"):
-            # Look for the PARAMS line (should be next continuation line)
-            for j in range(i+1, min(i+5, len(lines))):
+            # Xyce requires PARAMS: on the .SUBCKT line, but allow either style.
+            if "PARAMS:" in line:
+                params_line = line
+                break
+            # Back-compat: look for PARAMS on a following continuation line
+            for j in range(i + 1, min(i + 5, len(lines))):
                 if "PARAMS:" in lines[j]:
                     params_line = lines[j]
                     break
@@ -1577,9 +1581,9 @@ def test_inline_comment_preservation():
     write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.XYCE))
     output = dest.getvalue()
     assert "test comment" in output
-    assert "l=" in output
+    assert "L=" in output
     # Comment should be on same line as parameter
-    assert any("l=" in line and "test comment" in line for line in output.split('\n'))
+    assert any("L=" in line and "test comment" in line for line in output.split('\n'))
 
 
 def test_write_ngspice_basic():
@@ -1724,7 +1728,6 @@ def test_ngspice_statistics_mismatch():
     assert "width" not in param_names
 
 
-@pytest.mark.xfail(reason="ngspice-specific feature - unrelated to Xyce changes", strict=False)
 def test_ngspice_subcircuit_param_scope_in_models():
     """Test that subcircuit parameters used in models get .param statements for ngspice"""
     from netlist.data import ModelDef, ParamDecl, Ident, Float, Ref, Expr
@@ -1776,7 +1779,6 @@ def test_ngspice_subcircuit_param_scope_in_models():
     assert param_line < model_line, ".param statement should come before model"
 
 
-@pytest.mark.xfail(reason="ngspice-specific feature - unrelated to Xyce changes", strict=False)
 def test_ngspice_subcircuit_param_scope_in_instances():
     """Test that subcircuit parameters used in instance parameters get .param statements for ngspice"""
     from netlist.data import Instance, ParamVal, Ref

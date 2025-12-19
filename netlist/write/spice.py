@@ -1569,11 +1569,13 @@ class NgspiceNetlister(SpiceNetlister):
                                     params_needed_as_param_statements.add(subckt_param_name)
                                     break
             
-            # Add .param statements for parameters that are referenced in models/instances.
+            # Add `.param` statements for any subckt parameters referenced by models or instances.
             #
-            # IMPORTANT: In ngspice, subcircuit parameters are *not* reliably visible
-            # inside `.model` cards (and some instance contexts), so we emit `.param`
-            # statements for any referenced subcircuit parameter to ensure it is in scope.
+            # In ngspice, subckt parameters are usable in instance-value expressions, but
+            # *model cards* (and some instance-parameter evaluation paths) do not reliably
+            # see the `.SUBCKT ... params` namespace. Emitting `.param` statements inside
+            # the subckt body ensures the names are in scope when `.model` cards and
+            # instances are parsed.
             if params_needed_as_param_statements:
                 for param_name in sorted(params_needed_as_param_statements):  # Sort for deterministic output
                     for param in module.params:
