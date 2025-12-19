@@ -334,20 +334,23 @@ class DialectParser:
         comment_to_remove = None
         
         for comment_text, comment_type, line_num in new_comments:
-            if comment_type == "//":
+            if comment_type == "//" and (comment_text or "").strip():
                 inline_comment = comment_text
                 comment_to_remove = (comment_text, comment_type, line_num)
-                break  # Take the first inline comment on this line
+                break  # Take the first non-empty inline comment on this line
         
         # Also check current_line_comments (in case it hasn't been cleared yet)
         if inline_comment is None and hasattr(self.lex, 'current_line_comments'):
             for comment_text, comment_type in self.lex.current_line_comments:
-                if comment_type == "//":
+                if comment_type == "//" and (comment_text or "").strip():
                     inline_comment = comment_text
                     # Remove from current_line_comments
-                    self.lex.current_line_comments = [(t, ct) for t, ct in self.lex.current_line_comments 
-                                                     if not (t == comment_text and ct == comment_type)]
-                    break  # Take the first inline comment
+                    self.lex.current_line_comments = [
+                        (t, ct)
+                        for t, ct in self.lex.current_line_comments
+                        if not (t == comment_text and ct == comment_type)
+                    ]
+                    break  # Take the first non-empty inline comment
         
         # If still no comment, check if the next token is a comment
         if inline_comment is None:
@@ -364,7 +367,7 @@ class DialectParser:
                 # The comment should now be in current_line_comments
                 if hasattr(self.lex, 'current_line_comments'):
                     for comment_text, comment_type in self.lex.current_line_comments:
-                        if comment_type == "//":
+                        if comment_type == "//" and (comment_text or "").strip():
                             inline_comment = comment_text
                             # Remove from current_line_comments
                             self.lex.current_line_comments = [(t, ct) for t, ct in self.lex.current_line_comments 
@@ -383,6 +386,10 @@ class DialectParser:
         # 2. For parameter declarations (ParamDecl), parse_param_declaration() will handle it
         # This prevents comments from instance parameters from being incorrectly associated with model parameters
         
+        if inline_comment is not None:
+            inline_comment = inline_comment.strip()
+            if not inline_comment:
+                inline_comment = None
         return ParamVal(name, e, comment=inline_comment)
 
     def parse_param_declaration(self):
@@ -394,7 +401,7 @@ class DialectParser:
         
         # Check for inline comment (// style) on the same line
         # Use the comment from the ParamVal (which was captured in parse_param_val)
-        inline_comment = val.comment if hasattr(val, 'comment') else None
+        inline_comment = val.comment if hasattr(val, "comment") else None
         
         # If no comment was found in ParamVal, check comment_queue for comments on the current line
         if inline_comment is None:
@@ -402,7 +409,7 @@ class DialectParser:
             if hasattr(self.lex, 'comment_queue'):
                 # Look for comments on the current line
                 for comment_text, comment_type, line_num in self.lex.comment_queue:
-                    if comment_type == "//" and line_num == current_line:
+                    if comment_type == "//" and line_num == current_line and (comment_text or "").strip():
                         inline_comment = comment_text
                         # Remove this comment from the queue since we're using it
                         self.lex.comment_queue = [(t, ct, ln) for t, ct, ln in self.lex.comment_queue 
@@ -410,11 +417,11 @@ class DialectParser:
                         break  # Take the first inline comment on this line
         
         # Also check current_line_comments (in case it hasn't been cleared yet)
-        if inline_comment is None and hasattr(self.lex, 'current_line_comments'):
+        if inline_comment is None and hasattr(self.lex, "current_line_comments"):
             for comment_text, comment_type in self.lex.current_line_comments:
-                if comment_type == "//":
+                if comment_type == "//" and (comment_text or "").strip():
                     inline_comment = comment_text
-                    break  # Take the first inline comment
+                    break  # Take the first non-empty inline comment
         
         # If still no comment, check if the next token is a comment
         if inline_comment is None:
@@ -431,12 +438,16 @@ class DialectParser:
                 # The comment should now be in current_line_comments
                 if hasattr(self.lex, 'current_line_comments'):
                     for comment_text, comment_type in self.lex.current_line_comments:
-                        if comment_type == "//":
+                        if comment_type == "//" and (comment_text or "").strip():
                             inline_comment = comment_text
-                            break  # Take the first inline comment
+                            break  # Take the first non-empty inline comment
                 # Update nxt to the token after the comment
                 self.nxt = next_token
         
+        if inline_comment is not None:
+            inline_comment = inline_comment.strip()
+            if not inline_comment:
+                inline_comment = None
         return ParamDecl(val.name, val.val, comment=inline_comment)
 
     def parse_param_declarations(self) -> List[ParamDecl]:

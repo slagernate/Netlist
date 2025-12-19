@@ -1569,18 +1569,13 @@ class NgspiceNetlister(SpiceNetlister):
                                     params_needed_as_param_statements.add(subckt_param_name)
                                     break
             
-            # Add .param statements for parameters that are referenced in models
-            # BUT: Do NOT add .param statements for parameters that are already subcircuit parameters
-            # Subcircuit parameters are automatically in scope in ngspice
-            # We only need .param statements for parameters that are referenced but NOT subcircuit parameters
+            # Add .param statements for parameters that are referenced in models/instances.
+            #
+            # IMPORTANT: In ngspice, subcircuit parameters are *not* reliably visible
+            # inside `.model` cards (and some instance contexts), so we emit `.param`
+            # statements for any referenced subcircuit parameter to ensure it is in scope.
             if params_needed_as_param_statements:
                 for param_name in sorted(params_needed_as_param_statements):  # Sort for deterministic output
-                    # Skip if this is already a subcircuit parameter (it's already in scope)
-                    if param_name in subckt_param_names:
-                        continue
-                    # Find the parameter definition (must be a global parameter or from parent scope)
-                    # Note: This case is rare - usually referenced params are subcircuit params
-                    # But we handle it for completeness
                     for param in module.params:
                         if param.name.name == param_name:
                             # Write as .param statement

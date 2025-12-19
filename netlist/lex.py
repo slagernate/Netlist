@@ -290,13 +290,16 @@ class Lexer:
                 # Skip whitespace on the *next* line to detect plus-continuations.
                 while token and token.tp == Tokens.WHITE:
                     token = self.eat_idle(self.nxt())
-
+                
                 # If we see one or more NEWLINE tokens here, it means the next line
                 # was blank or comment-only. Look ahead across such lines to see if
-                # a PLUS continuation follows.
+                # a PLUS continuation follows. These comment-only lines must not break
+                # a continued statement (common in Spectre/Spice decks).
                 while token and token.tp == Tokens.NEWLINE:
                     self.lexed_nonwhite_on_this_line = False
-                    self.current_line_comments.clear()
+                    # IMPORTANT: do not clear current_line_comments here; comments were
+                    # already recorded into comment_queue by eat_idle(), and clearing
+                    # can prevent higher-level parsers from associating them correctly.
                     token = self.eat_idle(self.nxt())
                     while token and token.tp == Tokens.WHITE:
                         token = self.eat_idle(self.nxt())
