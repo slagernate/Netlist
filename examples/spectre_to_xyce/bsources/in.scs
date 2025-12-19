@@ -11,3 +11,4 @@ i1 (in 0) bsource i=1m*sin(2*3.1415926535*1k*time)
 
 * bsource q=  (charge -> should become I=ddt(q))
 q1 (in 0) bsource q=1p*v(in,0)
+

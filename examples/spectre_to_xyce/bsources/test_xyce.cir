@@ -8,3 +8,4 @@ V1 in 0 1
 .tran 1n 20n
 .print tran V(in)
 .end
+
