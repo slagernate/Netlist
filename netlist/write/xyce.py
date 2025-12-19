@@ -1561,12 +1561,15 @@ class XyceNetlister(SpiceNetlister):
     def _normalize_model_name_for_xyce(self, model_name: str) -> str:
         """Normalize numeric model-variant names to match what Xyce will see.
 
-        Xyce has trouble with numeric model-variant suffixes in some contexts (e.g. .1),
-        and this netlister historically strips the numeric suffix from the *first* variant
-        within a subcircuit (or from the only variant).
+        Rule we want:
+        - If a subckt contains exactly ONE numeric-suffixed model (e.g. `foo.0`), emit it
+          without the suffix (`foo`) so Xyce instance/model lookup works.
+        - If a subckt contains MULTIPLE numeric-suffixed models (`foo.1`, `foo.2`, ...),
+          do NOT strip any suffixes. These are distinct model cards (often bins) and must
+          remain uniquely named.
 
-        This helper applies the same rule to *references* (instance model names), so they
-        stay consistent with emitted `.model` cards.
+        This helper is used both when emitting `.model` cards and when emitting instance
+        references, so the two stay consistent.
         """
         if self._current_subckt is None:
             return model_name
@@ -1603,10 +1606,9 @@ class XyceNetlister(SpiceNetlister):
         suffixes.append(suffix_num)
         suffixes = sorted(set(suffixes))
 
-        # Match write_model_def's rule:
-        # - single variant => strip
-        # - multiple variants => strip the *lowest* numeric suffix
-        if len(suffixes) == 1 or suffix_num == suffixes[0]:
+        # Single variant => strip suffix (typically `.0`)
+        # Multiple variants => keep *all* suffixes
+        if len(suffixes) == 1:
             return base
 
         return model_name
