@@ -140,34 +140,47 @@ class XyceNetlister(SpiceNetlister):
 
         Includes:
         - `FunctionDef` nodes (true AST functions)
-        - Xyce `.func`-style parameter functions represented as `ParamDecl` where the
-          parameter name includes parentheses, e.g. `par1nrf__mismatch__(dummy_param)`.
+        - Xyce/ngspice-style param-functions declared as parameters whose *name* includes
+          parentheses, e.g. `.param foo(x)=...` which appears as `ParamDecl(name="foo(x)")`.
         """
-        fn_names = set()
+        fn_names: set[str] = set()
 
         if program is None:
             return fn_names
 
-        def collect_from_entry(entry):
+        def _add_param_function_name(name: str) -> None:
+            if "(" in name:
+                fn_names.add(name.split("(", 1)[0].lower())
+
+        def collect_from_entry(entry) -> None:
             if isinstance(entry, FunctionDef):
                 fn_names.add(entry.name.name.lower())
-            elif isinstance(entry, ParamDecl):
-                # Parameter-declared function (Xyce .func)
-                name = entry.name.name
-                if "(" in name:
-                    fn_names.add(name.split("(", 1)[0].lower())
-            elif isinstance(entry, ParamDecls):
+                return
+
+            if isinstance(entry, ParamDecls):
                 for p in entry.params:
-                    collect_from_entry(p)
-            elif isinstance(entry, SubcktDef):
+                    _add_param_function_name(p.name.name)
+                return
+
+            if isinstance(entry, ParamDecl):
+                _add_param_function_name(entry.name.name)
+                return
+
+            if isinstance(entry, SubcktDef):
                 for sub_entry in entry.entries:
                     collect_from_entry(sub_entry)
-            elif isinstance(entry, LibSectionDef):
+                return
+
+            if isinstance(entry, LibSectionDef):
                 for sub_entry in entry.entries:
                     collect_from_entry(sub_entry)
-            elif isinstance(entry, Library):
-                for sec in entry.sections:
-                    collect_from_entry(sec)
+                return
+
+            if isinstance(entry, Library):
+                for section in entry.sections:
+                    for sub_entry in section.entries:
+                        collect_from_entry(sub_entry)
+                return
 
         for file in program.files:
             for entry in file.contents:
@@ -1598,8 +1611,12 @@ class XyceNetlister(SpiceNetlister):
         for option in options.vals:
             name = self.format_ident(option.name)
             if name not in categories:
-                msg = f"Unknown Xyce option `{name}`, cannot find `.options` category"
-                self.handle_error(option, msg)
+                # Spectre/ HSPICE decks frequently carry simulator-specific options
+                # (e.g. `redefinedparams=ignore`) which have no Xyce equivalent.
+                # For Xyce output we skip these rather than failing the translation.
+                msg = f"Skipping unsupported Xyce option `{name}` (no `.options` category mapping)"
+                self.log_warning(msg, context=f"Option {name}")
+                self.write_comment(msg)
                 continue
             category = categories[name].value
             if category not in by_category:

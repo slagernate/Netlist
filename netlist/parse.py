@@ -126,6 +126,9 @@ class Parser:
         # Initialize the dialects for each file
         self.pending_dialects = {s: options.dialect for s in self.pending}
         self.done: Set[Path] = set()
+        # Track all paths that have been scheduled for parsing (pending or done),
+        # to avoid exponential growth from repeated includes and to prevent cycles.
+        self.scheduled: Set[Path] = set(self.pending)
         self.program = Program([])
         self.dialect = options.dialect
         self.file_parser = None
@@ -153,6 +156,7 @@ class Parser:
         self.file_parser = FileParser(self.dialect, self.options)
         path, stmts = self.file_parser.parse(p)
         self.done.add(p)
+        self.scheduled.add(p)
 
         # Filter out a few things
         # Before filtering DialectChange, preserve any comments that were associated with them
@@ -182,7 +186,10 @@ class Parser:
                 incp = incp.resolve()
                 if not incp.exists() or not incp.is_file():
                     raise FileNotFoundError(incp)
-                if incp in self.done:
+                # Avoid cycles and duplicate scheduling. This is especially important for
+                # "toplevel" wrapper decks which include the same large file many times
+                # (e.g. different `section=` values), and for any accidental self-includes.
+                if incp in self.scheduled or incp in self.done:
                     continue
 
                 # Sort out the initial dialect for the new file.
@@ -202,6 +209,7 @@ class Parser:
                 # Add the file and its dialect to the pending-queue
                 self.pending.append(incp)
                 self.pending_dialects[incp] = dialect_enum
+                self.scheduled.add(incp)
 
                 # # And kick off parsing of the included file
                 # self.parse(incp)
