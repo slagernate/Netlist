@@ -3475,9 +3475,11 @@ class XyceNetlister(SpiceNetlister):
         if self._last_entry_was_instance:
             self.write("\n")
             self._last_entry_was_instance = False
-        
+
         # Normalize numeric model-variant naming so cards match instance references.
         # IMPORTANT: Do not mutate the AST (`model.name`) while writing.
+        from ..data import Ident
+
         model_name_to_write = self._normalize_model_name_for_xyce(model.name.name)
         mname = self.format_ident(Ident(name=model_name_to_write))
         mtype = self.format_ident(model.mtype).lower()
