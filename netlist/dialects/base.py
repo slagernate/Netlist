@@ -168,6 +168,13 @@ class DialectParser:
         self.start()
         func = f if f else self.parse_expr
         self.root = func()
+        # Allow trailing blank lines / comment-only lines after a top-level parse.
+        # The lexer represents full-line comments as NEWLINE tokens (with the comment
+        # captured separately), so consuming blanks here is required for cases like:
+        #   <statement>
+        #   * comment
+        #   <EOF>
+        self.eat_blanks()
         if self.nxt is not None:  # Check whether there's more stuff
             self.fail()
         return self.root

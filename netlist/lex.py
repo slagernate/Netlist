@@ -281,16 +281,25 @@ class Lexer:
                 # Clear current_line_comments for next line, but keep in queue
                 self.current_line_comments.clear()
 
-                # Pull the next token (potentially skipping whitespace/comments), but
-                # DO NOT collapse multiple NEWLINEs into one. We want the parser to
-                # see each physical newline so it can preserve blank lines and
-                # comment-only lines accurately.
+                # Pull the next token (potentially skipping whitespace/comments).
+                # If we encounter one or more blank/comment-only lines before a PLUS
+                # continuation, treat the newline as cancelled (mid-stream comments
+                # must not break line continuation in Spectre/Spice decks).
                 token = self.eat_idle(self.nxt())
 
-                # Skip whitespace on the *next* line to detect plus-continuations,
-                # but do not skip NEWLINE tokens (those represent real blank lines).
+                # Skip whitespace on the *next* line to detect plus-continuations.
                 while token and token.tp == Tokens.WHITE:
                     token = self.eat_idle(self.nxt())
+
+                # If we see one or more NEWLINE tokens here, it means the next line
+                # was blank or comment-only. Look ahead across such lines to see if
+                # a PLUS continuation follows.
+                while token and token.tp == Tokens.NEWLINE:
+                    self.lexed_nonwhite_on_this_line = False
+                    self.current_line_comments.clear()
+                    token = self.eat_idle(self.nxt())
+                    while token and token.tp == Tokens.WHITE:
+                        token = self.eat_idle(self.nxt())
 
                 if token and token.tp == Tokens.PLUS:
                     # Cancelled newline; skip the PLUS and continue on the same statement.
