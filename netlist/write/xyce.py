@@ -136,7 +136,13 @@ class XyceNetlister(SpiceNetlister):
         return param_names
 
     def _collect_function_names(self, program: Optional[Program]) -> set:
-        """Collect all user-defined function names (FunctionDef) from the program AST."""
+        """Collect all user-defined function names from the program AST.
+
+        Includes:
+        - `FunctionDef` nodes (true AST functions)
+        - Xyce `.func`-style parameter functions represented as `ParamDecl` where the
+          parameter name includes parentheses, e.g. `par1nrf__mismatch__(dummy_param)`.
+        """
         fn_names = set()
 
         if program is None:
@@ -145,12 +151,23 @@ class XyceNetlister(SpiceNetlister):
         def collect_from_entry(entry):
             if isinstance(entry, FunctionDef):
                 fn_names.add(entry.name.name.lower())
+            elif isinstance(entry, ParamDecl):
+                # Parameter-declared function (Xyce .func)
+                name = entry.name.name
+                if "(" in name:
+                    fn_names.add(name.split("(", 1)[0].lower())
+            elif isinstance(entry, ParamDecls):
+                for p in entry.params:
+                    collect_from_entry(p)
             elif isinstance(entry, SubcktDef):
                 for sub_entry in entry.entries:
                     collect_from_entry(sub_entry)
             elif isinstance(entry, LibSectionDef):
                 for sub_entry in entry.entries:
                     collect_from_entry(sub_entry)
+            elif isinstance(entry, Library):
+                for sec in entry.sections:
+                    collect_from_entry(sec)
 
         for file in program.files:
             for entry in file.contents:
@@ -1068,18 +1085,21 @@ class XyceNetlister(SpiceNetlister):
                 module_name = self.format_ident(pinst.module.ident)
                 module_ref = pinst.module if isinstance(pinst.module, Ref) else None
 
-                # If this is a model reference, prefer the fully-qualified variant name (e.g. nch_rf.1)
-                # so instance model names match the emitted .model cards.
+                # If this is a model reference, align instance model names with the
+                # emitted `.model` card names.
+                #
+                # IMPORTANT: Xyce model cards in our output are emitted using the base
+                # model name (e.g. `nch_rf`), not the variant-qualified name
+                # (e.g. `nch_rf.1`). Use the base model name for instances so Xyce can
+                # resolve the model card.
                 if module_ref is not None and is_model:
                     from ..data import ModelVariant, ModelFamily, ModelDef
 
                     resolved = self._get_module_definition(module_ref)
                     if isinstance(resolved, ModelVariant):
-                        module_name = f"{resolved.model.name}.{resolved.variant.name}"
-                    elif isinstance(resolved, ModelFamily) and getattr(resolved, "variants", None):
-                        v0 = resolved.variants[0]
-                        if hasattr(v0, "model") and hasattr(v0, "variant"):
-                            module_name = f"{v0.model.name}.{v0.variant.name}"
+                        module_name = resolved.model.name
+                    elif isinstance(resolved, ModelFamily):
+                        module_name = resolved.name.name
                     elif isinstance(resolved, ModelDef):
                         module_name = resolved.name.name
 
@@ -1115,22 +1135,30 @@ class XyceNetlister(SpiceNetlister):
         # Write its parameter values (pass is_model to skip PARAMS: for models, and module_ref for BSIM4 detection)
         # module_ref already set above
         if is_diode:
-            # Write parameters on same line for diodes
-            # For diodes, only area is supported as positional parameter (perim not supported in Level 3)
-            area_val = None
-            other_params = []
+            # Write parameters on same line for diodes.
+            #
+            # IMPORTANT: Do NOT write AREA as a positional value. Xyce's parser is picky
+            # about positional diode fields, especially when expressions are used.
+            # Instead, write named parameters (area=...).
+            #
+            # Also drop Spectre perimeter-style instance params (`pj`/`perim`) which are
+            # not supported as diode instance params in Xyce.
+            kept: list[ParamVal] = []
+            dropped_names: list[str] = []
             for pval in pinst.params:
-                param_name = pval.name.name.lower()
-                if param_name == "area":
-                    area_val = pval.val
-                # Note: perim is not supported for Level 3 diodes in Xyce, so we skip it
-                elif param_name != "perim":
-                    other_params.append(pval)
-            # Write area as positional parameter (just value, no name)
-            if area_val is not None:
-                self.write(self.format_expr(area_val) + " ")
-            # Write other parameters as named (if any)
-            for pval in other_params:
+                pname = pval.name.name.lower()
+                if pname in {"perim", "pj"}:
+                    dropped_names.append(pval.name.name)
+                    continue
+                kept.append(pval)
+
+            if dropped_names:
+                self.log_warning(
+                    "Dropping unsupported diode instance parameter(s): " + ", ".join(sorted({n.upper() for n in dropped_names})),
+                    f"Instance: {pinst.name.name}",
+                )
+
+            for pval in kept:
                 self.write_param_val(pval)
                 self.write(" ")
             self.write("\n")
@@ -3411,6 +3439,25 @@ class XyceNetlister(SpiceNetlister):
             if not has_level:
                 level_param = ParamDecl(name=Ident("level"), default=Float(54.0), distr=None)
                 params_to_write.insert(0, level_param)
+
+        # Drop MOS model parameters which Xyce does not recognize.
+        # (These otherwise generate noisy warnings during parsing.)
+        if mtype in ("nmos", "pmos"):
+            dropped = []
+            kept = []
+            for p in params_to_write:
+                pname = self._get_param_name(p).lower()
+                if pname == "minr":
+                    dropped.append(self._get_param_name(p))
+                    continue
+                kept.append(p)
+            if dropped:
+                self.log_warning(
+                    "Dropping unsupported Xyce MOS model parameter(s): "
+                    + ", ".join(sorted({d.upper() for d in dropped})),
+                    f"Model: {mname}",
+                )
+            params_to_write = kept
         
         # Handle BJT models (NPN and PNP): keep level=1 (Gummel-Poon) if not already set
         # Only apply default behavior if level mapping was not already applied
