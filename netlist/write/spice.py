@@ -415,7 +415,16 @@ class SpiceNetlister(Netlister):
                             for variant in model.variants:
                                 variant.params = add_dtox(variant.params, dtox_val)
         
-        # 3. Add dvth0 parameter to subcircuit if needed, and modify model vth0
+        # 3. Add dvth0 parameter to subcircuit if needed, and modify model vth0.
+        #
+        # IMPORTANT (ngspice):
+        # Subckt-header parameters are not reliably visible inside `.model` cards.
+        # If we fold a per-instance delvto into a subckt parameter (dvth0) and then
+        # reference it from `.model`, ngspice can error with "Undefined parameter [dvth0]".
+        #
+        # To keep `.model` evaluation happy, we rewrite model expressions to reference an
+        # internal `.param` name (`__dvth0`) and emit `.param __dvth0={dvth0}` near the
+        # top of the subckt body (before any `.model` cards).
         if needs_dvth0_param:
             if debug:
                 try:
@@ -427,8 +436,26 @@ class SpiceNetlister(Netlister):
             # Check if dvth0 already exists in subcircuit params
             has_dvth0 = any(p.name.name == "dvth0" for p in module.params)
             if not has_dvth0:
-                # Add dvth0 parameter with default 0
-                dvth0_param = ParamDecl(name=Ident("dvth0"), default=Float(0.0), distr=None)
+                # Prefer using the (common) delvto expression as dvth0 default when possible.
+                # This matches the intended "dvth0 := delvto" mapping, but only works if the
+                # delvto expression is identical across the subckt (we can't represent per-instance
+                # delvto inside a single `.model` card for ngspice).
+                dvth0_default: Expr = Float(0.0)
+                try:
+                    if delvto_entries:
+                        first = delvto_entries[0][1]
+                        if all(str(e[1]) == str(first) for e in delvto_entries):
+                            dvth0_default = first
+                        else:
+                            warn(
+                                f"Ngspice: multiple distinct delvto expressions found in subckt {subckt_name}; "
+                                "cannot represent per-instance delvto in a single model-card vth0 adjustment. "
+                                "Using dvth0=0."
+                            )
+                except Exception:
+                    dvth0_default = Float(0.0)
+
+                dvth0_param = ParamDecl(name=Ident("dvth0"), default=dvth0_default, distr=None)
                 module.params.append(dvth0_param)
                 if debug:
                     warn(f"[DEBUG {subckt_name}] Added dvth0 parameter to subcircuit")
@@ -439,7 +466,8 @@ class SpiceNetlister(Netlister):
                 def modify_vth0(params_list):
                     new_params = []
                     vth0_found = False
-                    dvth0_ref = RefData(ident=Ident("dvth0"))
+                    # Use an internal `.param` name for ngspice model-card visibility.
+                    dvth0_ref = RefData(ident=Ident("__dvth0"))
                     
                     for p in params_list:
                         if p.name.name == "vth0":
@@ -507,6 +535,9 @@ class SpiceNetlister(Netlister):
         
         # Store current subcircuit context for use in write_subckt_instance
         self._current_subckt = module
+        # Track which numeric model-variant suffix was stripped to the base-name within this subckt.
+        # This lets us map the "first" numeric variant (often .0, but sometimes .1, .2, ...) to the base.
+        self._ngspice_model_base_stripped_suffix = {}
 
         # Create the module name
         module_name = self.format_ident(module.name)
@@ -542,12 +573,19 @@ class SpiceNetlister(Netlister):
             m_param = ParamDecl(name=Ident("m"), default=Float(1.0), distr=None)
             module.params.append(m_param)
         
-        # Create its parameters, if any are defined
+        # Create its parameters, if any are defined.
+        #
+        # Note: ngspice does NOT treat `*` as an inline comment marker; it only comments when `*`
+        # is at the start of a line. Emitting `+ * No parameters` breaks parsing.
         if module.params:
             self.write_module_params(module.params)
         else:
-            self.write("+ ")
-            self.write_comment("No parameters")
+            if self.enum == NetlistDialects.NGSPICE:
+                # Skip the params continuation line entirely.
+                self.write("\n")
+            else:
+                self.write("+ ")
+                self.write_comment("No parameters")
 
         # End the `subckt` header-content with a blank line
         self.write("\n")
@@ -580,26 +618,50 @@ class SpiceNetlister(Netlister):
     def write_subckt_instance(self, pinst: Instance) -> None:
         """Write sub-circuit-instance `pinst`."""
         from ..data import ParamVal, Ref, Ident
-        # Detect if the instance looks like a MOS device (even if parsed as subcircuit instance)
+        # Detect if the instance looks like a MOS/ BJT/ R/ D/ C primitive (even if parsed as subcircuit instance)
         conn_count = len(pinst.conns)
         has_l_w = {'l', 'w'} <= {p.name.name for p in pinst.params}
-        is_module_ref = isinstance(pinst.module, Ref)
+        # `pinst.module` may be a Ref (preferred) or an Ident (seen in some parsed Spectre constructs).
+        module_is_ref = isinstance(pinst.module, Ref)
+        module_is_ident = isinstance(pinst.module, Ident)
+        is_module_ref = module_is_ref or module_is_ident
         name_has_mos = any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet'])
         name_has_bjt = any(keyword in pinst.name.name.lower() for keyword in ['npn', 'pnp', 'bjt', 'q'])
         name_has_res = any(keyword in pinst.name.name.lower() for keyword in ['res', 'rc', 'r'])
         name_has_diode = any(keyword in pinst.name.name.lower() for keyword in ['diode', 'd', 'dn'])
         
-        # Check if module name suggests resistor or diode
+        # Cache known subckt names to avoid mis-classifying subckt instances as primitives.
+        if not hasattr(self, "_known_subckt_names"):
+            from ..data import SubcktDef
+            names = set()
+            for sf in getattr(self.src, "files", []) or []:
+                for e in getattr(sf, "contents", []) or []:
+                    if isinstance(e, SubcktDef):
+                        names.add(e.name.name)
+            self._known_subckt_names = names
+
+        module_name = None
+        module_is_subckt = False
+        if is_module_ref:
+            module_name = pinst.module.ident.name if module_is_ref else pinst.module.name
+            module_is_subckt = module_name in self._known_subckt_names
+
+        # Check if module name suggests resistor, diode, capacitor
         module_name_res = False
         module_name_diode = False
+        module_name_cap = False
         if is_module_ref:
-            module_name = pinst.module.ident.name.lower()
-            module_name_res = any(keyword in module_name for keyword in ['resistor', 'res', 'r'])
-            module_name_diode = any(keyword in module_name for keyword in ['diode', 'd'])
+            module_name_l = module_name.lower()
+            # Keep these heuristics conservative: many S130 *subckt* names start with 'd' or contain 'r'.
+            # Resistor models are commonly named starting with 'r' (e.g. rndiff).
+            module_name_res = (module_name_l.startswith('r') or any(keyword in module_name_l for keyword in ['resistor', 'res'])) and not module_is_subckt
+            module_name_diode = 'diode' in module_name_l
+            module_name_cap = any(keyword in module_name_l for keyword in ['capacitor', 'cap'])
         
         is_mos_like = (
             conn_count == 4  # Exactly 4 ports (d, g, s, b)
             and is_module_ref  # References a model
+            and not module_is_subckt  # Don't treat subckt instances as MOS primitives
             and has_l_w  # Has both 'l' and 'w' params
             and name_has_mos  # Instance name indicates MOS
         )
@@ -608,6 +670,7 @@ class SpiceNetlister(Netlister):
         is_bjt_like = (
             conn_count == 4  # Exactly 4 ports (c, b, e, s)
             and is_module_ref  # References a model
+            and not module_is_subckt  # Don't treat subckt instances as BJT primitives
             and name_has_bjt  # Instance name indicates BJT
         )
         
@@ -618,6 +681,106 @@ class SpiceNetlister(Netlister):
             conn_count == 2  # Exactly 2 ports
             and (is_module_ref and module_name_res) or (not is_module_ref and (name_has_res or has_r_param))
         )
+
+        # ngspice: translate voltage-dependent resistors to behavioral B-sources *before* emitting any R-lines.
+        # (If we emit the R header first, we end up leaving behind an invalid/ incomplete R element.)
+        if is_res_like and self.enum == NetlistDialects.NGSPICE:
+            def _expr_calls_v(expr: Expr) -> bool:
+                if isinstance(expr, Call) and isinstance(expr.func, Ref):
+                    return expr.func.ident.name.lower() == "v" or any(_expr_calls_v(a) for a in expr.args)
+                if isinstance(expr, BinaryOp):
+                    return _expr_calls_v(expr.left) or _expr_calls_v(expr.right)
+                if isinstance(expr, UnaryOp):
+                    return _expr_calls_v(expr.targ)
+                if isinstance(expr, TernOp):
+                    return _expr_calls_v(expr.cond) or _expr_calls_v(expr.if_true) or _expr_calls_v(expr.if_false)
+                return False
+
+            r_value: Optional[Expr] = None
+            for pv in list(pinst.params):
+                if pv.name.name.lower() == "r":
+                    r_value = pv.val
+                    break
+            if r_value is not None and isinstance(r_value, Expr) and _expr_calls_v(r_value):
+                # Build V(n1,n2)/r_value and emit B-source current.
+                def _ngspice_sanitize_bsource_expr(expr: Expr) -> Expr:
+                    """Rewrite expression to avoid ngspice behavioral-source crash modes."""
+                    from ..data import Int, Float, MetricNum
+
+                    def _func_name(call: Call) -> Optional[str]:
+                        if isinstance(call.func, Ref):
+                            return call.func.ident.name
+                        if isinstance(call.func, Ident):
+                            return call.func.name
+                        return None
+
+                    def _is_abs_call(e: Expr) -> bool:
+                        return isinstance(e, Call) and isinstance(e.func, Ref) and e.func.ident.name.lower() == "abs"
+
+                    if isinstance(expr, Call):
+                        name = (_func_name(expr) or "").lower()
+                        args = [_ngspice_sanitize_bsource_expr(a) for a in expr.args]
+
+                        # max(a,b) -> abs(a) + b (used for floors like max(abs(x), 1e-3))
+                        if name == "max" and len(args) == 2 and isinstance(args[1], (Int, Float, MetricNum)):
+                            a0 = args[0]
+                            b0 = args[1]
+                            a_abs = a0 if _is_abs_call(a0) else Call(func=Ref(ident=Ident("abs")), args=[a0])
+                            return BinaryOp(tp=BinaryOperator.ADD, left=a_abs, right=b0)
+
+                        # pwr/pow(base, exp) -> exp(exp * ln(abs(base) + eps))
+                        if name in ("pwr", "pow") and len(args) == 2:
+                            base = args[0]
+                            expo = args[1]
+                            base_abs = base if _is_abs_call(base) else Call(func=Ref(ident=Ident("abs")), args=[base])
+                            base_abs_eps = BinaryOp(tp=BinaryOperator.ADD, left=base_abs, right=Float(1e-30))
+                            ln_call = Call(func=Ref(ident=Ident("ln")), args=[base_abs_eps])
+                            mul = BinaryOp(tp=BinaryOperator.MUL, left=expo, right=ln_call)
+                            return Call(func=Ref(ident=Ident("exp")), args=[mul])
+
+                        return Call(func=expr.func, args=args)
+
+                    if isinstance(expr, BinaryOp):
+                        return BinaryOp(
+                            tp=expr.tp,
+                            left=_ngspice_sanitize_bsource_expr(expr.left),
+                            right=_ngspice_sanitize_bsource_expr(expr.right),
+                        )
+                    if isinstance(expr, UnaryOp):
+                        return UnaryOp(tp=expr.tp, targ=_ngspice_sanitize_bsource_expr(expr.targ))
+                    if isinstance(expr, TernOp):
+                        return TernOp(
+                            cond=_ngspice_sanitize_bsource_expr(expr.cond),
+                            if_true=_ngspice_sanitize_bsource_expr(expr.if_true),
+                            if_false=_ngspice_sanitize_bsource_expr(expr.if_false),
+                        )
+                    return expr
+
+                def _conn_name(c) -> Optional[str]:
+                    if isinstance(c, Ident):
+                        return c.name
+                    if isinstance(c, Ref):
+                        return c.ident.name
+                    return None
+
+                n1 = _conn_name(pinst.conns[0]) if len(pinst.conns) > 0 else None
+                n2 = _conn_name(pinst.conns[1]) if len(pinst.conns) > 1 else None
+                if n1 and n2:
+                    bname = self.format_ident(pinst.name)
+                    bname = bname if bname.lower().startswith("bsource_") else f"Bsource_{bname}"
+                    self.log_warning(
+                        "Translated voltage-dependent resistor r={...v(...)} into B-source current I=V(p,n)/r for ngspice",
+                        context=f"Instance {pinst.name.name}",
+                    )
+                    vcall = Call(func=Ref(ident=Ident("v")), args=[Ref(ident=Ident(n1)), Ref(ident=Ident(n2))])
+                    safe_r = _ngspice_sanitize_bsource_expr(self._replace_temp_with_temper(r_value))
+                    abs_r = Call(func=Ref(ident=Ident("abs")), args=[safe_r])
+                    denom = BinaryOp(tp=BinaryOperator.ADD, left=abs_r, right=Float(1e-3))
+                    i_expr = BinaryOp(tp=BinaryOperator.DIV, left=vcall, right=denom)
+                    self.write(f"{bname} \n")
+                    self.write("+ " + n1 + " " + n2 + " \n")
+                    self.write("+ I=" + self.format_expr(i_expr) + " \n\n")
+                    return
         
         # Detect if the instance looks like a diode (even if parsed as subcircuit instance)
         # Diodes typically have 2 ports and reference a diode model
@@ -627,7 +790,15 @@ class SpiceNetlister(Netlister):
             and (is_module_ref and module_name_diode) or (not is_module_ref and (name_has_diode or has_diode_params))
         )
 
-        prefix = 'M' if is_mos_like else ('Q' if is_bjt_like else ('R' if is_res_like else ('D' if is_diode_like else 'X')))
+        # Detect capacitor primitives (2-port C devices).
+        has_c_param = 'c' in {p.name.name.lower() for p in pinst.params}
+        is_cap_like = (
+            conn_count == 2
+            and (is_module_ref and module_name_cap and not module_is_subckt)
+            or (not is_module_ref and has_c_param)
+        )
+
+        prefix = 'M' if is_mos_like else ('Q' if is_bjt_like else ('C' if is_cap_like else ('R' if is_res_like else ('D' if is_diode_like else 'X'))))
 
         inst_name = self.format_ident(pinst.name)
         if prefix and not inst_name.upper().startswith(prefix):
@@ -639,11 +810,65 @@ class SpiceNetlister(Netlister):
         # Write its port-connections
         self.write_instance_conns(pinst)
 
-        # For resistors and diodes detected as primitives, don't write the module name (they're primitives)
-        # For other devices, write the sub-circuit/model name
-        if not is_res_like and not is_diode_like:
+        # For capacitors and resistors detected as primitives, don't write the module name here:
+        # - Capacitors: primitive C syntax is positional value.
+        # - Resistors: primitive R syntax is positional value and optionally a model name, and needs
+        #   special ordering (value before model). We'll handle it in the resistor block below.
+        # For diodes, we *must* write the model name (SPICE D element syntax).
+        # For other devices, write the sub-circuit/model name.
+        if not is_res_like and not is_cap_like:
             # Write the sub-circuit name
-            self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
+            if module_is_ref:
+                self.write("+ " + self.format_ident(pinst.module.ident) + " \n")
+            else:
+                self.write("+ " + self.format_ident(pinst.module) + " \n")
+
+        # Capacitor primitives in SPICE take their value positionally, not as `c=<val>`.
+        # Convert a `c=<expr>` ParamVal into a positional value line for ngspice.
+        cap_value: Optional[Expr] = None
+        if is_cap_like:
+            for pv in list(pinst.params):
+                if pv.name.name.lower() == "c":
+                    cap_value = pv.val
+                    break
+            if cap_value is not None:
+                self.write("+ " + self.format_expr(cap_value) + " \n")
+                # Remove the consumed `c=` param from params to avoid emitting `c=...` later.
+                pinst.params = [pv for pv in pinst.params if pv.name.name.lower() != "c"]
+
+        # Resistor primitives: ngspice expects the resistance value positionally, and uses tc1/tc2.
+        if is_res_like and self.enum == NetlistDialects.NGSPICE:
+            r_value: Optional[Expr] = None
+            for pv in list(pinst.params):
+                if pv.name.name.lower() == "r":
+                    r_value = pv.val
+                    break
+            # Resistor model name (optional).
+            # Spectre uses the literal keyword `resistor` for primitive resistors; that is NOT a model name in ngspice.
+            res_model_name: Optional[str] = None
+            if module_is_ref and module_name is not None:
+                mn = str(module_name).strip().lower()
+                if mn not in ("resistor", "r"):
+                    res_model_name = self.format_ident(pinst.module.ident) if module_is_ref else None
+            if r_value is not None:
+                # R <n1> <n2> <model> <value>
+                # Note: ngspice appears to resolve subckt-local model names more reliably when the
+                # model token comes before the value token.
+                if res_model_name:
+                    self.write("+ " + res_model_name + " " + self.format_expr(r_value) + " \n")
+                else:
+                    self.write("+ " + self.format_expr(r_value) + " \n")
+                pinst.params = [pv for pv in pinst.params if pv.name.name.lower() != "r"]
+            elif res_model_name:
+                # R <n1> <n2> <model> [params...]
+                self.write("+ " + res_model_name + " \n")
+            # Rename tc1r/tc2r -> tc1/tc2
+            for pv in pinst.params:
+                n = pv.name.name.lower()
+                if n == "tc1r":
+                    pv.name = Ident("tc1")
+                elif n == "tc2r":
+                    pv.name = Ident("tc2")
 
         # Check if instance parameter expressions reference 'm' and add m={m} if needed
         has_m_in_params = any(p.name.name == "m" for p in pinst.params)
@@ -673,11 +898,34 @@ class SpiceNetlister(Netlister):
                 warn(f"Added m={{m}} parameter to instance {pinst.name.name} (referenced in expressions)")
         
         # Write its parameter values
+        #
+        # Ngspice MOS-instance parameter filtering:
+        # Some Spectre/ Xyce BSIM4 decks use instance-level "multiplier" knobs (e.g. mulvsat, mulu0)
+        # which are not recognized by ngspice and cause hard parse errors ("unknown parameter").
+        # Drop these for ngspice output.
+        params_to_write = pinst.params
+        if is_mos_like and self.enum == NetlistDialects.NGSPICE:
+            unsupported_mos_instance_params = {
+                "mulvsat",
+                "mulu0",
+                "delk1",
+            }
+            filtered: list[ParamVal] = []
+            for pval in params_to_write:
+                if pval.name.name.lower() in unsupported_mos_instance_params:
+                    self.log_warning(
+                        f"Dropping unsupported ngspice MOS instance parameter '{pval.name.name}'",
+                        context=f"Instance {pinst.name.name}",
+                    )
+                    continue
+                filtered.append(pval)
+            params_to_write = filtered
+
         # For resistors, replace 'temp' with 'temper' in expressions (ngspice uses 'temper' as built-in)
         if is_res_like:
             # Create modified params with temp->temper replacement
             modified_params = []
-            for pval in pinst.params:
+            for pval in params_to_write:
                 if isinstance(pval.val, Expr):
                     # Replace temp references with temper in expressions
                     modified_val = self._replace_temp_with_temper(pval.val)
@@ -686,7 +934,7 @@ class SpiceNetlister(Netlister):
                     modified_params.append(pval)
             self.write_instance_params(modified_params)
         else:
-            self.write_instance_params(pinst.params)
+            self.write_instance_params(params_to_write)
 
         # Add a blank after each instance
         self.write("\n")
@@ -696,13 +944,130 @@ class SpiceNetlister(Netlister):
         Note spice's primitive instances often differn syntactically from sub-circuit instances,
         in that they can have positional (only) parameters."""
 
+        # ngspice: translate voltage-dependent resistors to behavioral B-sources.
+        # Some Spectre decks express non-linear resistors as `r={...v(...)...}`.
+        # ngspice 45.2 has been observed to segfault on some of these when kept as `R ... r={...}`.
+        # Emit an equivalent current source:
+        #   I = V(p,n) / r
+        # which matches the Xyce bsource r=<expr> translation pattern.
+        if self.enum == NetlistDialects.NGSPICE:
+            # Identify resistor primitives by presence of `r=` kwarg and at least two terminals.
+            r_kw = next((kw for kw in (pinst.kwargs or []) if kw.name.name.lower() == "r"), None)
+            if r_kw is not None and len(pinst.args) >= 2 and isinstance(r_kw.val, Expr):
+                def _expr_calls_v(expr: Expr) -> bool:
+                    if isinstance(expr, Call) and isinstance(expr.func, Ref):
+                        return expr.func.ident.name.lower() == "v" or any(_expr_calls_v(a) for a in expr.args)
+                    if isinstance(expr, BinaryOp):
+                        return _expr_calls_v(expr.left) or _expr_calls_v(expr.right)
+                    if isinstance(expr, UnaryOp):
+                        return _expr_calls_v(expr.targ)
+                    if isinstance(expr, TernOp):
+                        return _expr_calls_v(expr.cond) or _expr_calls_v(expr.if_true) or _expr_calls_v(expr.if_false)
+                    return False
+
+                if _expr_calls_v(r_kw.val):
+                    def _ngspice_sanitize_bsource_expr(expr: Expr) -> Expr:
+                        """Rewrite expression to avoid ngspice behavioral-source crash modes."""
+                        from ..data import Int, Float, MetricNum
+
+                        def _func_name(call: Call) -> Optional[str]:
+                            if isinstance(call.func, Ref):
+                                return call.func.ident.name
+                            if isinstance(call.func, Ident):
+                                return call.func.name
+                            return None
+
+                        def _is_abs_call(e: Expr) -> bool:
+                            return isinstance(e, Call) and isinstance(e.func, Ref) and e.func.ident.name.lower() == "abs"
+
+                        if isinstance(expr, Call):
+                            name = (_func_name(expr) or "").lower()
+                            args = [_ngspice_sanitize_bsource_expr(a) for a in expr.args]
+
+                            # max(a,b) -> abs(a) + b (used for floors like max(abs(x), 1e-3))
+                            if name == "max" and len(args) == 2 and isinstance(args[1], (Int, Float, MetricNum)):
+                                a0 = args[0]
+                                b0 = args[1]
+                                a_abs = a0 if _is_abs_call(a0) else Call(func=Ref(ident=Ident("abs")), args=[a0])
+                                return BinaryOp(tp=BinaryOperator.ADD, left=a_abs, right=b0)
+
+                            # pwr/pow(base, exp) -> exp(exp * ln(abs(base) + eps))
+                            if name in ("pwr", "pow") and len(args) == 2:
+                                base = args[0]
+                                expo = args[1]
+                                base_abs = base if _is_abs_call(base) else Call(func=Ref(ident=Ident("abs")), args=[base])
+                                base_abs_eps = BinaryOp(tp=BinaryOperator.ADD, left=base_abs, right=Float(1e-30))
+                                ln_call = Call(func=Ref(ident=Ident("ln")), args=[base_abs_eps])
+                                mul = BinaryOp(tp=BinaryOperator.MUL, left=expo, right=ln_call)
+                                return Call(func=Ref(ident=Ident("exp")), args=[mul])
+
+                            return Call(func=expr.func, args=args)
+
+                        if isinstance(expr, BinaryOp):
+                            return BinaryOp(
+                                tp=expr.tp,
+                                left=_ngspice_sanitize_bsource_expr(expr.left),
+                                right=_ngspice_sanitize_bsource_expr(expr.right),
+                            )
+                        if isinstance(expr, UnaryOp):
+                            return UnaryOp(tp=expr.tp, targ=_ngspice_sanitize_bsource_expr(expr.targ))
+                        if isinstance(expr, TernOp):
+                            return TernOp(
+                                cond=_ngspice_sanitize_bsource_expr(expr.cond),
+                                if_true=_ngspice_sanitize_bsource_expr(expr.if_true),
+                                if_false=_ngspice_sanitize_bsource_expr(expr.if_false),
+                            )
+                        return expr
+
+                    def _node_name(a: Expr) -> Optional[str]:
+                        if isinstance(a, Ident):
+                            return a.name
+                        if isinstance(a, Ref):
+                            return a.ident.name
+                        return None
+                    n1 = _node_name(pinst.args[0])
+                    n2 = _node_name(pinst.args[1])
+                    if n1 and n2:
+                        base_name = self.format_ident(pinst.name)
+                        bname = base_name if base_name.lower().startswith("bsource_") else f"Bsource_{base_name}"
+                        self.log_warning(
+                            "Translated voltage-dependent resistor r={...v(...)} into B-source current I=V(p,n)/r for ngspice",
+                            context=f"Primitive {pinst.name.name}",
+                        )
+                        vcall = Call(func=Ref(ident=Ident("v")), args=[Ref(ident=Ident(n1)), Ref(ident=Ident(n2))])
+                        safe_r = _ngspice_sanitize_bsource_expr(self._replace_temp_with_temper(r_kw.val))
+                        abs_r = Call(func=Ref(ident=Ident("abs")), args=[safe_r])
+                        denom = BinaryOp(tp=BinaryOperator.ADD, left=abs_r, right=Float(1e-3))
+                        i_expr = BinaryOp(tp=BinaryOperator.DIV, left=vcall, right=denom)
+                        self.write(f"{bname} \n")
+                        self.write("+ " + n1 + " " + n2 + " \n")
+                        self.write("+ I=" + self.format_expr(i_expr) + " \n\n")
+                        return
+
         is_mos_like = (
             len(pinst.args) == 5  # Exactly 4 ports + 1 model
             and isinstance(pinst.args[-1], Ref)  # Last arg is the model reference
             and {'l', 'w'} <= {p.name.name for p in pinst.kwargs}  # Has both 'l' and 'w' params
             and any(keyword in pinst.name.name.lower() for keyword in ['mos', 'fet', 'pmos', 'nmos'])  # Instance name indicates MOS
         )
+        # If the "model" argument actually refers to a subckt (common with diode-looking primitives
+        # in Spectre), emit it as an X-instance so ngspice doesn't try to resolve it as a .model.
         prefix = 'M' if is_mos_like else ''
+        try:
+            if len(pinst.args) > 0 and isinstance(pinst.args[-1], Ref):
+                model_name = pinst.args[-1].ident.name
+                if not hasattr(self, "_known_subckt_names"):
+                    from ..data import SubcktDef
+                    names = set()
+                    for sf in getattr(self.src, "files", []) or []:
+                        for e in getattr(sf, "contents", []) or []:
+                            if isinstance(e, SubcktDef):
+                                names.add(e.name.name)
+                    self._known_subckt_names = names
+                if model_name in getattr(self, "_known_subckt_names", set()):
+                    prefix = 'X'
+        except Exception:
+            pass
         inst_name = self.format_ident(pinst.name)
         if prefix and not inst_name.upper().startswith(prefix):
             inst_name = f"{prefix}{inst_name}"
@@ -733,14 +1098,30 @@ class SpiceNetlister(Netlister):
         # Write the model (last arg) on another continuation line
         self.write("+ " + self.format_ident(pinst.args[-1]) + " \n")
 
-        # Filter deltox and delvto from instance parameters if this instance references a BSIM4 model
-        # ngspice's BSIM4 model doesn't support these parameters on instances
+        # Filter instance parameters if this instance references a BSIM4 model.
+        #
+        # ngspice's BSIM4 does not support several dialect instance-level knobs that show up in
+        # Spectre/ Xyce decks. Keep the model instantiable by dropping them here.
         kwargs_to_write = pinst.kwargs
+        # ngspice: drop known-unsupported MOS instance knobs even when we can't reliably resolve the model.
+        if is_mos_like and self.enum == NetlistDialects.NGSPICE:
+            kwargs_to_write = [kw for kw in kwargs_to_write if kw.name.name.lower() not in {"delk1"}]
         if len(pinst.args) > 0 and isinstance(pinst.args[-1], Ref):
             module_ref = pinst.args[-1]
             if self._is_bsim4_model_ref(module_ref):
-                # Filter deltox and delvto from instance parameters
-                kwargs_to_write = [kw for kw in pinst.kwargs if kw.name.name not in ("deltox", "delvto", "dtox")]
+                unsupported_bsim4_instance_params = {
+                    "deltox",
+                    "dtox",
+                    "delvto",
+                    # Multipliers commonly used in some decks but not recognized by ngspice
+                    "mulvsat",
+                    "mulu0",
+                    # Some S130 HV devices use delk1 as an instance knob; ngspice does not accept it
+                    "delk1",
+                }
+                kwargs_to_write = [
+                    kw for kw in pinst.kwargs if kw.name.name.lower() not in unsupported_bsim4_instance_params
+                ]
 
         self.write("+ ")
         for kwarg in kwargs_to_write:
@@ -782,6 +1163,10 @@ class SpiceNetlister(Netlister):
         self.write("+ ")
 
         if not pvals:  # Write a quick comment for no parameters
+            # ngspice does not support inline `*` comments on continuation lines (`+ * ...`).
+            if self.enum == NetlistDialects.NGSPICE:
+                self.write("\n")
+                return
             return self.write_comment("No parameters")
 
         # And write them
@@ -1093,6 +1478,142 @@ class NgspiceNetlister(SpiceNetlister):
             self.write(conn_name + " ")
         self.write("\n")
 
+    def write_module_params(self, params: List[ParamDecl]) -> None:
+        """Write subckt parameter declarations for ngspice.
+
+        Additionally, handle BSIM4 `binunit=2` decks which expect instance L/W in microns.
+        Many Spectre sources keep default `w/l` values in SI metric form (e.g. 60u, 2u).
+        When a local BSIM4 model variant inside this subckt declares `binunit=2`, emit
+        `w`/`l` defaults converted to microns (60u -> 60.0) in the `.SUBCKT` PARAM line.
+        """
+        import re
+        from ..data import MetricNum, Float, Int, ModelVariant, ModelDef, ModelFamily
+
+        def metric_to_si(s: str) -> Optional[float]:
+            t = str(s).strip().lower()
+            if not t:
+                return None
+            if t.endswith("meg"):
+                try:
+                    return float(t[:-3]) * 1e6
+                except Exception:
+                    return None
+            m = re.match(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)([a-z]+)?$", t)
+            if not m:
+                return None
+            base = float(m.group(1))
+            suf = (m.group(2) or "")
+            mult = {
+                "t": 1e12,
+                "g": 1e9,
+                "k": 1e3,
+                "m": 1e-3,
+                "u": 1e-6,
+                "n": 1e-9,
+                "p": 1e-12,
+                "f": 1e-15,
+                "": 1.0,
+            }.get(suf)
+            if mult is None:
+                return None
+            return base * mult
+
+        # Heuristic: some S130 decks treat `w/l` as micron-like numbers inside the subckt equations
+        # (e.g. expressions like (w+11)). In ngspice, we must emit those defaults without SI suffixes.
+        def _expr_has_ref(name: str, expr) -> bool:
+            if expr is None:
+                return False
+            from ..data import Ref, BinaryOp, UnaryOp, TernOp, Call
+            if isinstance(expr, Ref):
+                return expr.ident.name == name
+            if isinstance(expr, BinaryOp):
+                return _expr_has_ref(name, expr.left) or _expr_has_ref(name, expr.right)
+            if isinstance(expr, UnaryOp):
+                return _expr_has_ref(name, getattr(expr, "targ", None) or getattr(expr, "expr", None))
+            if isinstance(expr, TernOp):
+                return _expr_has_ref(name, expr.cond) or _expr_has_ref(name, expr.if_true) or _expr_has_ref(name, expr.if_false)
+            if isinstance(expr, Call):
+                return any(_expr_has_ref(name, a) for a in expr.args)
+            return False
+
+        def _expr_has_ref_plus_big(name: str, expr) -> bool:
+            from ..data import BinaryOp, BinaryOperator, Ref, Int, Float, MetricNum
+            if expr is None:
+                return False
+            if isinstance(expr, BinaryOp) and expr.tp == BinaryOperator.ADD:
+                a, b = expr.left, expr.right
+                def is_ref(e): return isinstance(e, Ref) and e.ident.name == name
+                def num_val(e):
+                    if isinstance(e, Int): return float(e.val)
+                    if isinstance(e, Float): return float(e.val)
+                    if isinstance(e, MetricNum):
+                        si = metric_to_si(e.val)
+                        return float(si) if si is not None else None
+                    return None
+                if is_ref(a):
+                    nv = num_val(b)
+                    if nv is not None and nv >= 1.0:
+                        return True
+                if is_ref(b):
+                    nv = num_val(a)
+                    if nv is not None and nv >= 1.0:
+                        return True
+            # Recurse
+            from ..data import BinaryOp as B, UnaryOp, TernOp, Call
+            if isinstance(expr, B):
+                return _expr_has_ref_plus_big(name, expr.left) or _expr_has_ref_plus_big(name, expr.right)
+            if isinstance(expr, UnaryOp):
+                return _expr_has_ref_plus_big(name, getattr(expr, "targ", None) or getattr(expr, "expr", None))
+            if isinstance(expr, TernOp):
+                return _expr_has_ref_plus_big(name, expr.cond) or _expr_has_ref_plus_big(name, expr.if_true) or _expr_has_ref_plus_big(name, expr.if_false)
+            if isinstance(expr, Call):
+                return any(_expr_has_ref_plus_big(name, a) for a in expr.args)
+            return False
+
+        w_is_micron_like = False
+        l_is_micron_like = False
+        cur = getattr(self, "_current_subckt", None)
+        if cur is not None:
+            # First, scan this subckt's own parameter defaults (these often contain (w+11) style terms).
+            for pd in params:
+                d = getattr(pd, "default", None)
+                if _expr_has_ref_plus_big("w", d):
+                    w_is_micron_like = True
+                if _expr_has_ref_plus_big("l", d):
+                    l_is_micron_like = True
+
+            # Look for obvious micron-like usage in parameter defaults and primitive args/params.
+            for ent in getattr(cur, "entries", []) or []:
+                # ParamDecls blocks
+                if hasattr(ent, "params") and isinstance(getattr(ent, "params", None), list):
+                    for pd in ent.params:
+                        d = getattr(pd, "default", None)
+                        if _expr_has_ref_plus_big("w", d):
+                            w_is_micron_like = True
+                        if _expr_has_ref_plus_big("l", d):
+                            l_is_micron_like = True
+                # Early exit if both found
+                if w_is_micron_like and l_is_micron_like:
+                    break
+
+        self.write("+ ")
+        for param in params:
+            # Convert w/l defaults for micron-like subckt equations: SI meters -> microns.
+            if (
+                param.name.name in ("w", "l")
+                and isinstance(param.default, MetricNum)
+                and ((param.name.name == "w" and w_is_micron_like) or (param.name.name == "l" and l_is_micron_like))
+            ):
+                si = metric_to_si(param.default.val)
+                if si is not None:
+                    tmp = ParamDecl(name=param.name, default=Float(si * 1e6), distr=param.distr, comment=param.comment)
+                    self.write_param_decl(tmp)
+                    self.write(" ")
+                    continue
+            self.write_param_decl(param)
+            self.write(" ")
+        self.write("\n")
+
     def __init__(self, src: Program, dest: IO, *, errormode: ErrorMode = ErrorMode.RAISE, file_type: str = "", includes: List[Tuple[str, str]] = None, model_file: str = None, model_level_mapping: Optional[Dict[str, List[Tuple[int, int]]]] = None, options = None) -> None:
         super().__init__(src, dest, errormode=errormode, file_type=file_type, options=options)
         self.includes = includes or []
@@ -1145,6 +1666,15 @@ class NgspiceNetlister(SpiceNetlister):
             # Replace round() with nint() for ngspice compatibility
             if func.lower() == "round":
                 func = "nint"
+            # Spectre often uses pwr(x,y); ngspice uses pow(x,y)
+            if func.lower() == "pwr":
+                func = "pow"
+            # ngspice sometimes behaves poorly with v(n1,n2) in complex expressions.
+            # Emit the equivalent (v(n1)-v(n2)) form instead when possible.
+            if func.lower() == "v" and len(expr.args) == 2:
+                a0 = self._format_expr_inner(expr.args[0])
+                a1 = self._format_expr_inner(expr.args[1])
+                return f"(v({a0})-v({a1}))"
             args = [self._format_expr_inner(arg) for arg in expr.args]
             return f"{func}({','.join(args)})"
         
@@ -1314,7 +1844,104 @@ class NgspiceNetlister(SpiceNetlister):
                         f.flush()
                 except:
                     pass
-        
+
+        # Normalize local model references for ngspice:
+        # If models are emitted as `.model foo.0`, `.model foo.1`, etc, primitive instances
+        # must reference an actual emitted model name. Spectre often references `foo`;
+        # map such references to the *lowest* numeric suffix present (typically `.0`).
+        import re as _re
+        from ..data import ModelDef as _ModelDef
+
+        base_to_min_suffix: Dict[str, int] = {}
+        for e in module.entries:
+            if isinstance(e, _ModelDef):
+                m = _re.match(r"^(.+)\.(\d+)$", e.name.name)
+                if m:
+                    base = m.group(1)
+                    suf = int(m.group(2))
+                    base_to_min_suffix[base] = min(base_to_min_suffix.get(base, suf), suf)
+
+        def _map_model_base(name: str) -> str:
+            if name in base_to_min_suffix:
+                return f"{name}.{base_to_min_suffix[name]}"
+            return name
+
+        for entry in module.entries:
+            if isinstance(entry, Primitive) and entry.args:
+                # Primitive MOS: last arg is the model-name, which may appear as Ref or Ident.
+                if isinstance(entry.args[-1], Ref):
+                    entry.args[-1].ident = Ident(_map_model_base(entry.args[-1].ident.name))
+                elif isinstance(entry.args[-1], Ident):
+                    entry.args[-1] = Ident(_map_model_base(entry.args[-1].name))
+            if isinstance(entry, Instance) and isinstance(entry.module, Ref):
+                entry.module.ident = Ident(_map_model_base(entry.module.ident.name))
+
+        # ngspice stability workaround (default):
+        # ngspice 45.2 has been observed to segfault on some very large v()-heavy expressions used
+        # as non-linear resistor values (e.g. `r={... v(g,s) ... pow(...) ...}`) in DE_* devices.
+        #
+        # To keep ngspice usable out-of-the-box, we *simplify* these to a bias-independent form.
+        # The exact behavioral translation can be enabled via NETLIST_NGSPICE_BSOURCE_NL_R=1.
+        import os as _os
+        if _os.getenv("NETLIST_NGSPICE_BSOURCE_NL_R", "0") != "1":
+            from ..data import Call as _Call, BinaryOp as _BinaryOp, BinaryOperator as _BinaryOperator, Float as _Float
+
+            def _expr_calls_vi(expr: Expr) -> bool:
+                if isinstance(expr, _Call) and isinstance(expr.func, Ref):
+                    fn = expr.func.ident.name.lower()
+                    if fn in ("v", "i"):
+                        return True
+                    return any(_expr_calls_vi(a) for a in expr.args)
+                if isinstance(expr, BinaryOp):
+                    return _expr_calls_vi(expr.left) or _expr_calls_vi(expr.right)
+                if isinstance(expr, UnaryOp):
+                    return _expr_calls_vi(expr.targ)
+                if isinstance(expr, TernOp):
+                    return _expr_calls_vi(expr.cond) or _expr_calls_vi(expr.if_true) or _expr_calls_vi(expr.if_false)
+                return False
+
+            def _find_ref_with_prefix(expr: Expr, prefix: str) -> Optional[str]:
+                if isinstance(expr, Ref):
+                    n = expr.ident.name
+                    return n if n.lower().startswith(prefix) else None
+                if isinstance(expr, _Call):
+                    for a in expr.args:
+                        f = _find_ref_with_prefix(a, prefix)
+                        if f:
+                            return f
+                    return None
+                if isinstance(expr, BinaryOp):
+                    return _find_ref_with_prefix(expr.left, prefix) or _find_ref_with_prefix(expr.right, prefix)
+                if isinstance(expr, UnaryOp):
+                    return _find_ref_with_prefix(expr.targ, prefix)
+                if isinstance(expr, TernOp):
+                    return (
+                        _find_ref_with_prefix(expr.cond, prefix)
+                        or _find_ref_with_prefix(expr.if_true, prefix)
+                        or _find_ref_with_prefix(expr.if_false, prefix)
+                    )
+                return None
+
+            for e in module.entries:
+                if isinstance(e, Primitive):
+                    for kw in getattr(e, "kwargs", []) or []:
+                        if kw.name.name.lower() == "r" and isinstance(kw.val, Expr) and _expr_calls_vi(kw.val):
+                            # Prefer abs((1/w)*rdrift*) if present, else 1k.
+                            rdr = _find_ref_with_prefix(kw.val, "rdrift")
+                            if rdr:
+                                kw.val = _Call(
+                                    func=Ref(ident=Ident("abs")),
+                                    args=[
+                                        _BinaryOp(
+                                            tp=_BinaryOperator.MUL,
+                                            left=_BinaryOp(tp=_BinaryOperator.DIV, left=_Float(1.0), right=Ref(ident=Ident("w"))),
+                                            right=Ref(ident=Ident(rdr)),
+                                        )
+                                    ],
+                                )
+                            else:
+                                kw.val = _Float(1e3)
+
         if debug:
             try:
                 with open('/tmp/ngspice_delvto_debug.log', 'a') as f:
@@ -1323,9 +1950,13 @@ class NgspiceNetlister(SpiceNetlister):
             except:
                 pass
                     
-        # 2. Process delvto if subcircuit has BSIM4 model and delvto parameter
+        # 2. Collect instance-level delvto/deltox values (and remove them from instances).
+        # We'll re-introduce them as subckt-level `.param dvth0=...` and `.param dtox=...`
+        # so ngspice BSIM4 devices remain instantiable.
         needs_dvth0_param = False
+        needs_dtox_param = False
         delvto_entries = []
+        deltox_entries = []
         
         if has_bsim4_model and has_delvto:
             if debug:
@@ -1371,39 +2002,61 @@ class NgspiceNetlister(SpiceNetlister):
                         entry.params = params_to_keep
                     elif isinstance(entry, Primitive):
                         entry.kwargs = kwargs_to_keep
-                
-                # Handle deltox -> dtox for local models only
-                if dtox_val is not None:
-                    model_name = None
-                    if isinstance(entry, Instance) and isinstance(entry.module, Ref):
-                        model_name = entry.module.ident.name
-                    elif isinstance(entry, Primitive) and len(entry.args) > 0 and isinstance(entry.args[-1], Ref):
-                        model_name = entry.args[-1].ident.name
-                    
-                    if model_name and model_name in local_models:
-                        model = local_models[model_name]
-                        
-                        def add_dtox(params_list, val):
-                            new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
-                            new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
-                            return new_params
 
-                        if isinstance(model, ModelDef):
-                            model.params = add_dtox(model.params, dtox_val)
-                        elif isinstance(model, ModelFamily):
-                            for variant in model.variants:
-                                variant.params = add_dtox(variant.params, dtox_val)
+                if dtox_val is not None:
+                    needs_dtox_param = True
+                    deltox_entries.append((entry, dtox_val, "dtox"))
+                
+                # NOTE:
+                # We intentionally do NOT push dtox_val directly onto `.model` cards here.
+                # Instead we will define `.param dtox=<expr>` in the subckt body and make
+                # models reference `dtox`, which ngspice can evaluate.
         
-        # 3. Add dvth0 parameter to subcircuit if needed, and modify model vth0
+        # 3. Define subckt-level dvth0/dtox params (ngspice-friendly), and fold them into model cards.
+        dvth0_expr: Optional[Expr] = None
+        dtox_expr: Optional[Expr] = None
+
+        # Prefer subckt PARAMS `delvto`/`deltox` when they exist.
+        has_delvto_param = any(p.name.name == "delvto" for p in module.params)
+        has_deltox_param = any(p.name.name == "deltox" for p in module.params)
+
         if needs_dvth0_param:
-            # Check if dvth0 already exists in subcircuit params
-            has_dvth0 = any(p.name.name == "dvth0" for p in module.params)
-            if not has_dvth0:
-                dvth0_param = ParamDecl(name=Ident("dvth0"), default=Float(0.0), distr=None)
-                module.params.append(dvth0_param)
-            
-            # Modify model's vth0 parameter to include dvth0
-            # Since models are defined inside the subcircuit, they should have access to subcircuit parameters
+            if has_delvto_param:
+                dvth0_expr = Ref(ident=Ident("delvto"))
+            elif delvto_entries:
+                # If multiple delvto expressions exist, we can only represent one dvth0.
+                first = delvto_entries[0][1]
+                if all(str(e[1]) == str(first) for e in delvto_entries):
+                    dvth0_expr = first
+                else:
+                    self.log_warning(
+                        "Ngspice: multiple distinct instance-level delvto expressions in one subckt; "
+                        "cannot represent per-instance delvto via a single dvth0. Using dvth0=0.",
+                        context=f"Subckt {subckt_name}",
+                    )
+                    dvth0_expr = Float(0.0)
+            else:
+                dvth0_expr = Float(0.0)
+
+        if needs_dtox_param:
+            if has_deltox_param:
+                dtox_expr = Ref(ident=Ident("deltox"))
+            elif deltox_entries:
+                first = deltox_entries[0][1]
+                if all(str(e[1]) == str(first) for e in deltox_entries):
+                    dtox_expr = first
+                else:
+                    self.log_warning(
+                        "Ngspice: multiple distinct instance-level deltox/dtox expressions in one subckt; "
+                        "cannot represent per-instance deltox via a single dtox. Using dtox=0.",
+                        context=f"Subckt {subckt_name}",
+                    )
+                    dtox_expr = Float(0.0)
+            else:
+                dtox_expr = Float(0.0)
+
+        # Modify model's vth0 parameter to include dvth0
+        if dvth0_expr is not None:
             for model_name, model in local_models.items():
                 def modify_vth0(params_list):
                     new_params = []
@@ -1461,7 +2114,46 @@ class NgspiceNetlister(SpiceNetlister):
                         except:
                             pass
             
-            # We don't pass dvth0 to instances - it's incorporated into the model's vth0 instead
+        # Modify model's dtox parameter to include dtox
+        if dtox_expr is not None:
+            for model_name, model in local_models.items():
+                def modify_dtox(params_list):
+                    new_params = []
+                    dtox_found = False
+                    dtox_ref = Ref(ident=Ident("dtox"))
+                    for p in params_list:
+                        if p.name.name == "dtox":
+                            dtox_found = True
+                            if p.default is None:
+                                new_params.append(ParamDecl(name=p.name, default=dtox_ref, distr=p.distr, comment=p.comment))
+                            elif isinstance(p.default, (Int, Float, MetricNum)):
+                                # If dtox is literal 0, replace it; else add.
+                                try:
+                                    lit = float(p.default.val) if hasattr(p.default, "val") else float(p.default)
+                                    if lit == 0.0:
+                                        new_params.append(ParamDecl(name=p.name, default=dtox_ref, distr=p.distr, comment=p.comment))
+                                    else:
+                                        dtox_expr2 = BinaryOp(tp=BinaryOperator.ADD, left=p.default, right=dtox_ref)
+                                        new_params.append(ParamDecl(name=p.name, default=dtox_expr2, distr=p.distr, comment=p.comment))
+                                except Exception:
+                                    dtox_expr2 = BinaryOp(tp=BinaryOperator.ADD, left=p.default, right=dtox_ref)
+                                    new_params.append(ParamDecl(name=p.name, default=dtox_expr2, distr=p.distr, comment=p.comment))
+                            elif isinstance(p.default, Expr):
+                                dtox_expr2 = BinaryOp(tp=BinaryOperator.ADD, left=p.default, right=dtox_ref)
+                                new_params.append(ParamDecl(name=p.name, default=dtox_expr2, distr=p.distr, comment=p.comment))
+                            else:
+                                new_params.append(ParamDecl(name=p.name, default=dtox_ref, distr=p.distr, comment=p.comment))
+                        else:
+                            new_params.append(p)
+                    if not dtox_found:
+                        new_params.append(ParamDecl(name=Ident("dtox"), default=dtox_ref, distr=None))
+                    return new_params
+
+                if isinstance(model, ModelDef):
+                    model.params = modify_dtox(model.params)
+                elif isinstance(model, ModelFamily):
+                    for variant in model.variants:
+                        variant.params = modify_dtox(variant.params)
         
         # Store current subcircuit context for use in write_subckt_instance
         self._current_subckt = module
@@ -1499,6 +2191,165 @@ class NgspiceNetlister(SpiceNetlister):
         if needs_m_param and not has_m_param:
             m_param = ParamDecl(name=Ident("m"), default=Float(1.0), distr=None)
             module.params.append(m_param)
+
+        # Avoid ngspice blowing up on required geometry params (default=None) by assigning sane defaults.
+        # The base writer substitutes `sys.float_info.max`, which leads to INF computations in PDK equations.
+        for p in module.params:
+            if p.default is None and p.name.name in ("w", "l"):
+                # Use a unitless default of 1.0.
+                #
+                # Many S130 passive subcircuits (e.g. poly/ well resistors) treat w/l as
+                # dimensionless "micron-like" numbers inside equation-based .param blocks.
+                # Setting these to ~meters (e.g. 10e-6) can make internal "effective length"
+                # calculations go negative and yield NaNs during ngspice's early parameter evaluation.
+                p.default = Float(1.0)
+            if p.default is None and p.name.name in ("area", "perim"):
+                p.default = Float(1e-12)
+
+        # BSIM4 binunit=2 handling (micron-based L/W):
+        #
+        # Several S130 BSIM4 models declare `binunit=2` (meaning L/W are in microns).
+        # For ngspice with binunit=2, instance L/W must be passed in **microns**.
+        #
+        # Convert subckt parameter defaults for `w`/`l` from MetricNum SI into Float microns
+        # when this subckt contains a local BSIM4 model (often embedded as `ModelVariant`)
+        # with `binunit=2`.
+        def _metric_to_float_si(s: str) -> Optional[float]:
+            """Parse a metric-suffixed string like '60u' to an SI float (meters)."""
+            import re
+            if s is None:
+                return None
+            t = str(s).strip().lower()
+            if not t:
+                return None
+            # Handle MEG explicitly (case-insensitive)
+            if t.endswith("meg"):
+                try:
+                    return float(t[:-3]) * 1e6
+                except Exception:
+                    return None
+            m = re.match(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)([a-z]+)?$", t)
+            if not m:
+                return None
+            base = float(m.group(1))
+            suf = (m.group(2) or "")
+            mult = {
+                "t": 1e12,
+                "g": 1e9,
+                "k": 1e3,
+                "m": 1e-3,
+                "u": 1e-6,
+                "n": 1e-9,
+                "p": 1e-12,
+                "f": 1e-15,
+                "": 1.0,
+            }.get(suf)
+            if mult is None:
+                return None
+            return base * mult
+
+        # Detect binunit=2 in any local model entry.
+        # Spectre frequently embeds the BSIM4 modelcard as a `ModelVariant` inside the subckt.
+        binunit_is_2 = False
+
+        def _has_binunit2_in_params(params) -> bool:
+            for pp in params or []:
+                pp_obj = pp[0] if isinstance(pp, tuple) else pp
+                pname = getattr(getattr(pp_obj, "name", None), "name", None)
+                if not isinstance(pname, str) or pname.lower() != "binunit":
+                    continue
+                d = getattr(pp_obj, "default", None)
+                if d is None:
+                    continue
+                raw = getattr(d, "val", d)
+                try:
+                    v = _metric_to_float_si(raw) if isinstance(raw, str) else float(raw)
+                except Exception:
+                    continue
+                if v == 2.0:
+                    return True
+            return False
+
+        for entry in module.entries:
+            # ModelDef / ModelVariant-like
+            if hasattr(entry, "params") and _has_binunit2_in_params(getattr(entry, "params", None)):
+                binunit_is_2 = True
+                break
+            # ModelFamily-like
+            if hasattr(entry, "variants"):
+                for var in getattr(entry, "variants", []) or []:
+                    if hasattr(var, "params") and _has_binunit2_in_params(getattr(var, "params", None)):
+                        binunit_is_2 = True
+                        break
+                if binunit_is_2:
+                    break
+
+        # Fallback: detect binunit=2 via referenced MOS model (common when models live at file scope).
+        if not binunit_is_2:
+            from ..data import Primitive, Ref, ModelDef, ModelFamily
+
+            def _model_binunit_is_2(model_name: str) -> bool:
+                # Prefer resolved reference if available somewhere else; otherwise scan program.
+                for sf in getattr(self.src, "files", []) or []:
+                    for ent in getattr(sf, "contents", []) or []:
+                        if isinstance(ent, ModelDef) and ent.name.name == model_name:
+                            for pp in ent.params:
+                                if pp.name.name.lower() == "binunit" and isinstance(pp.default, (Int, Float)) and float(pp.default.val) == 2.0:
+                                    return True
+                            return False
+                        if isinstance(ent, ModelFamily) and ent.name.name == model_name:
+                            for var in ent.variants:
+                                for pp in var.params:
+                                    if pp.name.name.lower() == "binunit" and isinstance(pp.default, (Int, Float)) and float(pp.default.val) == 2.0:
+                                        return True
+                            return False
+                return False
+
+            for ent in module.entries:
+                if not isinstance(ent, Primitive):
+                    continue
+                # MOS primitive usually: 4 nodes + model ref
+                if len(getattr(ent, "args", []) or []) >= 5 and isinstance(ent.args[-1], Ref):
+                    model_name = ent.args[-1].ident.name
+                    if _model_binunit_is_2(model_name):
+                        binunit_is_2 = True
+                        break
+
+        # DEBUG (temporary): confirm binunit detection for problematic DE devices
+        if subckt_name in ("nmos_de_iso_v20", "nmos_de_v20"):
+            try:
+                with open("/tmp/ngspice_binunit_debug.log", "a") as f:
+                    first_params = [(p.name.name, getattr(p.default, "val", None), type(p.default).__name__) for p in module.params[:2]]
+                    f.write(f"[binunit] {subckt_name}: binunit_is_2={binunit_is_2}; first_params={first_params}\\n")
+                    f.flush()
+            except Exception:
+                pass
+
+        if binunit_is_2:
+            for p in module.params:
+                if p.name.name not in ("w", "l"):
+                    continue
+                if isinstance(p.default, MetricNum):
+                    meters = _metric_to_float_si(p.default.val)
+                    if subckt_name in ("nmos_de_iso_v20", "nmos_de_v20"):
+                        try:
+                            with open("/tmp/ngspice_binunit_debug.log", "a") as f:
+                                f.write(f"[binunit-convert] {subckt_name}: {p.name.name} raw={p.default.val!r} meters={meters!r}\\n")
+                                f.flush()
+                        except Exception:
+                            pass
+                    if meters is not None:
+                        p.default = Float(meters * 1e6)
+
+        # DEBUG (temporary): confirm w/l mutation actually happened
+        if subckt_name in ("nmos_de_iso_v20", "nmos_de_v20"):
+            try:
+                with open("/tmp/ngspice_binunit_debug.log", "a") as f:
+                    first_params2 = [(p.name.name, getattr(p.default, "val", None), type(p.default).__name__) for p in module.params[:2]]
+                    f.write(f"[binunit-after] {subckt_name}: first_params={first_params2}\\n")
+                    f.flush()
+            except Exception:
+                pass
         
         # Create its parameters, if any are defined
         if module.params:
@@ -1511,6 +2362,12 @@ class NgspiceNetlister(SpiceNetlister):
         # End the `subckt` header-content with a blank line
         self.write("\n")
 
+        # Emit dvth0/dtox as `.param` *before* any `.model` cards so ngspice can evaluate them.
+        if dvth0_expr is not None:
+            self.write(f".param dvth0={self.format_expr(dvth0_expr)}\n")
+        if dtox_expr is not None:
+            self.write(f".param dtox={self.format_expr(dtox_expr)}\n")
+
         # For ngspice: Check if any models inside this subcircuit reference subcircuit parameters
         # If so, add .param statements for those parameters to ensure they're in scope when models are evaluated
         if module.params:
@@ -1519,7 +2376,12 @@ class NgspiceNetlister(SpiceNetlister):
             # Collect parameter names from subcircuit
             subckt_param_names = {p.name.name for p in module.params}
             
-            # Check all entries for models and instances that reference subcircuit parameters
+            # Collect subckt params referenced by `.model` cards.
+            #
+            # NOTE:
+            # We intentionally do *not* alias parameters referenced by element-instance lines here.
+            # Subckt parameters are already visible in instance-value expressions, and trying to
+            # re-define them via `.param name={name}` can create self-referential loops in ngspice.
             params_needed_as_param_statements = set()
             for entry in module.entries:
                 if isinstance(entry, ModelDef):
@@ -1530,7 +2392,6 @@ class NgspiceNetlister(SpiceNetlister):
                             for subckt_param_name in subckt_param_names:
                                 if expr_references_param(param.default, subckt_param_name):
                                     params_needed_as_param_statements.add(subckt_param_name)
-                                    break
                 elif isinstance(entry, ModelFamily):
                     # Check all variants
                     for variant in entry.variants:
@@ -1539,52 +2400,14 @@ class NgspiceNetlister(SpiceNetlister):
                                 for subckt_param_name in subckt_param_names:
                                     if expr_references_param(param.default, subckt_param_name):
                                         params_needed_as_param_statements.add(subckt_param_name)
-                                        break
-                elif isinstance(entry, Instance):
-                    # Check instance parameters for references to subcircuit parameters
-                    for pval in entry.params:
-                        # Check Ref first (it's a subclass of Expr, so order matters)
-                        if isinstance(pval.val, Ref):
-                            # Direct parameter reference (e.g., nrd={nrd})
-                            if pval.val.ident.name in subckt_param_names:
-                                params_needed_as_param_statements.add(pval.val.ident.name)
-                        elif isinstance(pval.val, Expr):
-                            # Complex expression that might reference subcircuit parameters
-                            for subckt_param_name in subckt_param_names:
-                                if expr_references_param(pval.val, subckt_param_name):
-                                    params_needed_as_param_statements.add(subckt_param_name)
-                                    break
-                elif isinstance(entry, Primitive):
-                    # Check primitive instance parameters (kwargs) for references to subcircuit parameters
-                    for pval in entry.kwargs:
-                        # Check Ref first (it's a subclass of Expr, so order matters)
-                        if isinstance(pval.val, Ref):
-                            # Direct parameter reference (e.g., nrd={nrd})
-                            if pval.val.ident.name in subckt_param_names:
-                                params_needed_as_param_statements.add(pval.val.ident.name)
-                        elif isinstance(pval.val, Expr):
-                            # Complex expression that might reference subcircuit parameters
-                            for subckt_param_name in subckt_param_names:
-                                if expr_references_param(pval.val, subckt_param_name):
-                                    params_needed_as_param_statements.add(subckt_param_name)
-                                    break
             
-            # Add `.param` statements for any subckt parameters referenced by models or instances.
-            #
-            # In ngspice, subckt parameters are usable in instance-value expressions, but
-            # *model cards* (and some instance-parameter evaluation paths) do not reliably
-            # see the `.SUBCKT ... params` namespace. Emitting `.param` statements inside
-            # the subckt body ensures the names are in scope when `.model` cards and
-            # instances are parsed.
-            if params_needed_as_param_statements:
-                for param_name in sorted(params_needed_as_param_statements):  # Sort for deterministic output
-                    for param in module.params:
-                        if param.name.name == param_name:
-                            # Write as .param statement
-                            self.write(".param ")
-                            self.write_param_decl(param)
-                            self.write("\n")
-                            break
+            # Ngspice output policy:
+            # Do not emit extra `.param __foo={foo}` alias scaffolding here.
+            # We only inject `.param dvth0=...` and `.param dtox=...` for ngspice BSIM4
+            # compatibility in the ngspice dialect netlister.
+            if self.enum != NetlistDialects.NGSPICE:
+                # (Non-ngspice dialects may still choose to add additional `.param` helpers here.)
+                pass
 
         # Write its internal content/ entries
         for entry in module.entries:
@@ -1603,6 +2426,10 @@ class NgspiceNetlister(SpiceNetlister):
         """
         self.write("+ ")
         for param in params:
+            # Avoid inline comments on the `.SUBCKT` PARAMS lines; they can comment out
+            # trailing parameter assignments in ngspice.
+            if getattr(param, "comment", None):
+                param = ParamDecl(name=param.name, default=param.default, distr=param.distr, comment=None)
             self.write_param_decl(param)
             self.write(" ")
         self.write("\n")
@@ -1676,6 +2503,7 @@ class NgspiceNetlister(SpiceNetlister):
     def write_model_def(self, model: ModelDef) -> None:
         """Write a model definition in ngspice format, handling BJT level mapping."""
         from ..data import Int, Float, MetricNum, ParamDecl, Ident
+        import re
         
         # Helper to get param name safely
         def get_param_name(item):
@@ -1683,11 +2511,59 @@ class NgspiceNetlister(SpiceNetlister):
                 return item[0].name.name
             return item.name.name
 
-        mname = self.format_ident(model.name)
+        # ngspice compatibility: normalize numeric model-variant names.
+        # Many Spectre sources reference the *base* model-family name (e.g. `foo`) while the
+        # converter expands numeric variants as `foo.0`, `foo.1`, ... or sometimes starting at `.1`.
+        # We strip the *first* numeric variant we see for each base-name to `foo`, so instance
+        # references to `foo` resolve, and keep the remaining numeric variants as-is.
+        model_name_for_output = model.name.name
+        m = re.match(r"^(.+)\.(\d+)$", model_name_for_output)
+        if m:
+            base = m.group(1)
+            suf = int(m.group(2))
+            # Choose scope-local mapping (per-subckt), falling back to a global one.
+            mapping = None
+            if getattr(self, "_current_subckt", None) is not None and hasattr(self, "_ngspice_model_base_stripped_suffix"):
+                mapping = self._ngspice_model_base_stripped_suffix
+            else:
+                if not hasattr(self, "_ngspice_global_model_base_stripped_suffix"):
+                    self._ngspice_global_model_base_stripped_suffix = {}
+                mapping = self._ngspice_global_model_base_stripped_suffix
+            if base not in mapping:
+                mapping[base] = suf
+                model_name_for_output = base
+            elif mapping[base] == suf:
+                model_name_for_output = base
+
+        mname = self.format_ident(Ident(model_name_for_output))
         mtype = self.format_ident(model.mtype).lower()
+        # ngspice expects `D`/`d` for diode models, not the literal type name `diode`.
+        mtype_for_line = "d" if mtype == "diode" else ("r" if mtype == "resistor" else mtype)
         
         # Use local variable for params to avoid mutating the model object
         params_to_write = list(model.params)  # Create a copy
+
+        # BSIM4 / ngspice unit handling:
+        #
+        # ngspice uses `binunit=2` to indicate that **instance** L/W are *entered* in microns,
+        # but internally it converts to meters. The Spectre BSIM4 modelcards in this PDK already
+        # use SI (meters) for the model parameters, so we should **not** rescale the modelcard
+        # parameters here (doing so can make `lint/wint/...` huge and trigger Leff <= 0).
+        binunit_val = None
+        for p in params_to_write:
+            p_obj = p[0] if isinstance(p, tuple) else p
+            if not hasattr(p_obj, "name") or p_obj.name.name.lower() != "binunit":
+                continue
+            if isinstance(p_obj.default, (Int, Float)):
+                binunit_val = float(p_obj.default.val if hasattr(p_obj.default, "val") else p_obj.default)
+            elif isinstance(p_obj.default, MetricNum):
+                try:
+                    binunit_val = float(p_obj.default.val)
+                except Exception:
+                    binunit_val = None
+            break
+
+        # NOTE: intentionally no rescaling of model parameters for binunit=2.
         
         # Check for model level mapping (specific model name or device type)
         level_mapping_applied = False
@@ -1792,6 +2668,11 @@ class NgspiceNetlister(SpiceNetlister):
         # For BSIM4 models in ngspice, extract type from parameters and put it on .model line
         # Format: .model name nmos level=14 or .model name pmos level=14
         model_type_on_line = mtype.lower()
+        # Primitive model-type aliases for ngspice
+        if model_type_on_line == "resistor":
+            model_type_on_line = "r"
+        elif model_type_on_line == "diode":
+            model_type_on_line = "d"
         type_param_removed = False
         
         if mtype.lower() == "bsim4":
@@ -1837,7 +2718,7 @@ class NgspiceNetlister(SpiceNetlister):
             
             self.writeln(f".model {mname} {model_type_on_line}{level_str}")
         else:
-            self.writeln(f".model {mname} {mtype}")
+            self.writeln(f".model {mname} {mtype_for_line}")
         
         self.write("+ ")
         
@@ -2097,6 +2978,8 @@ class NgspiceNetlister(SpiceNetlister):
         self.write(".param enable_mismatch=0\n")
         self.write(".param mismatch_factor=0\n")
         self.write(".param corner_factor=0\n\n")
+        # Some PDK equations use `m` as a generic multiplicity term even outside subckt params.
+        self.write(".param m=1\n\n")
         
         # Includes
         self.write("* Includes\n")
@@ -2143,15 +3026,59 @@ class NgspiceNetlister(SpiceNetlister):
                 self.write(f"R_pd_{node} {node} 0 1M\n")
                 node_count += 1
             
-            # Instantiate subcircuit with only m=1 parameter (skip all other defaults)
+            # Instantiate subcircuit with a small set of "sanity" overrides to avoid NaN/Inf
+            # due to zero/ missing geometry parameters in some PDK cells.
             full_inst_name = f"{prefix}_{inst_name}"
             self.write(f"{full_inst_name} {' '.join(nodes)} {name}\n")
             
-            # Collect parameters to write - only m=1 for test files
-            inst_params = []
-            
-            # Only add m=1 parameter, skip all other default parameters
-            inst_params.append("m=1")
+            # Collect parameters to write
+            inst_params: list[str] = []
+
+            def _is_zero_default(default) -> bool:
+                from ..data import Int, Float, MetricNum
+                if default is None:
+                    return True
+                if isinstance(default, (Int, Float)):
+                    return float(default.val if hasattr(default, "val") else default) == 0.0
+                if isinstance(default, MetricNum):
+                    # MetricNum.val may include suffix (e.g. "2u"). Only treat explicit zeros as zero.
+                    sval = str(default.val).strip().lower()
+                    return sval in ("0", "0.0", "0u", "0n", "0p", "0m", "0k", "0meg", "0g", "0t")
+                return False
+
+            def _is_nonpositive_default(default) -> bool:
+                """Return True for defaults that are <= 0 (common NaN/Inf triggers in PDK equations)."""
+                from ..data import Int, Float, MetricNum, UnaryOp
+                if default is None:
+                    return True
+                if isinstance(default, (Int, Float)):
+                    return float(default.val if hasattr(default, "val") else default) <= 0.0
+                # Handle simple unary-negated numeric literals, e.g. l={-(1)}.
+                if isinstance(default, UnaryOp) and isinstance(default.targ, (Int, Float)):
+                    opv = default.tp.value if hasattr(default.tp, "value") else str(default.tp)
+                    if opv in ("-", "NEG", "neg"):
+                        v = float(default.targ.val if hasattr(default.targ, "val") else default.targ)
+                        return (-v) <= 0.0
+                if isinstance(default, MetricNum):
+                    sval = str(default.val).strip().lower()
+                    # Cheap but effective: treat leading '-' and explicit zeros as non-positive.
+                    return sval.startswith("-") or _is_zero_default(default)
+                return False
+
+            # Always try m=1 (many cells accept m; if not present, ngspice will ignore unknown params
+            # only if it is treated as a subckt param — so gate it on presence).
+            if any(p.name.name == "m" for p in defn.params):
+                inst_params.append("m=1")
+
+            # Guard against common zero-geometry defaults that lead to NaN/Inf.
+            # Use unitless "1" defaults here: many passive PDK subckts treat w/l as micron-like
+            # dimensionless quantities, and using SI-scaled "10u" can still trip internal NaNs.
+            for pname, safe in (("l", "1"), ("w", "1"), ("r", "1")):
+                for p in defn.params:
+                    bad = _is_nonpositive_default(p.default) if pname in ("l", "w") else _is_zero_default(p.default)
+                    if p.name.name == pname and bad:
+                        inst_params.append(f"{pname}={safe}")
+                        break
             
             # Write parameters
             if inst_params:
@@ -2160,8 +3087,9 @@ class NgspiceNetlister(SpiceNetlister):
             self.write("\n")
             
         self.write("* Simulation Commands\n")
-        self.write(".tran 1n 10n\n")
-        self.write(".print tran V(*)\n")
+        # Keep the sanity deck minimal and parsing-stable for ngspice:
+        # `.print tran V(*)` fails because ngspice does not accept wildcard `*` here.
+        self.write(".op\n")
         self.write(".end\n")
 
 
@@ -2887,10 +3815,15 @@ def add_lnorm_functions_ngspice(program: Program) -> None:
         stats_file = program.files[0]
 
     # Create .param function declarations for lnorm and alnorm
-    # Create expression: exp(gauss(mu,sigma))
+    #
+    # NOTE (ngspice-45.2):
+    # `gauss()` has been observed to segfault in this environment, even when multiplied by 0.
+    # Use `agauss()` instead (supported by ngspice) to avoid crashes.
+    #
+    # Create expression: exp(agauss(mu,sigma,1))
     gauss_call = Call(
-        func=Ref(ident=Ident("gauss")),
-        args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma"))]
+        func=Ref(ident=Ident("agauss")),
+        args=[Ref(ident=Ident("mu")), Ref(ident=Ident("sigma")), Int(1)]
     )
     exp_call = Call(
         func=Ref(ident=Ident("exp")),
@@ -2914,7 +3847,7 @@ def add_lnorm_functions_ngspice(program: Program) -> None:
     stats_file.contents.insert(0, ParamDecls(params=math_params))
 
 
-def create_monte_carlo_distribution_call(dist_type: str, std: Float) -> Optional[Call]:
+def create_monte_carlo_distribution_call(dist_type: str, std: Float, output_format: Optional["NetlistDialects"] = None) -> Optional[Call]:
     """Create a distribution function call (gauss or lnorm) for Monte Carlo variation.
 
     Returns a Call expression for the distribution function, or None if the distribution
@@ -2923,8 +3856,12 @@ def create_monte_carlo_distribution_call(dist_type: str, std: Float) -> Optional
     if not dist_type:
         return None
 
+    from .. import NetlistDialects
     dist_type_lower = dist_type.lower()
     if 'gauss' in dist_type_lower:
+        # ngspice: avoid `gauss()` (can segfault); use `agauss(mean, sigma, seed)` instead.
+        if output_format == NetlistDialects.NGSPICE:
+            return Call(func=Ref(ident=Ident("agauss")), args=[Int(0), Float(1), Int(1)])
         return Call(func=Ref(ident=Ident("gauss")), args=[Int(0), Float(1)])
     elif 'lnorm' in dist_type_lower:
         return Call(func=Ref(ident=Ident("lnorm")), args=[Int(0), Float(1)])
@@ -2934,12 +3871,12 @@ def create_monte_carlo_distribution_call(dist_type: str, std: Float) -> Optional
     return None
 
 
-def apply_monte_carlo_variation(original_expr: Expr, var: Variation) -> Expr:
+def apply_monte_carlo_variation(original_expr: Expr, var: Variation, output_format: Optional["NetlistDialects"] = None) -> Expr:
     """Apply Monte Carlo variation to an expression: original * (1 + std * dist(...))."""
     if not var.dist:
         return original_expr
 
-    dist_call = create_monte_carlo_distribution_call(var.dist, var.std)
+    dist_call = create_monte_carlo_distribution_call(var.dist, var.std, output_format=output_format)
     if not dist_call:
         return original_expr
 
@@ -2948,7 +3885,7 @@ def apply_monte_carlo_variation(original_expr: Expr, var: Variation) -> Expr:
     return BinaryOp(tp=BinaryOperator.MUL, left=original_expr, right=one_plus_variation)
 
 
-def apply_monte_carlo_variation_absolute(original_expr: Expr, var: Variation) -> Expr:
+def apply_monte_carlo_variation_absolute(original_expr: Expr, var: Variation, output_format: Optional["NetlistDialects"] = None) -> Expr:
     """Apply Monte Carlo variation as an *absolute* perturbation: original + std * dist(...).
 
     This matches common PDK patterns where the varied parameter is itself a random variable
@@ -2958,7 +3895,7 @@ def apply_monte_carlo_variation_absolute(original_expr: Expr, var: Variation) ->
     if not var.dist:
         return original_expr
 
-    dist_call = create_monte_carlo_distribution_call(var.dist, var.std)
+    dist_call = create_monte_carlo_distribution_call(var.dist, var.std, output_format=output_format)
     if not dist_call:
         return original_expr
 
@@ -2966,7 +3903,7 @@ def apply_monte_carlo_variation_absolute(original_expr: Expr, var: Variation) ->
     return BinaryOp(tp=BinaryOperator.ADD, left=original_expr, right=variation_term)
 
 
-def create_relative_process_variation_expr(param_name: str, var: Variation) -> Expr:
+def create_relative_process_variation_expr(param_name: str, var: Variation, output_format: Optional["NetlistDialects"] = None) -> Expr:
     """Create a relative process variation expression that references the parameter itself.
     
     Returns: {param_name * (1 + std * dist(...)) + mean}
@@ -2977,7 +3914,7 @@ def create_relative_process_variation_expr(param_name: str, var: Variation) -> E
     
     # Apply Monte Carlo variation: param_name * (1 + std * dist(...))
     if var.dist:
-        dist_call = create_monte_carlo_distribution_call(var.dist, var.std)
+        dist_call = create_monte_carlo_distribution_call(var.dist, var.std, output_format=output_format)
         if dist_call:
             variation_term = BinaryOp(tp=BinaryOperator.MUL, left=var.std, right=dist_call)
             one_plus_variation = BinaryOp(tp=BinaryOperator.ADD, left=Float(1), right=variation_term)
@@ -3037,13 +3974,13 @@ def verify_process_variation_params(program: Program, stats_blocks: List[Statist
         )
 
 
-def calculate_process_variation_expr(param_name: str, var: Variation) -> Expr:
+def calculate_process_variation_expr(param_name: str, var: Variation, output_format: Optional["NetlistDialects"] = None) -> Expr:
     """Calculate the relative process variation expression for a parameter.
     
     Returns an expression that references the parameter itself: {param_name * (1 + std * dist(...)) + mean}
     This expression will be applied after library sections as a relative assignment.
     """
-    return create_relative_process_variation_expr(param_name, var)
+    return create_relative_process_variation_expr(param_name, var, output_format=output_format)
 
 
 def is_param_in_process_variations(stats_blocks: List[StatisticsBlock], param_name: str) -> bool:
@@ -3212,7 +4149,7 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
                 # Check if parameter is in some library section (anywhere) or global
                 if is_param_in_library_section(program, param_name) and not is_local_to_stats_section:
                     # Non-local library section parameter: use relative expression (references itself)
-                    varied_expr = create_relative_process_variation_expr(param_name, var)
+                    varied_expr = create_relative_process_variation_expr(param_name, var, output_format=output_format)
                     if var.mean:
                         varied_expr = BinaryOp(tp=BinaryOperator.ADD, left=varied_expr, right=var.mean)
                 else:
@@ -3221,7 +4158,7 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
                     if not matching_param:
                         continue
                     original_expr = matching_param.default or Int(0)
-                    varied_expr = apply_monte_carlo_variation_absolute(original_expr, var)
+                    varied_expr = apply_monte_carlo_variation_absolute(original_expr, var, output_format=output_format)
                     if var.mean:
                         varied_expr = BinaryOp(tp=BinaryOperator.ADD, left=varied_expr, right=var.mean)
                 process_variations.append((param_name, varied_expr))
@@ -3370,6 +4307,101 @@ def replace_statistics_blocks_with_generated_content(program: Program, stats_blo
     # This ensures we always get __process____mismatch__ suffixes and never __mismatch____process__.
     apply_all_mismatch_variations(program, stats_blocks, output_format=output_format, stats_parent_entries=stats_parent_entries)
 
+    # ngspice BSIM4 binunit=2 fixup:
+    #
+    # Some Spectre decks embed BSIM4 modelcards as `ModelVariant` entries inside subckts and
+    # set `binunit=2` (micron-based geometry). ngspice interprets instance L/W in microns in this case.
+    # Spectre sources often keep the subckt `w/l` defaults in SI (e.g. 60u, 2u).
+    #
+    # Convert such subckt parameter defaults from MetricNum SI -> Float microns (60u -> 60.0)
+    # before netlisting to ngspice.
+    if output_format is not None:
+        from .. import NetlistDialects
+        if output_format == NetlistDialects.NGSPICE:
+            _normalize_bsim4_binunit2_subckt_params(program)
+
+
+def _normalize_bsim4_binunit2_subckt_params(program: Program) -> None:
+    """Normalize subckt w/l defaults to microns when a local BSIM4 model uses binunit=2 (ngspice only)."""
+    import re
+    from ..data import SubcktDef, ModelVariant, ModelDef, ModelFamily, MetricNum, Float, Int, ParamDecl, LibSectionDef, Library
+
+    def metric_to_si(s: str) -> float | None:
+        t = str(s).strip().lower()
+        if not t:
+            return None
+        if t.endswith("meg"):
+            try:
+                return float(t[:-3]) * 1e6
+            except Exception:
+                return None
+        m = re.match(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)([a-z]+)?$", t)
+        if not m:
+            return None
+        base = float(m.group(1))
+        suf = (m.group(2) or "")
+        mult = {
+            "t": 1e12,
+            "g": 1e9,
+            "k": 1e3,
+            "m": 1e-3,
+            "u": 1e-6,
+            "n": 1e-9,
+            "p": 1e-12,
+            "f": 1e-15,
+            "": 1.0,
+        }.get(suf)
+        if mult is None:
+            return None
+        return base * mult
+
+    def subckt_has_binunit2(sub: SubcktDef) -> bool:
+        for ent in sub.entries:
+            candidates = []
+            if isinstance(ent, ModelVariant):
+                candidates = [ent]
+            elif isinstance(ent, ModelDef):
+                candidates = [ent]
+            elif isinstance(ent, ModelFamily):
+                candidates = list(ent.variants or [])
+            else:
+                continue
+            for cand in candidates:
+                for pp in getattr(cand, "params", []) or []:
+                    if isinstance(pp, tuple):
+                        pp = pp[0]
+                    if not isinstance(pp, ParamDecl):
+                        continue
+                    if pp.name.name.lower() != "binunit":
+                        continue
+                    if isinstance(pp.default, Int) and pp.default.val == 2:
+                        return True
+        return False
+
+    def fix_subckt(sub: SubcktDef) -> None:
+        if not subckt_has_binunit2(sub):
+            return
+        for p in sub.params:
+            if p.name.name not in ("w", "l"):
+                continue
+            if isinstance(p.default, MetricNum):
+                si = metric_to_si(p.default.val)
+                if si is not None:
+                    p.default = Float(si * 1e6)
+
+    def walk_entries(entries):
+        for ent in entries:
+            if isinstance(ent, SubcktDef):
+                fix_subckt(ent)
+            elif isinstance(ent, LibSectionDef):
+                walk_entries(ent.entries)
+            elif isinstance(ent, Library):
+                for sec in ent.sections:
+                    walk_entries(sec.entries)
+
+    for sf in program.files:
+        walk_entries(sf.contents)
+
 
 def move_header_comments_to_top(program: Program, stats_blocks: List[StatisticsBlock]) -> None:
     """Move header comments (those that were before the first StatisticsBlock) to the top of the file.
@@ -3473,10 +4505,11 @@ def create_mismatch_function(var: Variation, idx: int, original_expr: Optional[E
     sigma_expr = BinaryOp(tp=BinaryOperator.MUL, left=mismatch_factor_ref, right=var.std)
 
     if 'gauss' in dist_type_lower:
-        dist_call = Call(
-            func=Ref(ident=Ident("gauss")),
-            args=[Int(0), sigma_expr]
-        )
+        # ngspice: avoid `gauss()` (can segfault); use `agauss(mean, sigma, seed)` instead.
+        if is_ngspice:
+            dist_call = Call(func=Ref(ident=Ident("agauss")), args=[Int(0), sigma_expr, Int(1)])
+        else:
+            dist_call = Call(func=Ref(ident=Ident("gauss")), args=[Int(0), sigma_expr])
     elif 'lnorm' in dist_type_lower:
         dist_call = Call(
             func=Ref(ident=Ident("lnorm")),
