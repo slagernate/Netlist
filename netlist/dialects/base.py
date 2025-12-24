@@ -498,21 +498,28 @@ class DialectParser:
         return e
 
     def parse_expr0b(self) -> Expr:
-        """expr1 ( (+|-) expr0 )?"""
+        """expr1 ( (+|-) expr1 )*
+
+        NOTE: `+`/`-` are left-associative in standard arithmetic.
+        """
         e = self.parse_expr1()
-        if self.match_any(Tokens.PLUS, Tokens.MINUS):
+        while self.match_any(Tokens.PLUS, Tokens.MINUS):
             tp = self.parse_binary_operator(self.cur.tp)
-            right = self.parse_expr0b()
-            return BinaryOp(tp=tp, left=e, right=right)
+            right = self.parse_expr1()
+            e = BinaryOp(tp=tp, left=e, right=right)
         return e
 
     def parse_expr1(self) -> Expr:
-        """expr2 ( (*|/) expr1 )?"""
+        """expr2 ( (*|/) expr2 )*
+
+        NOTE: `*`/`/` are left-associative in standard arithmetic. This matters a lot
+        for chained division: `a/b/c` must parse as `(a/b)/c`, not `a/(b/c)`.
+        """
         e = self.parse_expr2()
-        if self.match_any(Tokens.STAR, Tokens.SLASH):
+        while self.match_any(Tokens.STAR, Tokens.SLASH):
             tp = self.parse_binary_operator(self.cur.tp)
-            right = self.parse_expr1()
-            return BinaryOp(tp=tp, left=e, right=right)
+            right = self.parse_expr2()
+            e = BinaryOp(tp=tp, left=e, right=right)
         return e
 
     def parse_expr2(self) -> Expr:

@@ -1214,22 +1214,25 @@ class XyceNetlister(SpiceNetlister):
             # about positional diode fields, especially when expressions are used.
             # Instead, write named parameters (area=...).
             #
-            # Also drop Spectre perimeter-style instance params (`pj`/`perim`) which are
-            # not supported as diode instance params in Xyce.
+            # Perimeter support:
+            # - Xyce supports diode instance `PJ` (perimeter).
+            # - Some dialects use `perim`; map `perim` -> `pj`.
             kept: list[ParamVal] = []
-            dropped_names: list[str] = []
+            perim_val: Optional[Expr] = None
+            has_pj = False
             for pval in pinst.params:
                 pname = pval.name.name.lower()
-                if pname in {"perim", "pj"}:
-                    dropped_names.append(pval.name.name)
+                if pname == "pj":
+                    has_pj = True
+                    kept.append(pval)
+                    continue
+                if pname == "perim":
+                    perim_val = pval.val
                     continue
                 kept.append(pval)
 
-            if dropped_names:
-                self.log_warning(
-                    "Dropping unsupported diode instance parameter(s): " + ", ".join(sorted({n.upper() for n in dropped_names})),
-                    f"Instance: {pinst.name.name}",
-                )
+            if perim_val is not None and not has_pj:
+                kept.append(ParamVal(name=Ident("pj"), val=perim_val))
 
             for pval in kept:
                 self.write_param_val(pval)
@@ -1397,8 +1400,9 @@ class XyceNetlister(SpiceNetlister):
             if not skip_model_name and pinst.args:
                 self.write(self.format_ident(pinst.args[-1]) + " ")
             # Write parameters on same line
-            # For diodes, only area is supported as positional parameter (perim not supported in Level 3)
+            # For diodes, write AREA as positional (value-only) and PJ as a named param.
             area_val = None
+            pj_val = None
             other_kwargs = []
             kwargs_to_write = pinst.kwargs
             if module_ref:
@@ -1420,12 +1424,21 @@ class XyceNetlister(SpiceNetlister):
                 param_name = kwarg.name.name.lower()
                 if param_name == "area":
                     area_val = kwarg.val
-                # Note: perim is not supported for Level 3 diodes in Xyce, so we skip it
-                elif param_name != "perim":
+                elif param_name == "pj":
+                    pj_val = kwarg.val
+                elif param_name == "perim":
+                    # Map `perim` -> `pj` for Xyce.
+                    # If `pj` is also present, prefer the explicit `pj`.
+                    if pj_val is None:
+                        pj_val = kwarg.val
+                else:
                     other_kwargs.append(kwarg)
             # Write area as positional parameter (just value, no name)
             if area_val is not None:
                 self.write(self.format_expr(area_val) + " ")
+            # Write pj as named parameter (if any)
+            if pj_val is not None:
+                self.write("pj=" + self.format_expr(pj_val) + " ")
             # Write other parameters as named (if any)
             for kwarg in other_kwargs:
                 self.write_param_val(kwarg)
