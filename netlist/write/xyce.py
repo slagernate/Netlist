@@ -68,6 +68,11 @@ class XyceNetlister(SpiceNetlister):
         # We apply a safe alias-map and fail-fast on unsupported built-in functions.
         self._xyce_func_alias_map: Dict[str, str] = {
             "round": "nint",
+            # IMPORTANT SEMANTICS:
+            # Spectre's `log(x)` is the natural logarithm (ln).
+            # Xyce's `log(x)` is log-base-10; natural log is `ln(x)`.
+            # When converting Spectre-derived expressions to Xyce, map log -> ln.
+            "log": "ln",
         }
         self._xyce_func_alias_counts: Dict[str, int] = {}
         # Xyce built-in function allowlist (lowercased).
@@ -1913,41 +1918,34 @@ class XyceNetlister(SpiceNetlister):
                     if dtox_val is not None or delvto_val is not None:
                         entry.params = params_to_keep
 
+                    # Handle deltox -> dtox for local models only (Xyce requires dtox on the model card)
+                    # BUT: Only if dtox_val doesn't reference instance parameters (m, l, w)
+                    # Model parameters can't reference instance parameters in Xyce.
+                    if dtox_val is not None and model_name in local_models:
+                        references_instance_params = False
+                        if isinstance(dtox_val, Expr):
+                            for param_name in ["m", "l", "w"]:
+                                if expr_references_param(dtox_val, param_name):
+                                    references_instance_params = True
+                                    break
+
+                        if not references_instance_params:
+                            model = local_models[model_name]
+
+                            def add_dtox(params_list, val):
+                                new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
+                                new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
+                                return new_params
+
+                            if isinstance(model, ModelDef):
+                                model.params = add_dtox(model.params, dtox_val)
+                            elif isinstance(model, ModelFamily):
+                                for variant in model.variants:
+                                    variant.params = add_dtox(variant.params, dtox_val)
+                        # else: dtox references instance params, cannot be lifted to model in Xyce.
+
                     if delvto_val is not None:
                         delvto_vals.append(delvto_val)
-                        
-                        # Handle deltox -> dtox for local models only
-                        # BUT: Only if dtox_val doesn't reference instance parameters (m, l, w)
-                        # Model parameters can't reference instance parameters in Xyce
-                        if dtox_val is not None and model_name in local_models:
-                            # Check if dtox_val references instance parameters
-                            # expr_references_param is imported from spice module at top level (line 43)
-                            references_instance_params = False
-                            if isinstance(dtox_val, Expr):
-                                # Check for m, l, w references
-                                for param_name in ['m', 'l', 'w']:
-                                    if expr_references_param(dtox_val, param_name):
-                                        references_instance_params = True
-                                        break
-                            
-                            if not references_instance_params:
-                                model = local_models[model_name]
-                                
-                                # Helper to add dtox to a param list
-                                def add_dtox(params_list, val):
-                                    # Remove existing dtox/deltox
-                                    new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
-                                    # Add new dtox
-                                    new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
-                                    return new_params
-
-                                if isinstance(model, ModelDef):
-                                    model.params = add_dtox(model.params, dtox_val)
-                                elif isinstance(model, ModelFamily):
-                                    for variant in model.variants:
-                                        variant.params = add_dtox(variant.params, dtox_val)
-                            # else: dtox references instance parameters - can't move to model
-                            # It will be filtered out by parameter filtering (deltox/dtox are filtered)
                 
                 # Check Primitive entries
                 elif isinstance(entry, Primitive) and len(entry.args) > 0 and isinstance(entry.args[-1], Ref):
@@ -1969,41 +1967,33 @@ class XyceNetlister(SpiceNetlister):
                     if dtox_val is not None or delvto_val is not None:
                         entry.kwargs = kwargs_to_keep
 
+                    # Handle deltox -> dtox for local models only (Xyce requires dtox on the model card)
+                    # BUT: Only if dtox_val doesn't reference instance parameters (m, l, w)
+                    if dtox_val is not None and model_name in local_models:
+                        references_instance_params = False
+                        if isinstance(dtox_val, Expr):
+                            for param_name in ["m", "l", "w"]:
+                                if expr_references_param(dtox_val, param_name):
+                                    references_instance_params = True
+                                    break
+
+                        if not references_instance_params:
+                            model = local_models[model_name]
+
+                            def add_dtox(params_list, val):
+                                new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
+                                new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
+                                return new_params
+
+                            if isinstance(model, ModelDef):
+                                model.params = add_dtox(model.params, dtox_val)
+                            elif isinstance(model, ModelFamily):
+                                for variant in model.variants:
+                                    variant.params = add_dtox(variant.params, dtox_val)
+                        # else: dtox references instance params, cannot be lifted to model in Xyce.
+
                     if delvto_val is not None:
                         delvto_vals.append(delvto_val)
-                        
-                        # Handle deltox -> dtox for local models only
-                        # BUT: Only if dtox_val doesn't reference instance parameters (m, l, w)
-                        # Model parameters can't reference instance parameters in Xyce
-                        if dtox_val is not None and model_name in local_models:
-                            # Check if dtox_val references instance parameters
-                            # expr_references_param is imported from spice module at top level (line 43)
-                            references_instance_params = False
-                            if isinstance(dtox_val, Expr):
-                                # Check for m, l, w references
-                                for param_name in ['m', 'l', 'w']:
-                                    if expr_references_param(dtox_val, param_name):
-                                        references_instance_params = True
-                                        break
-                            
-                            if not references_instance_params:
-                                model = local_models[model_name]
-                                
-                                # Helper to add dtox to a param list
-                                def add_dtox(params_list, val):
-                                    # Remove existing dtox/deltox
-                                    new_params = [p for p in params_list if p.name.name not in ("deltox", "dtox")]
-                                    # Add new dtox
-                                    new_params.append(ParamDecl(name=Ident("dtox"), default=val, distr=None))
-                                    return new_params
-
-                                if isinstance(model, ModelDef):
-                                    model.params = add_dtox(model.params, dtox_val)
-                                elif isinstance(model, ModelFamily):
-                                    for variant in model.variants:
-                                        variant.params = add_dtox(variant.params, dtox_val)
-                            # else: dtox references instance parameters - can't move to model
-                            # It will be filtered out by parameter filtering (deltox/dtox are filtered)
         
         # 3. Add dvth0 parameter to subcircuit if needed, and modify local model vth0.
         if needs_dvth0_param:

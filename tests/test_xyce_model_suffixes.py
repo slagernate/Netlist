@@ -52,3 +52,4 @@ def test_xyce_multiple_numeric_model_suffixes_are_not_stripped_in_subckt() -> No
     assert ".model foo.3 nmos" in out
     assert ".model foo nmos" not in out
 
+

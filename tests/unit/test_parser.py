@@ -122,14 +122,15 @@ def test_spectre_exprs():
     )
 
     p = parse_expression("r*l/w")
+    # Multiplication and division are same precedence and left-associative: (r*l)/w
     assert p == BinaryOp(
-        tp=BinaryOperator.MUL,
-        left=Ref(ident=Ident(name="r")),
-        right=BinaryOp(
-            tp=BinaryOperator.DIV,
-            left=Ref(ident=Ident(name="l")),
-            right=Ref(ident=Ident(name="w")),
+        tp=BinaryOperator.DIV,
+        left=BinaryOp(
+            tp=BinaryOperator.MUL,
+            left=Ref(ident=Ident(name="r")),
+            right=Ref(ident=Ident(name="l")),
         ),
+        right=Ref(ident=Ident(name="w")),
     )
 
     p = parse_expression("(0.5f * p)")  # SPICE metric-suffixed number
@@ -668,15 +669,13 @@ def test_nested_expression_parens():
     parser = SpectreDialectParser.from_str(expr_str)
     parsed = parser.parse(parser.parse_expr)
 
-    # Assertions: Verify left-associative parsing (a * (b * (c + (d * e))))
+    # Assertions: Verify left-associative parsing ((a * b) * (c + (d * e)))
     assert isinstance(parsed, BinaryOp)
     assert parsed.tp == BinaryOperator.MUL
-    assert isinstance(parsed.right, BinaryOp)  # b * (...)
-    assert parsed.right.tp == BinaryOperator.MUL
-    assert isinstance(parsed.right.right, BinaryOp)  # The (c + ...)
-    assert parsed.right.right.tp == BinaryOperator.ADD  # Now this should match
-    assert isinstance(parsed.right.right.left, Ref) and parsed.right.right.left.ident.name == "c"
-    assert isinstance(parsed.right.right.right, BinaryOp) and parsed.right.right.right.tp == BinaryOperator.MUL
+    assert isinstance(parsed.left, BinaryOp) and parsed.left.tp == BinaryOperator.MUL
+    assert isinstance(parsed.right, BinaryOp) and parsed.right.tp == BinaryOperator.ADD
+    assert isinstance(parsed.right.left, Ref) and parsed.right.left.ident.name == "c"
+    assert isinstance(parsed.right.right, BinaryOp) and parsed.right.right.tp == BinaryOperator.MUL
 
 
 def test_mixed_spectre_spice_dialect():

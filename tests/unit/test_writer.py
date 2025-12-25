@@ -190,6 +190,36 @@ def test_write_xyce_func_with_args():
     assert "mu" in func_line or "sigma" in func_line  # Arguments should be present
 
 
+def test_write_xyce_maps_log_to_ln():
+    """Spectre's log() is natural log; Xyce's log() is log10. Ensure writer maps log->ln."""
+    src = Program(
+        files=[
+            SourceFile(
+                path="/",
+                contents=[
+                    ParamDecls(
+                        params=[
+                            ParamDecl(
+                                name=Ident("x"),
+                                default=Call(func=Ref(ident=Ident("log")), args=[Int(3)]),
+                                distr=None,
+                                comment=None,
+                            )
+                        ]
+                    )
+                ],
+            )
+        ]
+    )
+
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    out = dest.getvalue().lower()
+
+    assert "ln(3)" in out
+    assert "log(3)" not in out
+
+
 def test_writer_parentheses_precedence():
     """Test that the writer adds parentheses for operator precedence in expressions"""
     # Fix import path for XyceNetlister
@@ -204,8 +234,9 @@ def test_writer_parentheses_precedence():
     netlister = XyceNetlister(src=None, dest=StringIO())  # src can be None for this isolated test
     formatted = netlister.format_expr(parsed_expr)
 
-    # Expected: {a*(b*(c+(d*e)))} (safe parenthesis insertion)
-    expected = "{a*(b*(c+(d*e)))}"
+    # Expected left-associative formatting with safe parentheses.
+    # The minimal requirement is correct precedence, i.e. multiplication over addition.
+    expected = "{(a*b)*(c+(d*e))}"
     assert formatted == expected, f"Writer failed to add parentheses for precedence: got {formatted}, expected {expected}"
 
 

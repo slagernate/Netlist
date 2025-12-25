@@ -32,3 +32,4 @@ def test_long_division_chain_is_left_associative():
     s = _xyce_expr_string("lspace/2/nr/(wr*factor+_xw)")
     assert "lspace/(2/(nr/" not in s
 
+
