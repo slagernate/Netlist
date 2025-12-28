@@ -40,6 +40,9 @@ ident_pattern = r"[A-Za-z_][A-Za-z0-9_]*"
 _patterns1 = dict(
     DUBSLASH=r"\/\/",
     DUBSTAR=r"\*\*",
+    # Xyce-specific keyword form used in our emitted decks.
+    # Note this must come before COLON and IDENT tokenization.
+    PARAMS_COLON=r"(PARAMS\:|params\:)",
     LPAREN=r"\(",
     RPAREN=r"\)",
     LBRACKET=r"\{",
@@ -185,6 +188,8 @@ class Lexer:
                 comment_type = "//"
             elif token.tp == Tokens.DOLLAR:
                 comment_type = "$"
+            elif token.tp == Tokens.SEMICOLON:
+                comment_type = ";"
             elif token.tp == Tokens.STAR:
                 comment_type = "*"
             else:
@@ -208,6 +213,8 @@ class Lexer:
                     cleaned_text = comment_text[1:] if len(comment_text) >= 1 else ""  # Preserve whitespace after $
                 elif comment_type == "*":
                     cleaned_text = comment_text[1:] if len(comment_text) >= 1 else ""  # Preserve whitespace after *
+                elif comment_type == ";":
+                    cleaned_text = comment_text[1:] if len(comment_text) >= 1 else ""  # Preserve whitespace after ;
                 
                 # Remove only trailing newline, preserve all other whitespace
                 cleaned_text = cleaned_text.rstrip('\n\r')

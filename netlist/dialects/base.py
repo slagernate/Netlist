@@ -73,6 +73,7 @@ class DialectParser:
         Returns the default class if argument `dialect` is not provided or `None`."""
         from .spice import SpiceDialectParser, NgSpiceDialectParser
         from .spectre import SpectreDialectParser, SpectreSpiceDialectParser
+        from .xyce import XyceDialectParser
 
         if dialect is None:
             return SpectreDialectParser
@@ -83,7 +84,7 @@ class DialectParser:
         if dialect == NetlistDialects.NGSPICE:
             return NgSpiceDialectParser
         if dialect == NetlistDialects.XYCE:
-            return NgSpiceDialectParser
+            return XyceDialectParser
         raise ValueError
 
     def eat_blanks(self):
