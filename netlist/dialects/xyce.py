@@ -129,7 +129,9 @@ class XyceDialectParser(SpiceDialectParser):
         """.subckt <name> <ports...> [PARAMS:] <p1=... p2=...>
 
         Xyce uses `PARAMS:` (often uppercase) to introduce subckt parameters.
-        Our lexer tokenizes `PARAMS:` as `Tokens.PARAMS_COLON`.
+        We accept `PARAMS:` as either:
+        - `Tokens.PARAMETERS` ('params' / 'parameters') followed by optional `Tokens.COLON`, or
+        - it can be omitted entirely.
         """
         _inline = self.match(Tokens.INLINE)
         self.expect(Tokens.SUBCKT)
@@ -143,14 +145,15 @@ class XyceDialectParser(SpiceDialectParser):
         term = lambda s: (
             s.nxt is None
             or s.nxt.tp == Tokens.NEWLINE
-            or s.nxt.tp == Tokens.PARAMS_COLON
+            or s.nxt.tp == Tokens.PARAMETERS
             or _endargs_startkwargs(s)
         )
         ports = self.parse_node_list(term)
 
-        # Optional PARAMS:
-        if self.match(Tokens.PARAMS_COLON):
-            pass
+        # Optional PARAMS: marker (PARAMS[:])
+        if self.peek() and self.peek().tp == Tokens.PARAMETERS and str(self.peek().val).lower() in ("params", "parameters"):
+            self.advance()
+            self.match(Tokens.COLON)
 
         # Params until end-of-line
         params = self.parse_param_declarations()
@@ -176,7 +179,7 @@ class XyceDialectParser(SpiceDialectParser):
         # and must not be consumed as a node identifier.
         term = lambda s: (
             s.nxt is None
-            or s.nxt.tp in (Tokens.NEWLINE, Tokens.PARAMS_COLON)
+            or s.nxt.tp in (Tokens.NEWLINE, Tokens.PARAMETERS)
             or s.nxt.tp == Tokens.EQUALS
             or s.nxt.tp == Tokens.LPAREN
         )
@@ -200,8 +203,9 @@ class XyceDialectParser(SpiceDialectParser):
 
     def parse_instance_param_values(self):
         """Support optional `PARAMS:` marker before instance param values."""
-        if self.match(Tokens.PARAMS_COLON):
-            # Now parse k=v pairs
+        if self.peek() and self.peek().tp == Tokens.PARAMETERS and str(self.peek().val).lower() in ("params", "parameters"):
+            self.advance()
+            self.match(Tokens.COLON)
             return self.parse_param_values()
         return super().parse_instance_param_values()
 

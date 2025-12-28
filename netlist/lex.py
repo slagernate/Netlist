@@ -40,9 +40,6 @@ ident_pattern = r"[A-Za-z_][A-Za-z0-9_]*"
 _patterns1 = dict(
     DUBSLASH=r"\/\/",
     DUBSTAR=r"\*\*",
-    # Xyce-specific keyword form used in our emitted decks.
-    # Note this must come before COLON and IDENT tokenization.
-    PARAMS_COLON=r"(PARAMS\:|params\:)",
     LPAREN=r"\(",
     RPAREN=r"\)",
     LBRACKET=r"\{",
@@ -91,7 +88,8 @@ _keywords = dict(
     STATS=r"statistics",
     SIMULATOR=r"simulator",
     LANG=r"lang",
-    PARAMETERS=r"(parameters|params)",
+    # Include common uppercase forms as well (Xyce decks often use `PARAMS:`).
+    PARAMETERS=r"(parameters|params|PARAMETERS|PARAMS)",
     PARAM=r"(param|PARAM)",
     OPTIONS=r"(options|OPTIONS)",
     OPTION=r"(option|OPTION)",

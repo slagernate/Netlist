@@ -560,7 +560,10 @@ class DialectParser:
             return Int(int(self.cur.val))
         if self.match_any(Tokens.PLUS, Tokens.MINUS):
             tp = self.parse_unary_operator(self.cur.tp)
-            return UnaryOp(tp=tp, targ=self.parse_term())
+            # Unary operators must be able to target parenthesized/braced expressions:
+            # e.g. `-(0.1)` or `-({a+b})`.
+            # Use expr3 here (primary) rather than term to support these.
+            return UnaryOp(tp=tp, targ=self.parse_expr3())
         if self.match(Tokens.IDENT):
             ref = Ref(ident=Ident(self.cur.val))
             if self.match(Tokens.LPAREN):  # Function-call syntax
