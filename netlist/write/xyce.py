@@ -105,6 +105,17 @@ class XyceNetlister(SpiceNetlister):
             for key, mappings in model_level_mapping.items():
                 self._model_level_mapping[key.lower()] = {in_level: out_level for in_level, out_level in mappings}
 
+        # Constant-eval environment for the current library section (when writing `.lib` sections).
+        self._section_const_env: Optional[dict] = None
+        # Fallback constant-eval environment for non-library netlists (single scope).
+        try:
+            all_entries = []
+            for f in (getattr(src, "files", []) or []):
+                all_entries.extend(getattr(f, "contents", []) or [])
+            self._global_const_env = self._build_section_const_env(all_entries)
+        except Exception:
+            self._global_const_env = {}
+
     @property
     def enum(self):
         """Get our entry in the `NetlistDialects` enumeration"""
@@ -453,6 +464,12 @@ class XyceNetlister(SpiceNetlister):
         """Write a Library Section definition."""
         # Write library section normally (no process variations here)
         section_name = self.format_ident(section.name)
+        # Build a best-effort constant-eval environment for this section, used
+        # to constant-fold BSIM4 bin-range parameters (lmin/lmax/wmin/wmax).
+        #
+        # Xyce requires these bounds to be literal numbers; it will not accept
+        # expressions or parameter references for lmin/lmax/wmin/wmax.
+        self._section_const_env = self._build_section_const_env(section.entries)
         self.write(f".lib {section_name}\n")
         pbar = None
         if self.options is not None and getattr(self.options, "show_progress", False):
@@ -469,6 +486,140 @@ class XyceNetlister(SpiceNetlister):
         if pbar is not None:
             pbar.close()
         self.write(f".endl {self.format_ident(section.name)}\n\n")
+        self._section_const_env = None
+
+    def _build_section_const_env(self, entries: list) -> dict:
+        """Collect top-level parameter *expressions* from a section's entries.
+
+        For bin-bound folding we need to be able to resolve references (e.g. dxlp_33)
+        to expressions that may include MC terms. The actual folding evaluation is
+        done with conservative short-circuiting and with MC controls defaulted to 0.
+        """
+        from ..data import ParamDecl, ParamDecls, Int, Float
+
+        env_expr: dict[str, object] = {}
+
+        def _collect_from_entry(ent) -> None:
+            if isinstance(ent, ParamDecl):
+                env_expr[ent.name.name.lower()] = ent.default
+                return
+            if isinstance(ent, ParamDecls):
+                for p in ent.params:
+                    env_expr[p.name.name.lower()] = p.default
+                return
+
+        for ent in entries or []:
+            _collect_from_entry(ent)
+
+        # Default MC controls to 0 unless explicitly set in this section.
+        env_expr.setdefault("enable_mismatch", Int(0))
+        env_expr.setdefault("mismatch_factor", Float(0.0))
+        env_expr.setdefault("process_mc_factor", Int(0))
+        return env_expr
+
+    def _eval_const_expr(self, expr, env_expr: dict, cache: dict[str, float], visiting: set[str]) -> float:
+        """Best-effort constant-ish evaluator used for BSIM4 bin-bound folding.
+
+        Key behavior:
+        - short-circuits multiplication by 0.0 (so enable_mismatch=0 kills gauss())
+        - treats mismatch-related symbols and calls as 0.0 (bin bounds should not depend on mismatch)
+        - treats process-random calls as 0.0 (bin bounds should not depend on MC)
+        """
+        from ..data import Int, Float, MetricNum, Ref, UnaryOp, BinaryOp, Call
+
+        if isinstance(expr, Int):
+            return float(expr.val)
+        if isinstance(expr, Float):
+            return float(expr.val)
+        if isinstance(expr, MetricNum):
+            return float(expr.val)
+
+        if isinstance(expr, Ref):
+            name = expr.ident.name.lower()
+            if "__mismatch__" in name or "misp" in name:
+                return 0.0
+            if name in cache:
+                return cache[name]
+            if name in visiting:
+                raise ValueError(f"cyclic reference: {name}")
+            if name not in env_expr:
+                # For bin-bound folding, treat small geometry-shift params as 0 if
+                # they are not defined in the current section (common when the
+                # shift is defined in an always-included mismatch/process section).
+                #
+                # This keeps nominal bin boundaries constant, which is what Xyce
+                # needs for bin selection.
+                if name.startswith(("dxl", "dxw", "dl", "dw", "dvth")):
+                    return 0.0
+                raise KeyError(name)
+            visiting.add(name)
+            v = self._eval_const_expr(env_expr[name], env_expr, cache, visiting)
+            visiting.remove(name)
+            cache[name] = v
+            return v
+
+        if isinstance(expr, UnaryOp):
+            op = expr.tp.value if hasattr(expr.tp, "value") else str(expr.tp)
+            v = self._eval_const_expr(expr.targ, env_expr, cache, visiting)
+            if op == "-":
+                return -v
+            if op == "+":
+                return v
+            raise ValueError(op)
+
+        if isinstance(expr, BinaryOp):
+            op = expr.tp.value if hasattr(expr.tp, "value") else str(expr.tp)
+            if op == "*":
+                a = self._eval_const_expr(expr.left, env_expr, cache, visiting)
+                if a == 0.0:
+                    return 0.0
+                b = self._eval_const_expr(expr.right, env_expr, cache, visiting)
+                if b == 0.0:
+                    return 0.0
+                return a * b
+            a = self._eval_const_expr(expr.left, env_expr, cache, visiting)
+            b = self._eval_const_expr(expr.right, env_expr, cache, visiting)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "/":
+                return a / b
+            if op == "^":
+                return a ** b
+            raise ValueError(op)
+
+        if isinstance(expr, Call):
+            fn = expr.func.ident.name.lower()
+            # Random / MC helpers: treat as 0 (should be killed by control params anyway).
+            if fn in ("gauss", "random", "rand", "random_fn__process__"):
+                return 0.0
+            if "__mismatch__" in fn or "mismatch" in fn:
+                return 0.0
+
+            args = [self._eval_const_expr(a, env_expr, cache, visiting) for a in expr.args]
+            if fn == "min":
+                return float(min(args))
+            if fn == "max":
+                return float(max(args))
+            if fn == "sqrt":
+                import math
+                return float(math.sqrt(args[0]))
+            if fn in ("ln", "log"):
+                import math
+                return float(math.log(args[0]))
+            if fn == "exp":
+                import math
+                return float(math.exp(args[0]))
+            if fn == "abs":
+                return float(abs(args[0]))
+            if fn == "pow":
+                return float(args[0] ** args[1])
+            if fn == "if":
+                return float(args[1] if args[0] != 0.0 else args[2])
+            raise ValueError(fn)
+
+        raise ValueError(type(expr).__name__)
 
     def write_library(self, library) -> None:
         """Write a Library object, logging a warning about the omitted library wrapper.
@@ -3736,6 +3887,9 @@ class XyceNetlister(SpiceNetlister):
         # No need to replace references - the .param aliases reference PARAMS, so models can use the same names
         # The .param statements (e.g., .param swx_nrds={swx_nrds}) create aliases that models can access
         
+        # Track any BSIM4 bin-bound folding so we can emit one summary warning per model.
+        folded_bin_bounds: set[str] = set()
+
         # Write parameters using the filtered list
         for item in params_to_write:
             # Handle new format (tuple) from _map_bjt_level1_to_mextram_params
@@ -3771,6 +3925,21 @@ class XyceNetlister(SpiceNetlister):
                             is_level_504 = True
                             break
             
+            # Xyce cannot accept expressions/parameter refs for BSIM4 bin bounds.
+            # Constant-fold lmin/lmax/wmin/wmax where possible using the section env.
+            if mtype in ("nmos", "pmos") and param.name.name.lower() in ("lmin", "lmax", "wmin", "wmax"):
+                env_expr = getattr(self, "_section_const_env", None) or getattr(self, "_global_const_env", {}) or {}
+                try:
+                    # Only fold if it actually references something non-literal.
+                    from ..data import Ref as _Ref, BinaryOp as _BinaryOp, UnaryOp as _UnaryOp, Call as _Call
+                    if isinstance(param.default, (_Ref, _BinaryOp, _UnaryOp, _Call)):
+                        v = self._eval_const_expr(param.default, env_expr, cache={}, visiting=set())
+                        param = ParamDecl(name=param.name, default=Float(v), distr=param.distr)
+                        folded_bin_bounds.add(param.name.name.lower())
+                except Exception:
+                    # If we can't fold it, leave it as-is (but note: Xyce may reject).
+                    pass
+
             if is_level_504 and param.name.name != "level":
                 # Create a temporary param with uppercase name for writing (MEXTRAM)
                 param_upper = ParamDecl(
@@ -3788,4 +3957,15 @@ class XyceNetlister(SpiceNetlister):
                 
             self.write("\n")
         
+        if folded_bin_bounds:
+            # This warning is important for auditability: it explains why MC-dependent
+            # deltas do not affect bin selection in the Xyce deck.
+            self.log_warning(
+                "Constant-folded BSIM4 bin bounds for Xyce compatibility: "
+                + ", ".join(sorted({b.upper() for b in folded_bin_bounds}))
+                + ". Note: mismatch/process geometry deltas were treated as 0 when folding, "
+                "so Monte Carlo does not change bin selection.",
+                f"Model: {mname}",
+            )
+
         self.write("\n")  # Ending blank-line
