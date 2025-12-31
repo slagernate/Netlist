@@ -34,3 +34,4 @@ def test_parse_xyce_emitted_subckts_out_cir() -> None:
     subckts = [e for e in prog.files[0].contents if isinstance(e, SubcktDef)]
     assert len(subckts) >= 2
 
+
