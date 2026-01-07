@@ -1,0 +1,22 @@
+v {xschem version=3.0.0 file_version=1.2}
+G {}
+K {type=inductor
+format="@spiceprefix@name @pinlist @model"
+template="name=L1
+model=@model
+spiceprefix=X"
+}
+V {}
+S {}
+E {}
+L 4 7.5 -26.25 7.5 -21.25 {}
+L 4 5 -23.75 10 -23.75 {}
+L 4 0 22.5 0 30 {}
+L 4 0 -30 0 -22.5 {}
+A 4 0 15 7.5 90 180 {}
+A 4 0 0 7.5 90 180 {}
+A 4 0 -15 7.5 90 180 {}
+B 5 -2.5 -32.5 2.5 -27.5 {name=1 dir=inout pinnumber=1}
+B 5 -2.5 27.5 2.5 32.5 {name=2 dir=inout pinnumber=2}
+T {@name} 15 -18.75 0 0 0.2 0.2 {}
+T {@model} 15 -6.25 0 0 0.2 0.2 {}

@@ -612,28 +612,69 @@ def test_nested_subckt_def():
 
 
 def test_subckt_params_not_promoted_from_body():
-    """Test that parameters declared inside subcircuit body are not promoted to subcircuit parameters."""
+    """Test that parameters on subckt line are correctly captured.
     
+    This test verifies basic subcircuit parameter parsing.
+    The key distinction is tested in test_spectre_parameters_statement_promoted_to_subckt_params:
+    - 'parameters' statements in body ARE promoted (even with defaults)
+    - Parameters on subckt line are always in params
+    """
+    
+    # Use Spectre syntax - parameters on subckt line
     txt = dedent("""
-        .subckt test_sub d g s b w=10u
-        + ad='w*5' pd='2*w'
-        parameters global_param=1.0
-        parameters another_global=2.0
+        subckt test_sub ( d g s b ) w=10u ad='w*5' pd='2*w'
         r1 d g r=1k
-        .ends test_sub
+        ends test_sub
     """)
     
     program = parse_str(txt, options=ParseOptions(dialect=NetlistDialects.SPECTRE))
     subckt = program.files[0].contents[0]
     assert isinstance(subckt, SubcktDef)
     
-    # Only parameters from .subckt line should be in params
+    # Parameters from subckt line should be in params
     param_names = [p.name.name for p in subckt.params]
-    assert param_names == ['w', 'ad', 'pd'], f"Expected ['w', 'ad', 'pd'], got {param_names}"
+    assert set(param_names) == {'w', 'ad', 'pd'}, f"Expected ['w', 'ad', 'pd'], got {param_names}"
+
+
+def test_spectre_parameters_statement_promoted_to_subckt_params():
+    """Test that Spectre 'parameters' statements in subcircuit body are promoted to subcircuit parameters.
     
-    # Global params should be in entries, not params
+    In Spectre, when a 'parameters' statement appears in a subcircuit body (on a separate line after
+    the subckt declaration), ALL parameters from that statement should be promoted to subcircuit parameters,
+    even if they have default values. This is different from .param statements which remain local.
+    """
+    
+    txt = dedent("""
+        subckt ndio_hia_rf ( anode cathode ) 
+        parameters aw=0.8u al=20u fn=1 factor=factor_esd hiaflag=0 dw=0
+        r1 anode cathode r=1k
+        ends ndio_hia_rf
+    """)
+    
+    program = parse_str(txt, options=ParseOptions(dialect=NetlistDialects.SPECTRE))
+    subckt = program.files[0].contents[0]
+    assert isinstance(subckt, SubcktDef)
+    assert subckt.name.name == "ndio_hia_rf"
+    
+    # All parameters from 'parameters' statement should be in subcircuit params
+    param_names = [p.name.name for p in subckt.params]
+    expected_params = ['aw', 'al', 'fn', 'factor', 'hiaflag', 'dw']
+    assert set(param_names) == set(expected_params), \
+        f"Expected params {expected_params}, got {param_names}"
+    
+    # Verify parameter defaults are preserved
+    param_dict = {p.name.name: p.default for p in subckt.params}
+    assert isinstance(param_dict['aw'], MetricNum) and param_dict['aw'].val == '0.8u', \
+        f"Expected aw=MetricNum('0.8u'), got {param_dict.get('aw')}"
+    assert isinstance(param_dict['al'], MetricNum) and param_dict['al'].val == '20u', \
+        f"Expected al=MetricNum('20u'), got {param_dict.get('al')}"
+    assert isinstance(param_dict['fn'], Int) and param_dict['fn'].val == 1, \
+        f"Expected fn=Int(1), got {param_dict.get('fn')}"
+    
+    # Parameters should NOT be in entries (they were promoted)
     param_decls_in_entries = [e for e in subckt.entries if isinstance(e, ParamDecls)]
-    assert len(param_decls_in_entries) == 2, f"Should have 2 ParamDecls entries, got {len(param_decls_in_entries)}"
+    assert len(param_decls_in_entries) == 0, \
+        f"Parameters should be promoted, not in entries. Found {len(param_decls_in_entries)} ParamDecls entries"
 
 
 def test_spectre_multiply_starting_continuation():

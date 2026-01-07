@@ -452,6 +452,8 @@ class HierarchyCollector:
                 continue
 
             # Parameter statements in subckt scope:
+            # - Parameters from "parameters" statement (ParamDecls from parse_param_statement) should ALL be promoted to subcircuit params
+            #   (In Spectre, "parameters" in subcircuit body defines subcircuit parameters, even with defaults)
             # - Formal parameters (from "parameters:" statement, no defaults) should be promoted to subcircuit params
             # - Local/global parameters (from ".param" or ".PARAM", with defaults) should remain as entries
             if isinstance(stmt, ParamDecl):
@@ -462,14 +464,12 @@ class HierarchyCollector:
                     nodes.append(stmt)  # Local parameter - keep as entry
                 continue
             elif isinstance(stmt, ParamDecls):
-                # Check if all params are formal (no defaults) - if so, promote them
-                formal_params = [p for p in stmt.params if p.default is None]
-                local_params = [p for p in stmt.params if p.default is not None]
-                if formal_params:
-                    params.extend(formal_params)  # Promote formal params
-                if local_params:
-                    # Keep local params as ParamDecls entry
-                    nodes.append(ParamDecls(params=local_params))
+                # For ParamDecls from "parameters" statement in Spectre subcircuit body:
+                # ALL parameters should be promoted to subcircuit params (even with defaults)
+                # This is because "parameters" in Spectre defines subcircuit parameters, not local params
+                # We distinguish this from ".param" statements which would be ParamDecl (single) not ParamDecls
+                # So if we see ParamDecls in subcircuit body, it's from "parameters" statement -> promote all
+                params.extend(stmt.params)  # Promote ALL parameters from "parameters" statement
                 continue
 
             if isinstance(stmt, StartSubckt):

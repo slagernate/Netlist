@@ -96,18 +96,25 @@ class PrimitiveDetector:
         param_names = {p.name.name.lower() for p in subckt.params}
         
         # Check name patterns
-        name_has_mos = any(keyword in subckt_name_lower for keyword in ['mos', 'fet', 'transistor'])
+        name_has_mos = any(keyword in subckt_name_lower for keyword in ['mos', 'fet', 'transistor', 'nch', 'pch'])
         name_has_bjt = any(keyword in subckt_name_lower for keyword in ['npn', 'pnp', 'bjt', 'q'])
-        name_has_res = any(keyword in subckt_name_lower for keyword in ['resistor', 'res', 'r'])
-        name_has_diode = any(keyword in subckt_name_lower for keyword in ['diode', 'd'])
-        name_has_cap = any(keyword in subckt_name_lower for keyword in ['capacitor', 'cap', 'c'])
-        name_has_ind = any(keyword in subckt_name_lower for keyword in ['inductor', 'ind', 'l'])
+        # Avoid single-letter heuristics like 'r' which match too broadly (e.g. "circuit").
+        name_has_res = any(keyword in subckt_name_lower for keyword in ['resistor', 'res'])
+        name_has_diode = any(keyword in subckt_name_lower for keyword in ['diode', 'dio', 'sbd'])
+        # Avoid single-letter heuristics like 'c' which match too broadly (e.g. "circuit").
+        name_has_cap = any(keyword in subckt_name_lower for keyword in ['capacitor', 'cap'])
+        name_has_ind = any(keyword in subckt_name_lower for keyword in ['inductor', 'ind'])
+        # Don't use 'l' alone as it matches too many things (MOSFET length, etc.)
         
-        # Check for MOSFET (4 ports, has l and w params, name suggests MOS)
+        # Check for MOSFET (4, 5, or 6 ports, has l/w or lr/wr params, name suggests MOS)
         has_l_w = {'l', 'w'} <= param_names
+        has_lr_wr = {'lr', 'wr'} <= param_names
+        # Some subckts (nch*/pch*) may not have their L/W extracted in our reduced param set yet.
+        # For these, allow name+port-count to classify as MOSFET even if L/W are missing.
+        name_is_nch_pch = ('nch' in subckt_name_lower) or ('pch' in subckt_name_lower)
         is_mosfet = (
-            port_count == 4  # Exactly 4 ports (d, g, s, b)
-            and has_l_w  # Has both 'l' and 'w' params
+            port_count in [4, 5, 6]  # 4, 5, or 6 ports (d, g, s, b, [ng], [pg])
+            and (has_l_w or has_lr_wr or name_is_nch_pch)  # Has either sizing params OR is clearly nch/pch
             and name_has_mos  # Name indicates MOS
         )
         
@@ -123,6 +130,38 @@ class PrimitiveDetector:
         if is_bjt:
             return PrimitiveType.BJT
         
+        # Check for Diode (usually 2 ports, but allow 3-port variants with a gnode/sub terminal)
+        #
+        # IMPORTANT: Names like rnod*/rpod* in this PDK are resistors (user confirmed),
+        # even though they contain "nod"/"pod". So we only treat "nod"/"pod" as diode
+        # hints when the device is NOT an R* device.
+        name_has_dio = ('dio' in subckt_name_lower) or ('sbd' in subckt_name_lower)
+        is_r_device = subckt_name_lower.startswith('r')
+        name_has_nod = (not is_r_device) and ('nod' in subckt_name_lower)
+        name_has_pod = (not is_r_device) and ('pod' in subckt_name_lower)
+        has_diode_params = any(p in param_names for p in ['area', 'perim', 'pj', 'aw', 'al'])
+        port_names_lower = [p.name.lower() for p in subckt.ports]
+        is_sbd = 'sbd' in subckt_name_lower
+        has_gnode_like = any(
+            p in ['gnode', 'gnd', 'gnd!', 'sub', 'substrate', 'bulk', 'body', 'b']
+            for p in port_names_lower
+        )
+        is_diode = (
+            (port_count in [2, 3])
+            and (name_has_diode or name_has_dio or name_has_nod or name_has_pod or has_diode_params)
+            # For 3-pin diodes, require a gnode/sub-like terminal unless this is an SBD device
+            # which uses numeric terminals (1 2 3) but is still a diode network.
+            and (port_count == 2 or has_gnode_like or is_sbd)
+        )
+        
+        if is_diode:
+            return PrimitiveType.DIODE
+
+        # Strong resistor heuristic for this PDK: many resistors are named r* and may not have an explicit 'r' param.
+        # Treat 2- or 3-terminal r* devices as resistors.
+        if subckt_name_lower.startswith('r') and port_count in [2, 3]:
+            return PrimitiveType.RESISTOR
+        
         # Check for Resistor (2 ports, has 'r' param or name suggests resistor)
         has_r_param = 'r' in param_names
         is_resistor = (
@@ -133,32 +172,24 @@ class PrimitiveDetector:
         if is_resistor:
             return PrimitiveType.RESISTOR
         
-        # Check for Diode (2 ports, has diode params or name suggests diode)
-        has_diode_params = any(p in param_names for p in ['area', 'perim', 'pj'])
-        is_diode = (
-            port_count == 2  # Exactly 2 ports
-            and (name_has_diode or has_diode_params)
-        )
-        
-        if is_diode:
-            return PrimitiveType.DIODE
-        
-        # Check for Capacitor (2 ports, has 'c' param or name suggests capacitor)
+        # Check for Capacitor (2 or 3 ports, has 'c' param or name suggests capacitor)
+        # Note: MOSFET capacitors (moscap) can have 2 or 3 ports
         has_c_param = 'c' in param_names
         is_capacitor = (
-            port_count == 2  # Exactly 2 ports
+            port_count in [2, 3]  # 2 or 3 ports (regular cap or MOSFET cap)
             and (name_has_cap or has_c_param)
         )
         
         if is_capacitor:
             return PrimitiveType.CAPACITOR
         
-        # Check for Inductor (2 ports, has 'l' param or name suggests inductor)
+        # Check for Inductor (2, 3, or 4 ports, name suggests inductor like "spiral")
         # Note: 'l' is also used for MOSFET length, so we need to be careful
         has_l_param = 'l' in param_names
+        name_has_spiral = 'spiral' in subckt_name_lower
         is_inductor = (
-            port_count == 2  # Exactly 2 ports
-            and name_has_ind  # Name must suggest inductor (to avoid confusion with MOSFET)
+            port_count in [2, 3, 4]  # 2, 3, or 4 ports (spiral inductors can have extra terminals)
+            and (name_has_ind or name_has_spiral)  # Name must suggest inductor
             and not has_l_w  # Not a MOSFET (doesn't have both l and w)
         )
         
