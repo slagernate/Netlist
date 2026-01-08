@@ -1128,9 +1128,9 @@ class XschemSymbolGenerator:
             has_nr = any(p.name.name.lower() == 'nr' for p in subckt.params)
             if has_wr and has_lr:
                 # RF MOSFET: show wr/lr
-                # Display in microns for readability (does not affect netlisting):
-                # wr/lr are typically in meters in the RF MOS libraries.
-                lines.append("T {@wr*1e6 / @lr*1e6} 31.25 10 0 0 0.2 0.2 { layer=13}")
+                # Keep display simple and robust across Xschem expression handling.
+                # (Using arithmetic like `*1e6` caused some setups to render only `/`.)
+                lines.append("T {@wr / @lr} 31.25 10 0 0 0.2 0.2 { layer=13}")
             else:
                 # Standard MOSFET: show W/L if available
                 has_w = any(p.name.name.lower() == 'w' for p in subckt.params)
