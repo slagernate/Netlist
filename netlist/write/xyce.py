@@ -532,7 +532,29 @@ class XyceNetlister(SpiceNetlister):
         if isinstance(expr, Float):
             return float(expr.val)
         if isinstance(expr, MetricNum):
-            return float(expr.val)
+            # MetricNum.val may include suffixes like "1u" / "10n". Parse those.
+            val_str = str(expr.val).strip()
+            m = re.match(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)([a-zA-Z]+)?$", val_str)
+            if not m:
+                return float(val_str)
+            num = float(m.group(1))
+            suf = (m.group(2) or "")
+            suffix_map = {
+                "T": 1e12,
+                "G": 1e9,
+                "MEG": 1e6,
+                "X": 1e6,
+                "K": 1e3,
+                "M": 1e-3,
+                "MIL": 2.54e-5,
+                "U": 1e-6,
+                "N": 1e-9,
+                "P": 1e-12,
+                "F": 1e-15,
+                "A": 1e-18,
+            }
+            mult = suffix_map.get(suf.upper(), 1.0)
+            return num * mult
 
         if isinstance(expr, Ref):
             name = expr.ident.name.lower()
@@ -663,22 +685,10 @@ class XyceNetlister(SpiceNetlister):
             for i, param in enumerate(params):
                 if i:
                     self.write(" ")
-                # Many S130 subckts use microns for L/W, but some Spectre defaults come through as
-                # metric-suffixed values (e.g. w=60u). For Xyce/BSIM4 here we want unitless microns,
-                # so strip the 'u' suffix for L/W defaults in subckt headers.
-                p = param
-                if p.name.name.lower() in ("l", "w") and isinstance(p.default, MetricNum) and str(p.default.val).lower().endswith("u"):
-                    try:
-                        p = ParamDecl(
-                            name=p.name,
-                            default=Float(float(str(p.default.val)[:-1])),
-                            distr=p.distr,
-                            comment=p.comment,
-                        )
-                    except Exception:
-                        # If parsing fails, fall back to original value.
-                        p = param
-                self.write_param_decl(p, include_comment=False)
+                # Preserve metric suffixes (e.g. 1u) in PARAMS defaults.
+                # Conversions that want unitless microns should do so explicitly upstream
+                # (e.g. via binunit/scale-aware transforms), not by stripping suffixes here.
+                self.write_param_decl(param, include_comment=False)
             self.write("\n")
             # Preserve any parameter comments as standalone lines (won't affect PARAMS parsing).
             for param in params:

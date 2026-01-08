@@ -136,6 +136,35 @@ def test_write_xyce_func():
     assert "}" in func_line
 
 
+def test_write_xyce_preserves_metric_suffix_in_subckt_params():
+    """Xyce writer should preserve metric suffixes like `1u` in .SUBCKT PARAMS defaults."""
+    src = Program(
+        files=[
+            SourceFile(
+                path="/test.scs",
+                contents=[
+                    SubcktDef(
+                        name=Ident("nch_mac"),
+                        ports=[Ident("d"), Ident("g"), Ident("s"), Ident("b")],
+                        params=[
+                            ParamDecl(name=Ident("l"), default=MetricNum("0.5u"), distr=None),
+                            ParamDecl(name=Ident("w"), default=MetricNum("1u"), distr=None),
+                        ],
+                        entries=[],
+                    )
+                ],
+            )
+        ]
+    )
+    dest = StringIO()
+    write_netlist(src=src, dest=dest, options=WriteOptions(fmt=NetlistDialects.XYCE))
+    out = dest.getvalue()
+    assert ".SUBCKT" in out
+    # Do not strip the suffix (regression: "1u" -> "1.0")
+    assert "l=0.5u" in out
+    assert "w=1u" in out
+
+
 def test_write_xyce_func_with_args():
     """Test writing Xyce .FUNC definitions with arguments"""
     
