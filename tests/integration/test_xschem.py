@@ -12,7 +12,7 @@ from io import StringIO
 
 from netlist import parse_files, netlist, NetlistDialects, ParseOptions, WriteOptions
 from netlist.data import Program, SourceFile, SubcktDef, Ident, ParamDecl, Float, Instance, Ref
-from netlist.write.primitive_detector import PrimitiveDetector, PrimitiveType
+from netlist.write.xschem_symbol import PrimitiveDetector, PrimitiveType
 
 
 def test_primitive_detector_mosfet():

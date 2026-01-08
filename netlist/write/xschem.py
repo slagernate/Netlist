@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import IO, Optional, Dict, Tuple
 from io import StringIO
 from .base import Netlister
-from .primitive_detector import PrimitiveDetector, PrimitiveType
+from .xschem_symbol import PrimitiveDetector, PrimitiveType
 from .xschem_symbol import XschemSymbolGenerator
 from .spice import SpiceNetlister, NgspiceNetlister
 from .xyce import XyceNetlister

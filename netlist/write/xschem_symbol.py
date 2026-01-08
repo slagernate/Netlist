@@ -5,9 +5,327 @@ Generates xschem .sym symbol files for primitive device types.
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional
-from .primitive_detector import PrimitiveType
-from ..data import SubcktDef, ParamDecl, Ident
+from typing import Dict, List, Optional, Tuple
+import json
+import re
+from enum import Enum
+
+# Optional yaml support (for primitive overrides config)
+try:
+    import yaml  # type: ignore
+
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+
+class PrimitiveType(Enum):
+    """Enumerated primitive device types (Xschem symbol/template classification)."""
+
+    MOSFET = "mosfet"
+    BJT = "bjt"
+    DIODE = "diode"
+    RESISTOR = "resistor"
+    CAPACITOR = "capacitor"
+    INDUCTOR = "inductor"
+    UNKNOWN = "unknown"
+
+
+class PrimitiveDetector:
+    """Detects primitive device types from SubcktDef structures (Xschem-focused)."""
+
+    def __init__(self, config_file: Optional[str] = None):
+        self.config_overrides: Dict[str, PrimitiveType] = {}
+        if config_file:
+            self._load_config(config_file)
+
+    def _load_config(self, config_file: str) -> None:
+        p = Path(config_file)
+        if not p.exists():
+            return
+        try:
+            with open(p, "r") as f:
+                if p.suffix.lower() in [".yaml", ".yml"]:
+                    if HAS_YAML:
+                        config = yaml.safe_load(f)
+                    else:
+                        return
+                else:
+                    config = json.load(f)
+            if isinstance(config, dict):
+                for subckt_name, prim_type_str in config.items():
+                    try:
+                        self.config_overrides[subckt_name.lower()] = PrimitiveType(prim_type_str.lower())
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+
+    def detect(self, subckt: "SubcktDef") -> PrimitiveType:
+        subckt_name_lower = subckt.name.name.lower()
+        if subckt_name_lower in self.config_overrides:
+            return self.config_overrides[subckt_name_lower]
+
+        port_count = len(subckt.ports)
+        param_names = {p.name.name.lower() for p in subckt.params}
+
+        name_has_mos = any(k in subckt_name_lower for k in ["mos", "fet", "transistor", "nch", "pch"])
+        name_has_bjt = any(k in subckt_name_lower for k in ["npn", "pnp", "bjt", "q"])
+        name_has_res = any(k in subckt_name_lower for k in ["resistor", "res"])
+        name_has_diode = any(k in subckt_name_lower for k in ["diode", "dio", "sbd"])
+        name_has_cap = any(k in subckt_name_lower for k in ["capacitor", "cap"])
+        name_has_ind = any(k in subckt_name_lower for k in ["inductor", "ind"])
+
+        has_l_w = {"l", "w"} <= param_names
+        has_lr_wr = {"lr", "wr"} <= param_names
+        name_is_nch_pch = ("nch" in subckt_name_lower) or ("pch" in subckt_name_lower)
+        if port_count in [4, 5, 6] and (has_l_w or has_lr_wr or name_is_nch_pch) and name_has_mos:
+            return PrimitiveType.MOSFET
+
+        if port_count == 4 and name_has_bjt:
+            return PrimitiveType.BJT
+
+        name_has_dio = ("dio" in subckt_name_lower) or ("sbd" in subckt_name_lower)
+        is_r_device = subckt_name_lower.startswith("r")
+        name_has_nod = (not is_r_device) and ("nod" in subckt_name_lower)
+        name_has_pod = (not is_r_device) and ("pod" in subckt_name_lower)
+        has_diode_params = any(p in param_names for p in ["area", "perim", "pj", "aw", "al"])
+        port_names_lower = [p.name.lower() for p in subckt.ports]
+        is_sbd = "sbd" in subckt_name_lower
+        has_gnode_like = any(
+            p in ["gnode", "gnd", "gnd!", "sub", "substrate", "bulk", "body", "b"] for p in port_names_lower
+        )
+        if (port_count in [2, 3]) and (name_has_diode or name_has_dio or name_has_nod or name_has_pod or has_diode_params) and (
+            port_count == 2 or has_gnode_like or is_sbd
+        ):
+            return PrimitiveType.DIODE
+
+        if subckt_name_lower.startswith("r") and port_count in [2, 3]:
+            return PrimitiveType.RESISTOR
+
+        if port_count == 2 and (name_has_res or ("r" in param_names)):
+            return PrimitiveType.RESISTOR
+
+        if port_count in [2, 3] and (name_has_cap or ("c" in param_names)):
+            return PrimitiveType.CAPACITOR
+
+        name_has_spiral = "spiral" in subckt_name_lower
+        if port_count in [2, 3, 4] and (name_has_ind or name_has_spiral) and not has_l_w:
+            return PrimitiveType.INDUCTOR
+
+        return PrimitiveType.UNKNOWN
+
+from ..data import SubcktDef, ParamDecl, Ident, MetricNum
+
+
+class SymbolMatcher:
+    """Matches subcircuits to generic Xschem symbol templates using heuristics.
+
+    Xschem-specific by design: it assumes templates are `.sym` files organized by
+    primitive type in `xschem_symbol_templates/<primitive>/...`.
+    """
+
+    def __init__(self, template_dir: Path):
+        self.template_dir = Path(template_dir)
+        self._load_available_templates()
+
+    def _load_available_templates(self) -> None:
+        self.templates: Dict[PrimitiveType, List[Path]] = {
+            PrimitiveType.MOSFET: [],
+            PrimitiveType.RESISTOR: [],
+            PrimitiveType.CAPACITOR: [],
+            PrimitiveType.DIODE: [],
+            PrimitiveType.BJT: [],
+            PrimitiveType.INDUCTOR: [],
+        }
+
+        mosfet_dir = self.template_dir / "mosfet"
+        if mosfet_dir.exists():
+            self.templates[PrimitiveType.MOSFET].extend(mosfet_dir.glob("*.sym"))
+
+        resistor_dir = self.template_dir / "resistor"
+        if resistor_dir.exists():
+            self.templates[PrimitiveType.RESISTOR].extend(resistor_dir.glob("*.sym"))
+
+        for dev_type in [
+            PrimitiveType.CAPACITOR,
+            PrimitiveType.DIODE,
+            PrimitiveType.BJT,
+            PrimitiveType.INDUCTOR,
+        ]:
+            dev_dir = self.template_dir / dev_type.value
+            if dev_dir.exists():
+                self.templates[dev_type].extend(dev_dir.glob("*.sym"))
+
+    def match(self, subckt: SubcktDef, prim_type: PrimitiveType) -> Tuple[Optional[Path], float, List[str]]:
+        """Return (template_path, confidence, reasons)."""
+        if prim_type == PrimitiveType.UNKNOWN:
+            return None, 0.0, ["primitive_type_unknown"]
+
+        available_templates = self.templates.get(prim_type, [])
+        if not available_templates:
+            return None, 0.0, [f"no_templates_available_for_{prim_type.value}"]
+
+        best_template: Optional[Path] = None
+        best_score = 0.0
+        best_reasons: List[str] = []
+
+        subckt_name_lower = subckt.name.name.lower()
+        port_names = {p.name.lower() for p in subckt.ports}
+        param_names = {p.name.name.lower() for p in subckt.params}
+
+        for template_path in available_templates:
+            score = 0.0
+            reasons: List[str] = []
+            template_name = template_path.stem.lower()
+
+            if prim_type == PrimitiveType.MOSFET:
+                is_pmos = subckt_name_lower.startswith("p") or "pmos" in subckt_name_lower or "pfet" in subckt_name_lower
+                is_nmos = subckt_name_lower.startswith("n") or "nmos" in subckt_name_lower or "nfet" in subckt_name_lower
+
+                if "pmos" in template_name or "pfet" in template_name:
+                    if is_pmos:
+                        score += 0.4
+                        reasons.append("name_contains_pmos")
+                    elif is_nmos:
+                        score -= 0.2
+                elif "nmos" in template_name or "nfet" in template_name:
+                    if is_nmos:
+                        score += 0.4
+                        reasons.append("name_contains_nmos")
+                    elif is_pmos:
+                        score -= 0.2
+
+                if "4pin" in template_name:
+                    if len(subckt.ports) == 4:
+                        score += 0.3
+                        reasons.append("pins_match_4pin")
+                        has_dgsb = port_names >= {"d", "g", "s", "b"}
+                        has_n1234 = port_names >= {"n1", "n2", "n3", "n4"}
+                        has_digisibi = port_names >= {"di", "gi", "si", "bi"}
+                        if has_dgsb or has_n1234 or has_digisibi:
+                            score += 0.2
+                            if has_dgsb:
+                                reasons.append("pins_match_dgsb")
+                            elif has_n1234:
+                                reasons.append("pins_match_n1n2n3n4_as_dgsb")
+                            else:
+                                reasons.append("pins_match_di_gi_si_bi_as_dgsb")
+                    elif len(subckt.ports) in [5, 6]:
+                        score += 0.1
+                        reasons.append("pins_match_variant")
+
+                if "lr" in param_names and "wr" in param_names:
+                    score += 0.1
+                    reasons.append("has_lr_wr_params")
+                elif "l" in param_names and "w" in param_names:
+                    score += 0.1
+                    reasons.append("has_L_W_params")
+
+            elif prim_type == PrimitiveType.CAPACITOR:
+                if "capacitor" in template_name or "cap" in template_name:
+                    if "cap" in subckt_name_lower or "capacitor" in subckt_name_lower:
+                        score += 0.3
+                        reasons.append("name_contains_cap")
+
+                if "2pin" in template_name:
+                    if len(subckt.ports) == 2:
+                        score += 0.4
+                        reasons.append("pins_match_2pin")
+                    elif len(subckt.ports) == 3:
+                        score += 0.1
+                        reasons.append("pins_match_3pin")
+                elif "3pin" in template_name:
+                    if len(subckt.ports) == 3:
+                        score += 0.4
+                        reasons.append("pins_match_3pin")
+                    elif len(subckt.ports) == 2:
+                        score += 0.1
+                        reasons.append("pins_match_2pin")
+
+                if "c" in param_names or "w" in param_names or "l" in param_names:
+                    score += 0.2
+                    reasons.append("has_cap_params")
+
+            elif prim_type == PrimitiveType.RESISTOR:
+                if "resistor" in template_name or "res" in template_name:
+                    if "res" in subckt_name_lower or "resistor" in subckt_name_lower:
+                        score += 0.2
+                        reasons.append("name_contains_res")
+                    else:
+                        score += 0.1
+                        reasons.append("resistor_type_detected")
+
+                if "2pin" in template_name:
+                    if len(subckt.ports) == 2:
+                        score += 0.4
+                        reasons.append("pins_match_2pin")
+                    elif len(subckt.ports) == 3:
+                        score += 0.2
+                        reasons.append("pins_match_3pin")
+                elif "3pin" in template_name:
+                    if len(subckt.ports) == 3:
+                        score += 0.4
+                        reasons.append("pins_match_3pin")
+                    elif len(subckt.ports) == 2:
+                        score += 0.2
+                        reasons.append("pins_match_2pin")
+
+                if "r" in param_names:
+                    score += 0.2
+                    reasons.append("has_r_param")
+                elif "l" in param_names or "w" in param_names:
+                    score += 0.15
+                    reasons.append("has_L_W_params")
+
+            elif prim_type == PrimitiveType.INDUCTOR:
+                if "2pin" in template_name:
+                    if len(subckt.ports) == 2:
+                        score += 0.4
+                        reasons.append("pins_match_2pin")
+                    elif len(subckt.ports) == 3:
+                        score += 0.3
+                        reasons.append("pins_match_2pin_can_add_3rd")
+                    elif len(subckt.ports) == 4:
+                        score += 0.25
+                        reasons.append("pins_match_2pin_can_add_extras")
+                elif "3pin" in template_name:
+                    if len(subckt.ports) == 3:
+                        score += 0.4
+                        reasons.append("pins_match_3pin")
+                    elif len(subckt.ports) == 2:
+                        score += 0.2
+                        reasons.append("pins_match_2pin")
+                    elif len(subckt.ports) == 4:
+                        score += 0.35
+                        reasons.append("pins_match_3pin_can_add_4th")
+
+                if "inductor" in template_name or "ind" in template_name:
+                    if "ind" in subckt_name_lower or "spiral" in subckt_name_lower:
+                        score += 0.2
+                        reasons.append("name_contains_ind")
+
+            else:
+                if len(subckt.ports) == 2:
+                    score += 0.3
+                    reasons.append("pins_match_2pin")
+                elif len(subckt.ports) == 4:
+                    score += 0.3
+                    reasons.append("pins_match_4pin")
+
+            if score > best_score:
+                best_score = score
+                best_template = template_path
+                best_reasons = reasons
+
+        confidence = min(1.0, max(0.0, best_score))
+        threshold = 0.2 if prim_type in [PrimitiveType.RESISTOR, PrimitiveType.INDUCTOR] else 0.3
+
+        if best_template and confidence > threshold:
+            return best_template, confidence, best_reasons
+        if best_reasons:
+            return None, confidence, best_reasons + ["below_threshold"]
+        return None, confidence, ["no_match_found", f"available_templates: {[t.name for t in available_templates]}"]
 
 
 class XschemSymbolGenerator:
@@ -70,6 +388,55 @@ class XschemSymbolGenerator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.template_dir = Path(template_dir) if template_dir else None
         self._generated_symbols: Dict[PrimitiveType, str] = {}
+
+    @staticmethod
+    def _is_constant_numeric_default_str(s: str) -> bool:
+        """Return True if s looks like a plain numeric literal (optionally with metric suffix).
+
+        This is used to keep generated symbols simulator-agnostic: we only pre-populate
+        numeric constants and let derived/expr defaults come from the simulator model library.
+        """
+        ss = str(s).strip()
+        if not ss:
+            return False
+        # Reject anything that is obviously an expression / reference.
+        if any(ch in ss for ch in ["{", "}", "(", ")", "/", "*", "=", ","]):
+            return False
+        # Allow a leading sign and exponent sign; reject other operator usage.
+        # If there's a + or - not at the beginning and not immediately after e/E, treat as expression.
+        for i, ch in enumerate(ss):
+            if ch in ["+", "-"]:
+                if i == 0:
+                    continue
+                if ss[i - 1] in ["e", "E"]:
+                    continue
+                return False
+        metric = r"(?:t|g|meg|k|m|u|n|p|f)?"
+        pat = re.compile(rf"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?{metric}$", re.IGNORECASE)
+        return bool(pat.match(ss))
+
+    @staticmethod
+    def _primary_param_names_for_prim(prim_type: PrimitiveType) -> List[str]:
+        """Small set of user-facing params to propagate into symbols/netlists.
+
+        These are intended to be simulator-agnostic, and avoid exporting hundreds of
+        model-internal tuning coefficients even if they appear as header PARAMS.
+        """
+        if prim_type == PrimitiveType.MOSFET:
+            # RF MOS subckts often use (wr, lr, nr); 3.3V macro MOS often uses (w, l, nf, multi).
+            # Keep sigma as a common constant toggle and allow multi-finger/replication knobs.
+            return ["wr", "lr", "nr", "w", "l", "nf", "multi", "sigma", "m", "mf"]
+        if prim_type == PrimitiveType.RESISTOR:
+            return ["wr", "lr", "w", "l", "r", "nf", "multi", "m", "mf"]
+        if prim_type == PrimitiveType.CAPACITOR:
+            return ["w", "l", "wr", "lr", "c", "nf", "multi", "m", "mf"]
+        if prim_type == PrimitiveType.INDUCTOR:
+            return ["w", "rad", "nr", "l", "nf", "multi", "m", "mf"]
+        if prim_type == PrimitiveType.DIODE:
+            return ["area", "perim", "pj", "aw", "al", "nf", "multi", "m", "mf"]
+        if prim_type == PrimitiveType.BJT:
+            return ["area", "nf", "multi", "m", "mf"]
+        return []
     
     def generate_symbol(self, subckt: SubcktDef, prim_type: PrimitiveType, 
                        template_path: Optional[Path] = None) -> Path:
@@ -97,33 +464,7 @@ class XschemSymbolGenerator:
             content = self._load_and_adapt_template(template_path, subckt, prim_type)
         else:
             content = self._generate_symbol_content(subckt, prim_type)
-        
-        # Add source context as hidden attribute if available.
-        # Prefer ±5-line context around the .SUBCKT line (user request), fall back to older
-        # (comments_above + subckt_line) if needed.
-        has_old = hasattr(subckt, '_comments_above') and hasattr(subckt, '_subckt_line')
-        has_ctx = hasattr(subckt, '_subckt_context')
-        if has_ctx or has_old:
-            ctx = str(getattr(subckt, '_subckt_context', '') or '').strip()
-            if ctx:
-                comment_text = ctx
-            else:
-                comment_text = f"{getattr(subckt, '_comments_above', '')}\n{getattr(subckt, '_subckt_line', '')}".strip()
-            # Replace the K block to add the comment attribute
-            import re
-            # Add comment attribute to K block
-            k_block_pattern = r'(K \{)([^}]+)(\})'
-            def add_comment(match):
-                k_content = match.group(2)
-                # Escape the comment text for Xschem
-                comment_escaped = comment_text.replace('"', '\\"').replace('\n', '\\n')
-                # Add comment attribute (legacy) and source_context attribute (explicit)
-                if 'comment=' not in k_content:
-                    k_content += f'\ncomment="{comment_escaped}"'
-                if 'source_context=' not in k_content:
-                    k_content += f'\nsource_context="{comment_escaped}"'
-                return match.group(1) + k_content + match.group(3)
-            content = re.sub(k_block_pattern, add_comment, content, flags=re.DOTALL)
+        # Note: source context is added in `_generate_symbol_content()` as K-block attributes.
         
         # Write to file
         with open(sym_file, 'w') as f:
@@ -304,20 +645,24 @@ class XschemSymbolGenerator:
         # Generate template
         template = self._generate_template(subckt, prim_type)
         
-        # Build format string (multi-line if needed)
-        # Sort params: wr and lr first (for MOSFETs), then others
+        # Build format string.
+        # Sort params: wr and lr first (for MOSFETs), then others.
         sorted_params = self._sort_params_for_mosfet(subckt.params, prim_type)
+        # Dialect-agnostic policy:
+        # Include ALL header params that have constant numeric defaults (no expressions).
+        constant_params = [
+            p
+            for p in sorted_params
+            if self._is_constant_numeric_default_str(getattr(p.default, "val", p.default))
+        ]
         
         # Generated symbols instantiate IR subcircuits, so use X prefix directly (tests expect X@name).
+        # Keep `format` single-line (native xschem symbols do this); multi-line quoted strings here
+        # can cause Xschem to skip parsing the rest of the K-block (leading to "fresh device has 0 params").
         format_str = f"X@name @pinlist {subckt_name}"
-        param_str = ""
-        for param in sorted_params:
-            if param_str:
-                param_str += " "
-            # Use @param_name format to match Sky130 (not {param_name})
-            param_str += "{}=@{}".format(param.name.name, param.name.name)
-        if param_str:
-            format_str += "\n+ {}".format(param_str)
+        fmt_params = " ".join([f"{p.name.name}=@{p.name.name}" for p in constant_params])
+        if fmt_params:
+            format_str += " " + fmt_params
         
         # Build template string - use the _generate_template method
         template_str = self._generate_template(subckt, prim_type)
@@ -335,39 +680,43 @@ class XschemSymbolGenerator:
                 or "pfet" in subckt_name_lower
             ) else "nmos"
         
-        # Build lvs_format (simpler version for LVS)
-        # Use same sorted order as format
-        # For resistors, use simpler format like Sky130
-        if prim_type == PrimitiveType.RESISTOR:
-            # Use actual subcircuit name instead of @model
-            subckt_name = subckt.name.name if hasattr(subckt.name, 'name') else str(subckt.name)
-            lvs_format_str = f"X@name @pinlist {subckt_name}"
-            lvs_param_str = ""
-            for param in sorted_params:
-                if lvs_param_str:
-                    lvs_param_str += " "
-                lvs_param_str += "{}=@{}".format(param.name.name, param.name.name)
-            if lvs_param_str:
-                lvs_format_str += " {}".format(lvs_param_str)
-        else:
-            # Use actual subcircuit name instead of @model
-            subckt_name = subckt.name.name if hasattr(subckt.name, 'name') else str(subckt.name)
-            lvs_format_str = f"X@name @pinlist {subckt_name}"
-            lvs_param_str = ""
-            for param in sorted_params:
-                if lvs_param_str:
-                    lvs_param_str += " "
-                lvs_param_str += "{}=@{}".format(param.name.name, param.name.name)
-            if lvs_param_str:
-                lvs_format_str += " {}".format(lvs_param_str)
+        # Build lvs_format (LVS-oriented / minimal).
+        # Keep it small (typical libraries only include key geometry),
+        # while `format=` keeps the full parameter list for netlisting.
+        def _lvs_params(pt: PrimitiveType, params: List[ParamDecl]) -> List[ParamDecl]:
+            idx = {p.name.name.lower(): p for p in params}
+            if pt == PrimitiveType.MOSFET:
+                want = ["wr", "lr", "nr", "w", "l"]
+            elif pt == PrimitiveType.RESISTOR:
+                want = ["wr", "lr", "mf", "r"]
+            elif pt == PrimitiveType.CAPACITOR:
+                want = ["w", "l", "mf", "c"]
+            elif pt == PrimitiveType.INDUCTOR:
+                want = ["w", "rad", "nr", "l"]
+            elif pt == PrimitiveType.DIODE:
+                want = ["area", "perim", "pj", "aw", "al"]
+            else:
+                want = []
+            chosen = [idx[k] for k in want if k in idx]
+            # Enforce constant-only policy.
+            return [
+                p
+                for p in chosen
+                if self._is_constant_numeric_default_str(getattr(p.default, "val", p.default))
+            ]
+
+        lvs_format_str = f"X@name @pinlist {subckt_name}"
+        lvs_params = " ".join([f"{p.name.name}=@{p.name.name}" for p in _lvs_params(prim_type, constant_params)])
+        if lvs_params:
+            lvs_format_str += " " + lvs_params
         
         # Build drc attribute (for MOSFETs, match Sky130 format)
         drc_str = ""
-        if prim_type == PrimitiveType.MOSFET and sorted_params:
+        if prim_type == PrimitiveType.MOSFET and constant_params:
             # For MOSFETs, use fet_drc with name, symname, model, and key params
             # Use wr and lr from sorted params (they should be first)
-            param1 = sorted_params[0].name.name if sorted_params else "wr"
-            param2 = sorted_params[1].name.name if len(sorted_params) > 1 else "lr"
+            param1 = constant_params[0].name.name if constant_params else "wr"
+            param2 = constant_params[1].name.name if len(constant_params) > 1 else "lr"
             # Escape braces properly: need \\{ for { in output, and @param needs proper escaping
             # Format: fet_drc {@name\} {@symname\} {@model\} {@lr\} {@wr\}
             drc_str = 'fet_drc \\{{@name\\\\\\}} \\{{@symname\\\\\\}} \\{{@model\\\\\\}} \\{{@{}\\\\\\}} \\{{@{}\\\\\\}}'.format(
@@ -389,6 +738,24 @@ class XschemSymbolGenerator:
             'format="{}"'.format(format_str),
             'template="{}"'.format(template_str)
         ]
+        # Add source context (and legacy comment) as escaped, quoted K-block attributes.
+        # IMPORTANT: do NOT post-process the K block with a naive regex: many PARAMS defaults
+        # contain `}` which would corrupt the block.
+        ctx = str(getattr(subckt, "_subckt_context", "") or "").strip()
+        if not ctx:
+            ctx = f"{getattr(subckt, '_comments_above', '')}\n{getattr(subckt, '_subckt_line', '')}".strip()
+        if ctx:
+            # Escape for K-block quoted strings. Braces matter to xschem parsing even when
+            # nested in larger `{ ... }` attribute blocks, so escape them too.
+            ctx_escaped = (
+                ctx.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("{", "\\{")
+                .replace("}", "\\}")
+                .replace("\n", "\\n")
+            )
+            k_block_parts.append(f'comment="{ctx_escaped}"')
+            k_block_parts.append(f'source_context="{ctx_escaped}"')
         if drc_str:
             k_block_parts.append('drc="{}"'.format(drc_str))
         k_block = "K {{{}}}".format("\n".join(k_block_parts))
@@ -679,7 +1046,7 @@ class XschemSymbolGenerator:
                 pin_number += 1
         
         # Place extra pins on the LEFT side (for 5T/6T FETs)
-        # Position them vertically spaced, avoiding overlap with model text
+        # Position them vertically spaced, avoiding overlap with the gate/name text area.
         if extra_pins:
             extra_pin_x = -35  # Left side, far from gate
             # Move extra terminals higher so they don't sit on top of the gate area.
@@ -761,28 +1128,31 @@ class XschemSymbolGenerator:
             has_nr = any(p.name.name.lower() == 'nr' for p in subckt.params)
             if has_wr and has_lr:
                 # RF MOSFET: show wr/lr
-                lines.append("T {@wr / @lr} 31.25 13.75 0 0 0.2 0.2 { layer=13}")
+                # Display in microns for readability (does not affect netlisting):
+                # wr/lr are typically in meters in the RF MOS libraries.
+                lines.append("T {@wr*1e6 / @lr*1e6} 31.25 10 0 0 0.2 0.2 { layer=13}")
             else:
                 # Standard MOSFET: show W/L if available
                 has_w = any(p.name.name.lower() == 'w' for p in subckt.params)
                 has_l = any(p.name.name.lower() == 'l' for p in subckt.params)
                 if has_w and has_l:
                     # Use lowercase @w/@l since many subckts (e.g. *mac) use lowercase params.
-                    lines.append("T {@w / @l} 31.25 13.75 0 0 0.2 0.2 { layer=13}")
+                    lines.append("T {@w / @l} 31.25 10 0 0 0.2 0.2 { layer=13}")
                 else:
                     # Fallback for symbols that use uppercase W/L
                     has_W = any(p.name.name == 'W' for p in subckt.params)
                     has_L = any(p.name.name == 'L' for p in subckt.params)
                     if has_W and has_L:
-                        lines.append("T {@W / @L} 31.25 13.75 0 0 0.2 0.2 { layer=13}")
+                        lines.append("T {@W / @L} 31.25 10 0 0 0.2 0.2 { layer=13}")
 
             # Show nr (number of rows / fingers) if present
             if has_nr:
-                lines.append("T {nr=@nr} 31.25 20 0 0 0.2 0.2 { layer=13}")
+                # Push down to avoid overlapping the W/L label.
+                lines.append("T {nr=@nr} 31.25 22.5 0 0 0.2 0.2 { layer=13}")
             # Also show nf if present (many bsim devices use nf as fingers)
             has_nf = any(p.name.name.lower() == 'nf' for p in subckt.params)
             if has_nf:
-                lines.append("T {nf=@nf} 31.25 26.25 0 0 0.2 0.2 { layer=13}")
+                lines.append("T {nf=@nf} 31.25 32.5 0 0 0.2 0.2 { layer=13}")
         elif prim_type == PrimitiveType.RESISTOR:
             # Resistor labels matching Sky130
             lines.append("T {@name} 15 -27.5 0 0 0.2 0.2 {}")
@@ -1033,8 +1403,15 @@ class XschemSymbolGenerator:
             default_name = "X1"
         template_lines = [f'name={default_name}']
         
-        # Add parameters with their default values (only what's in the subcircuit definition)
+        # Add parameters with their default values:
+        # - Only a small user-facing allowlist per primitive type
+        # - Only constant numeric defaults (no expressions/references)
+        # NOTE: We intentionally do NOT apply the per-primitive allowlist here.
+        # Policy: include ALL header params with constant numeric defaults.
         for param in sorted_params:
+            default_raw = getattr(param.default, "val", param.default)
+            if not self._is_constant_numeric_default_str(default_raw):
+                continue
             param_name = param.name.name
             default_val = self._format_param_default(param)
             template_lines.append("{}={}".format(param_name, default_val))
@@ -1197,9 +1574,343 @@ class XschemSymbolGenerator:
         
         from ..data import Int, Float, MetricNum, Ref
         if isinstance(param.default, (Int, Float, MetricNum)):
-            return str(param.default.val) if hasattr(param.default, 'val') else str(param.default)
+            s = str(param.default.val) if hasattr(param.default, 'val') else str(param.default)
         elif isinstance(param.default, Ref):
-            return param.default.ident.name if hasattr(param.default, 'ident') else str(param.default)
+            s = param.default.ident.name if hasattr(param.default, 'ident') else str(param.default)
         else:
-            return str(param.default)
+            s = str(param.default)
+
+        # Xschem uses `{...}` as structural syntax in .sym/.sch files. Many Xyce defaults
+        # use `{expr}`. Escape braces so Xschem doesn't truncate the K-block/template,
+        # but the resulting parsed value still contains literal braces.
+        # (Tcl-style: `\{` -> `{` after parsing)
+        s = s.replace("{", "\\{").replace("}", "\\}")
+        return s
+
+
+#
+# Batch symbol generation (Xschem-specific)
+#
+
+"""
+Parameter policy for symbol generation:
+
+- **Strict** (current): only parameters explicitly declared on the `.SUBCKT ... PARAMS:` header
+  are exposed on the generated symbol. This matches "params that can be passed at the subckt level"
+  under the common SPICE convention.
+
+If a future workflow wants to expose additional parameters referenced inside the subckt body,
+it should do so in a separate, opt-in layer/tool.
+"""
+
+
+def extract_all_top_level_subckts(xyce_file: Path) -> List[str]:
+    """Extract all top-level subcircuit names from an Xyce file."""
+    subckt_names: List[str] = []
+    lines = Path(xyce_file).read_text(errors="ignore").splitlines(True)
+
+    referenced_subckts = set()
+    for line in lines:
+        line_stripped = line.strip()
+
+        if line_stripped.startswith(".SUBCKT"):
+            parts = line_stripped.split()
+            if len(parts) >= 2:
+                subckt_names.append(parts[1])
+        elif line_stripped.startswith("X") or line_stripped.startswith("x"):
+            parts = line_stripped.split()
+            if len(parts) >= 2:
+                for part in parts[1:]:
+                    if part and not part.startswith("{") and "=" not in part:
+                        referenced_subckts.add(part)
+                        break
+
+    top_level = [name for name in subckt_names if name not in referenced_subckts]
+    return top_level or subckt_names
+
+
+def extract_subckt_from_xyce(xyce_file: Path, subckt_name: str) -> SubcktDef:
+    """Extract a subcircuit definition from Xyce file, for Xschem symbol generation."""
+    lines = Path(xyce_file).read_text(errors="ignore").splitlines(True)
+
+    # Find the .SUBCKT line and extract comments above it + surrounding context (±5 lines)
+    # Also capture continuation lines (leading '+') as part of the same header.
+    subckt_line = None
+    subckt_line_idx = None
+    comments_above: List[str] = []
+    context_lines: List[str] = []
+    for i, line in enumerate(lines):
+        if line.strip().startswith(f".SUBCKT {subckt_name}"):
+            header_parts = [line.strip()]
+            j = i + 1
+            while j < len(lines) and lines[j].lstrip().startswith("+"):
+                header_parts.append(lines[j].strip().lstrip("+").strip())
+                j += 1
+            subckt_line = " ".join(header_parts).strip()
+            subckt_line_idx = i
+
+            start_idx = max(0, i - 20)
+            for jj in range(start_idx, i):
+                comment_line = lines[jj].rstrip()
+                if comment_line.strip() and not comment_line.strip().startswith(".SUBCKT"):
+                    comments_above.append(comment_line)
+
+            ctx_start = max(0, i - 5)
+            ctx_end = min(len(lines), i + 6)
+            context_lines = [ln.rstrip("\n") for ln in lines[ctx_start:ctx_end]]
+            break
+
+    if not subckt_line:
+        raise ValueError(f"Subcircuit '{subckt_name}' not found in {xyce_file}")
+
+    parts = subckt_line.split()
+    if parts[0] != ".SUBCKT":
+        raise ValueError(f"Invalid subcircuit line: {subckt_line}")
+
+    name = parts[1]
+
+    ports: List[str] = []
+    for part in parts[2:]:
+        if part == "PARAMS:":
+            break
+        ports.append(part)
+
+    # STRICT PARAM POLICY: only include header params
+    header_params: List[Tuple[str, str]] = []
+    if "PARAMS:" in subckt_line:
+        params_start = subckt_line.find("PARAMS:") + len("PARAMS:")
+        params_str = subckt_line[params_start:].strip()
+        for param_str in params_str.split():
+            if "=" not in param_str:
+                continue
+            param_name, param_val = param_str.split("=", 1)
+            header_params.append((param_name.strip(), param_val.strip()))
+
+    param_decls: List[ParamDecl] = []
+    for param_name, default_str in header_params:
+        param_decls.append(ParamDecl(name=Ident(param_name), default=MetricNum(default_str)))
+
+    subckt_def = SubcktDef(
+        name=Ident(name),
+        ports=[Ident(p) for p in ports],
+        params=param_decls,
+        entries=[],
+    )
+
+    # Attach context metadata for symbol-generation (comment/source_context)
+    if subckt_line_idx is not None and subckt_line_idx >= 0:
+        subckt_def._comments_above = "\n".join(comments_above)
+        subckt_def._subckt_line = subckt_line
+        subckt_def._subckt_context = "\n".join(context_lines).strip()
+    else:
+        subckt_def._comments_above = ""
+        subckt_def._subckt_line = subckt_line
+        subckt_def._subckt_context = "\n".join(context_lines).strip() if context_lines else ""
+
+    return subckt_def
+
+
+class BatchSymbolGenerator:
+    """Generate Xschem symbols for all top-level subcircuits from an Xyce file."""
+
+    def __init__(
+        self,
+        xyce_file: Path,
+        output_dir: Path,
+        template_dir: Optional[Path] = None,
+        primitive_config_file: Optional[Path] = None,
+    ):
+        self.xyce_file = Path(xyce_file)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.detector = PrimitiveDetector(config_file=str(primitive_config_file) if primitive_config_file else None)
+        template_base = template_dir or (Path(__file__).parent / "xschem_symbol_templates")
+        self.matcher = SymbolMatcher(template_base)
+        self.generator = XschemSymbolGenerator(self.output_dir, template_dir=template_base)
+
+        self.mapping: Dict[str, Dict] = {}
+        # Store extracted subckts and types for downstream tasks (e.g. schematic placement)
+        self.subckts: Dict[str, SubcktDef] = {}
+        self.prim_types: Dict[str, PrimitiveType] = {}
+
+    def generate_all(self) -> Dict[str, Dict]:
+        # Single-pass parse of the xyce file: read it once, then reuse `lines` throughout.
+        lines = self.xyce_file.read_text(errors="ignore").splitlines(True)
+
+        def _extract_all_top_level_subckts_from_lines(lines_: List[str]) -> List[str]:
+            subckt_names_: List[str] = []
+            referenced_subckts_ = set()
+            for line in lines_:
+                line_stripped = line.strip()
+                if line_stripped.startswith(".SUBCKT"):
+                    parts = line_stripped.split()
+                    if len(parts) >= 2:
+                        subckt_names_.append(parts[1])
+                elif line_stripped.startswith("X") or line_stripped.startswith("x"):
+                    parts = line_stripped.split()
+                    if len(parts) >= 2:
+                        for part in parts[1:]:
+                            if part and not part.startswith("{") and "=" not in part:
+                                referenced_subckts_.add(part)
+                                break
+            top_level_ = [n for n in subckt_names_ if n not in referenced_subckts_]
+            return top_level_ or subckt_names_
+
+        def _extract_subckt_from_lines(lines_: List[str], subckt_name_: str) -> SubcktDef:
+            # Find .SUBCKT header and capture continuation '+'
+            subckt_line_ = None
+            subckt_line_idx_ = None
+            comments_above_: List[str] = []
+            context_lines_: List[str] = []
+            for i, line in enumerate(lines_):
+                if line.strip().startswith(f".SUBCKT {subckt_name_}"):
+                    header_parts = [line.strip()]
+                    j = i + 1
+                    while j < len(lines_) and lines_[j].lstrip().startswith("+"):
+                        header_parts.append(lines_[j].strip().lstrip("+").strip())
+                        j += 1
+                    subckt_line_ = " ".join(header_parts).strip()
+                    subckt_line_idx_ = i
+
+                    start_idx = max(0, i - 20)
+                    for jj in range(start_idx, i):
+                        comment_line = lines_[jj].rstrip()
+                        if comment_line.strip() and not comment_line.strip().startswith(".SUBCKT"):
+                            comments_above_.append(comment_line)
+
+                    ctx_start = max(0, i - 5)
+                    ctx_end = min(len(lines_), i + 6)
+                    context_lines_ = [ln.rstrip("\n") for ln in lines_[ctx_start:ctx_end]]
+                    break
+
+            if not subckt_line_:
+                raise ValueError(f"Subcircuit '{subckt_name_}' not found in {self.xyce_file}")
+
+            parts = subckt_line_.split()
+            if parts[0] != ".SUBCKT":
+                raise ValueError(f"Invalid subcircuit line: {subckt_line_}")
+
+            name = parts[1]
+            ports: List[str] = []
+            for part in parts[2:]:
+                if part == "PARAMS:":
+                    break
+                ports.append(part)
+
+            header_params: List[Tuple[str, str]] = []
+            if "PARAMS:" in subckt_line_:
+                params_start = subckt_line_.find("PARAMS:") + len("PARAMS:")
+                params_str = subckt_line_[params_start:].strip()
+                for param_str in params_str.split():
+                    if "=" not in param_str:
+                        continue
+                    param_name, param_val = param_str.split("=", 1)
+                    header_params.append((param_name.strip(), param_val.strip()))
+
+            param_decls: List[ParamDecl] = []
+            for param_name, default_str in header_params:
+                param_decls.append(ParamDecl(name=Ident(param_name), default=MetricNum(default_str)))
+
+            subckt_def = SubcktDef(
+                name=Ident(name),
+                ports=[Ident(p) for p in ports],
+                params=param_decls,
+                entries=[],
+            )
+
+            # attach context metadata
+            if subckt_line_idx_ is not None and subckt_line_idx_ >= 0:
+                subckt_def._comments_above = "\n".join(comments_above_)
+                subckt_def._subckt_line = subckt_line_
+                subckt_def._subckt_context = "\n".join(context_lines_).strip()
+            else:
+                subckt_def._comments_above = ""
+                subckt_def._subckt_line = subckt_line_
+                subckt_def._subckt_context = "\n".join(context_lines_).strip() if context_lines_ else ""
+
+            return subckt_def
+
+        print(f"Extracting top-level subcircuits from {self.xyce_file}...")
+        subckt_names = _extract_all_top_level_subckts_from_lines(lines)
+        print(f"Found {len(subckt_names)} top-level subcircuits")
+
+        primitives = []
+        for subckt_name in subckt_names:
+            try:
+                subckt = _extract_subckt_from_lines(lines, subckt_name)
+                prim_type = self.detector.detect(subckt)
+                primitives.append((subckt_name, subckt, prim_type))
+                print(f"  {subckt_name}: {prim_type.value}")
+            except Exception as e:
+                print(f"  Warning: Failed to extract {subckt_name}: {e}")
+                continue
+
+        print(f"\nGenerating symbols for {len(primitives)} primitives...")
+        for subckt_name, subckt, prim_type in primitives:
+            try:
+                self.subckts[subckt_name] = subckt
+                self.prim_types[subckt_name] = prim_type
+                template_path, confidence, match_reasons = self.matcher.match(subckt, prim_type)
+
+                if template_path:
+                    _ = self.generator.generate_symbol(subckt, prim_type, template_path=template_path)
+                    template_name = template_path.name
+                    template_rel_path = template_path.relative_to(Path(__file__).parent)
+                    print(f"  ✓ {subckt_name}: {template_name} (confidence: {confidence:.2f})")
+                else:
+                    _ = self.generator.generate_symbol(subckt, prim_type)
+                    template_name = None
+                    template_rel_path = None
+                    print(f"  ⚠ {subckt_name}: NO TEMPLATE MATCH (confidence: {confidence:.2f}, reasons: {match_reasons})")
+                    print(f"     Generated from scratch. Ports: {[p.name for p in subckt.ports]}, Params: {[p.name.name for p in subckt.params]}")
+
+                port_names = [str(p.name) for p in subckt.ports]
+                self.mapping[subckt_name] = {
+                    "template": template_name,
+                    "template_path": str(template_rel_path) if template_rel_path else None,
+                    "primitive_type": prim_type.value,
+                    "confidence": confidence,
+                    "match_reasons": match_reasons,
+                    "ports": port_names,
+                }
+
+            except Exception as e:
+                print(f"  ✗ {subckt_name}: ERROR - {e}")
+                import traceback
+
+                traceback.print_exc()
+                port_names = []
+                try:
+                    port_names = [str(p.name) for p in subckt.ports]
+                except Exception:
+                    pass
+                self.mapping[subckt_name] = {
+                    "template": None,
+                    "template_path": None,
+                    "primitive_type": prim_type.value,
+                    "confidence": 0.0,
+                    "match_reasons": [f"error: {str(e)}"],
+                    "ports": port_names if port_names else None,
+                }
+
+        return self.mapping
+
+    def save_mapping(self, mapping_file: Path) -> None:
+        mapping_file = Path(mapping_file)
+        mapping_file.parent.mkdir(parents=True, exist_ok=True)
+        mapping_file.write_text(json.dumps(self.mapping, indent=2) + "\n")
+        print(f"\nMapping saved to {mapping_file}")
+
+    def write_test_schematic(self, output_sch: Path) -> Path:
+        """Generate a top-level schematic placing all generated symbols, using in-memory data."""
+        from .xschem_schematic import create_schematic_from_subckts
+
+        symbol_dir = self.output_dir
+        return create_schematic_from_subckts(
+            symbol_dir=symbol_dir,
+            output_sch=Path(output_sch),
+            mapping=self.mapping,
+            subckts=self.subckts,
+        )
 
